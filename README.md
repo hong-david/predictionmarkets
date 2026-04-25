@@ -151,6 +151,15 @@ This section tracks the architectural decisions actually present in the code, pl
 
 Most recent first.
 
+#### 2026-04-25 — Add `orderbook_delta` ingestion
+
+- Added `BookEvent` model in `app/db/models.py`. One row per price level: `is_snapshot=true` rows carry absolute level size in `size_fp`; delta rows carry signed `delta_fp`. Stamped with per-connection `session_id` (UUID) and Kalshi's per-subscription `seq`. Unique constraint on `(session_id, seq, side, price_dollars)` enforces idempotency.
+- New Alembic migration `c4d8f2e0a91b_create_book_events_table.py` (`down_revision = b3a7e4c19f02`).
+- New `handle_orderbook_snapshot_message` (bulk insert, one row per level) and `handle_orderbook_delta_message` (single-row insert) in `app/services/kalshi_ws.py`. Both use `INSERT … ON CONFLICT DO NOTHING`.
+- `consume_market_data_forever` now generates a `session_id` UUID per connection and sends a second `subscribe` command for `orderbook_delta` with explicit `market_tickers`. Resolved via new `resolve_book_market_tickers` helper from either a configured allowlist or the DB.
+- Added `kalshi_book_market_tickers: list[str]` and `kalshi_book_market_limit: int = 50` to `app/core/config.py`.
+- Book events do **not** trigger any detector yet; persistence-only step.
+
 #### 2026-04-25 — Add public trade tape ingestion
 
 - Added `Trade` model in `app/db/models.py`: `trade_id` unique, event-time `ts` indexed, composite `(market_pk, ts)` index for replay queries, `received_at` server-default for ingest time.
