@@ -1,5 +1,17 @@
 from datetime import datetime
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -35,6 +47,11 @@ class Market(Base):
     )
 
     trades: Mapped[list["Trade"]] = relationship(
+        back_populates="market",
+        cascade="all, delete-orphan",
+    )
+
+    book_events: Mapped[list["BookEvent"]] = relationship(
         back_populates="market",
         cascade="all, delete-orphan",
     )
@@ -82,6 +99,53 @@ class Trade(Base):
 
     __table_args__ = (
         Index("ix_trades_market_pk_ts", "market_pk", "ts"),
+    )
+
+
+class BookEvent(Base):
+    __tablename__ = "book_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_pk: Mapped[int] = mapped_column(ForeignKey("markets.id"), index=True)
+
+    # session_id is generated per WS connection. Kalshi's `seq` resets on
+    # reconnect, so it is only meaningful within a single connection lifetime.
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    seq: Mapped[int] = mapped_column(Integer)
+
+    # Event time from the message's ts_ms. Snapshots may not carry one, hence
+    # nullable. received_at is always populated for ingest-time / clock-skew.
+    ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    side: Mapped[str] = mapped_column(String(3))
+    price_dollars: Mapped[float] = mapped_column(Numeric(12, 4))
+
+    # Snapshot rows carry the absolute level size; delta rows carry the signed
+    # delta (positive adds contracts, negative removes, zero removes the level).
+    size_fp: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
+    delta_fp: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
+
+    is_snapshot: Mapped[bool] = mapped_column(Boolean)
+
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship(back_populates="book_events")
+
+    __table_args__ = (
+        # Idempotency: re-applying the same Kalshi message (snapshot expansion
+        # or single delta) is a no-op via ON CONFLICT DO NOTHING.
+        UniqueConstraint(
+            "session_id",
+            "seq",
+            "side",
+            "price_dollars",
+            name="uq_book_events_session_seq_side_price",
+        ),
+        # Replay queries: "give me events for market M in arrival order."
+        Index("ix_book_events_market_pk_id", "market_pk", "id"),
     )
 
 

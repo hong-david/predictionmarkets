@@ -40,7 +40,7 @@ This README is updated whenever the code changes.
 flowchart LR
     subgraph EXTERNAL[External]
         KREST[Kalshi REST API]
-        KWS[Kalshi WebSocket\nticker + trade channels]
+        KWS[Kalshi WebSocket\nticker + trade + orderbook_delta]
     end
 
     subgraph INGEST[Ingest]
@@ -52,6 +52,7 @@ flowchart LR
         TMARKETS[(markets)]
         TSNAPS[(market_snapshots)]
         TTRADES[(trades)]
+        TBOOK[(book_events)]
         TANOM[(anomalies)]
     end
 
@@ -67,11 +68,13 @@ flowchart LR
     KREST -->|GET /markets| POLLER
     KWS -->|ticker msg| WSCONS
     KWS -->|trade msg| WSCONS
+    KWS -->|orderbook_snapshot / orderbook_delta| WSCONS
 
     POLLER -->|upsert + snapshot| TMARKETS
     POLLER --> TSNAPS
     WSCONS -->|new snapshot per ticker| TSNAPS
     WSCONS -->|new trade per trade msg\nINSERT ON CONFLICT DO NOTHING| TTRADES
+    WSCONS -->|book event rows per snapshot/delta\nINSERT ON CONFLICT DO NOTHING| TBOOK
 
     WSCONS -->|trigger after snapshot| MAT
     MAT --> ENGINE
@@ -89,7 +92,7 @@ flowchart LR
     classDef api fill:#fee2e2,stroke:#dc2626,color:#000
     class KREST,KWS ext
     class POLLER,WSCONS ing
-    class TMARKETS,TSNAPS,TTRADES,TANOM db
+    class TMARKETS,TSNAPS,TTRADES,TBOOK,TANOM db
     class ENGINE,MAT proc
     class API api
 ```
