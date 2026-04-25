@@ -1,0 +1,40 @@
+---
+description: Keep README.md §3 in sync with code changes
+alwaysApply: true
+---
+
+# Keep `README.md` in sync with code changes
+
+`README.md` is the single source of truth for what this project is and what design decisions are currently in effect. It MUST be kept in sync with the code on every change.
+
+## Rule
+
+When you make any non-trivial code change in this repo (new feature, schema change, new file/module, dependency change, refactor of an architectural choice), you MUST also update `README.md` in the same change.
+
+Trivial edits that do NOT require a README update:
+- typo fixes, comment-only changes, formatting / whitespace
+- pure dependency version bumps with no behavior change
+- log message tweaks
+
+## What to update
+
+1. **Section 3 → "Recent changes"**: prepend a new dated entry (most recent first). Use the actual date. Bullet points describing what changed and why, in the same voice as existing entries.
+
+2. **Section 3 → "Current design choices"**: edit ONLY when the change alters an architectural fact (e.g., a stated design choice no longer holds, or a new architectural fact is introduced). Do not restate every implementation detail here.
+
+3. **Section 2 → architecture diagram and prose**: update when components, data flow, or storage tables change (new table, new service, renamed entry point, new external dependency).
+
+4. **Section 1 → overview**: update only if the project's goals or methodology change.
+
+## Style
+
+- Match the existing voice: factual, no emojis, no hype.
+- Be honest about what is *not* yet wired in (e.g., declared-but-unused dependencies). Do not oversell.
+- Reference real file paths and symbols (e.g., `app/services/kalshi_ws.py`, `consume_market_data_forever`).
+- Keep "Recent changes" entries short — 3–6 bullets is usually enough.
+
+## How to verify before finishing
+
+- The diagram in §2 reflects the current set of services, tables, and external interfaces.
+- Any design choice listed in §3 "Current design choices" is still true in the code.
+- The newest "Recent changes" entry summarizes today's change clearly enough that a reviewer skimming only the README understands it.
