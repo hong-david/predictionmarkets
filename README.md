@@ -139,7 +139,10 @@ This section tracks the architectural decisions actually present in the code, pl
 - **Per-connection `session_id` for the book stream.** Kalshi's `seq` is per-subscription and resets on reconnect, so it is not a globally stable identifier. We generate a UUID per WS connection and stamp it on every `book_events` row. Idempotency, gap detection, and replay all use `(session_id, seq)`; a new `is_snapshot=true` row inside a new `session_id` is the natural marker of a session boundary.
 - **Selective `orderbook_delta` subscription.** Unlike `ticker` and `trade`, the book channel requires explicit market tickers. The consumer takes either a configured `kalshi_book_market_tickers` list, or falls back to the most recently updated active markets in the DB capped at `kalshi_book_market_limit` (default 50). The set is resolved once per connection; updating it mid-session via `update_subscription` is deferred.
 - **One row per price level on snapshots.** An `orderbook_snapshot` is expanded into N `book_events` rows in a single bulk `INSERT … ON CONFLICT DO NOTHING`. Uniform schema with delta rows means replays just walk events in order rather than branching on row shape.
-- **Composite index `(market_pk, ts)` on every event table.** The dominant detector query is *"give me events for market M between t1 and t2"*; this index turns it into a clean range scan.
+- **Per-table replay-ordering indexes.** Each event table has a per-market access path tuned to its data, rather than one uniform composite. The dominant detector query is *"give me events for market M in order between t1 and t2"*; the right key for that query depends on whether the table's event-time column is reliable.
+  - `trades` indexes `(market_pk, ts)`. `ts` (Kalshi's `ts_ms`) is non-null on every row and is what every detector joins on.
+  - `book_events` indexes `(market_pk, id)` instead. Snapshot rows do not carry `ts_ms`, so `ts` is nullable; the autoincrement `id` is monotonic per insert and never null, which is what replays actually need.
+  - `market_snapshots` currently has separate single-column `market_pk` and `ts` indexes (pre-existing); tightening to a composite `(market_pk, ts)` is an obvious follow-up but has not been done yet.
 - **Unique external IDs as constraints.** `markets.market_id` and `trades.trade_id` are both indexed `UNIQUE`. Dedup is enforced by the database, not application logic.
 - **Snapshot-based anomaly engine, scoped to evolve.** `anomaly_engine.analyze_market` currently uses static thresholds (spread > 0.10, |Δprice| ≥ 0.15, Δvolume ≥ 25). This is acknowledged as a placeholder; the planned next step is per-market rolling baselines (z-scores / percentile ranks) and pattern-specific detectors instead of a single summed score. Trade and `book_events` data are persisted but not yet read by the engine.
 - **No in-memory order book yet.** `book_events` is persisted append-only so a live L2 book can be reconstructed when needed. Building and maintaining one in-process (the natural home for spoofing / quote-stuffing detectors) is deliberately deferred until the detector PR — keeping ingest and live-state concerns separate.
@@ -150,6 +153,14 @@ This section tracks the architectural decisions actually present in the code, pl
 ### Recent changes
 
 Most recent first.
+
+#### 2026-04-25 — Test suite + Postgres integration tests
+
+- New `tests/` package with `conftest.py` that pins env vars to a test DB (`surveillance_test`) before any `app.*` import, so tests cannot accidentally touch a developer's real database.
+- `tests/test_kalshi_ws_handlers.py` covers the WS handlers' branches that don't need a DB: malformed-payload guards on `handle_trade_message` and `handle_orderbook_delta_message`, the snapshot row-expansion shape for `handle_orderbook_snapshot_message`, and `resolve_book_market_tickers` precedence (config beats DB; DB query is only run when config is empty). 15 unit tests, no DB required.
+- `tests/test_migrations_integration.py` runs against a real Postgres (gated on `RUN_INTEGRATION=1`). It drops the public schema, runs `alembic upgrade head`, asserts that all five tables exist with their unique constraints and composite indexes, and then exercises both `Trade`'s DB-level dedup (raises `IntegrityError`) and `BookEvent`'s `INSERT … ON CONFLICT DO NOTHING` (second identical insert is a true no-op). 6 integration tests.
+- Fixed one mypy attr-defined error introduced earlier: `db.execute(stmt).rowcount` in `handle_trade_message` is annotated with `# type: ignore[attr-defined]` since SQLAlchemy 2's static return type is `Result[Any]` while the runtime object is a `CursorResult`. The 7 other mypy errors are pre-existing in `app/services/anomaly_engine.py` (the standard `Numeric` → `Decimal` typing gap) and are not session-introduced.
+- Removed the obsolete `version: "3.9"` field from `docker-compose.yml`.
 
 #### 2026-04-25 — Add `orderbook_delta` ingestion
 
@@ -201,4 +212,21 @@ python -m venv .venv
 
 # Materialize anomalies over recent snapshots
 .venv/Scripts/python scripts/materialize_anomalies.py
+```
+
+### Tests
+
+```bash
+# Unit tests (no DB required)
+.venv/Scripts/python -m pytest tests/
+
+# Integration tests against a real Postgres
+docker compose up -d postgres
+docker compose exec -T postgres psql -U postgres \
+    -c "CREATE DATABASE surveillance_test"
+RUN_INTEGRATION=1 .venv/Scripts/python -m pytest tests/test_migrations_integration.py -v
+
+# Static checks
+.venv/Scripts/python -m ruff check app/ tests/
+.venv/Scripts/python -m mypy app/
 ```

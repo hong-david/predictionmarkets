@@ -101,10 +101,13 @@ def handle_trade_message(data: dict) -> None:
             )
             .on_conflict_do_nothing(index_elements=["trade_id"])
         )
+        # SQLAlchemy 2's static return type is `Result[Any]`, but a DML
+        # statement executes as a `CursorResult` at runtime, which is what
+        # exposes `rowcount`. Suppress the false-positive attribute error.
         result = db.execute(stmt)
         db.commit()
 
-        if result.rowcount:
+        if result.rowcount:  # type: ignore[attr-defined]
             print(
                 f"trade market={market.market_id} trade_id={trade_id} "
                 f"yes={msg.get('yes_price_dollars')} count_fp={msg.get('count_fp')} "
