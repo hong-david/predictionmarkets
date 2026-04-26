@@ -11,6 +11,7 @@
 | **Manipulability prior** | A rough “how plausibly could non-public *information* move this market?” label — a triage input, not evidence of wrongdoing. |
 | **Anomaly (stored row)** | A **rule score** from the latest few dozen snapshots (and book activity) materialized in the `anomalies` table when the score clears the persistence **floor** in `anomaly_materializer`. Not a per-trade “insider” verdict. |
 | **Triage prior** | The `manipulability_prior` classifier label (“how leak-prone is this *kind* of market?”). The Overview **Triage (top prior)** count is **only** “high + elevated” — separate from the “high” **single** bar, and from **evidence** (see **Markets with risk flags**). |
+| **Rule row count** (per market) | `COUNT(*)` in `anomalies` for that market. The materializer **inserts a new row** for each *new* `latest_snapshot_id` (ticker/quote) that produces a high enough rule score. **Trades** are a separate, much sparser count — a hyped event can have thousands of quote updates and hundreds of those stored as “rule rows” but only a few hundred **executions** on the tape, so 1255 vs 283 is normal. |
 | **Z-score (here)** | How many standard deviations the *latest* move is from *this* market’s own *recent* history of moves (rolling baseline). |
 | **Order-book event** | One line-level change: full level snapshot, or a delta (add/cancel size) on one price. |
 | **Trade tape** | Public list of executed trades (price, size, which side was aggressive). |
@@ -169,12 +170,19 @@ flowchart TD
 Two processes side by side. The API serves JSON; Vite serves the frontend with hot-reload and proxies `/api/*` calls to the API.
 
 ```bash
-# Terminal 1 — API
+# Terminal 1 — from repo root, with venv on PATH (API required for Overview)
+# Use `python -m uvicorn` so the same interpreter as the project is used.
 .venv/Scripts/python -m uvicorn app.main:app --reload
+
+# If Windows returns **WinError 10013** on the default port, bind out of the
+# "excluded" range — for example (then point Vite at the same port, next block):
+# .venv/Scripts/python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 
 # Terminal 2 — frontend (one-time install, then dev server)
 cd frontend
 npm install
+# If Uvicorn is on :8001, create `frontend/.env.local` with:
+#   VITE_DEV_API_TARGET=http://127.0.0.1:8001
 npm run dev
 # open http://localhost:5173
 ```
@@ -228,6 +236,16 @@ This section tracks the architectural decisions actually present in the code, pl
 
 Most recent first.
 
+#### 2026-04-26 (later) — “Flags” vs trade count: copy
+
+- **UI** / **glossary:** `anomaly_count` is **not** one flag per print — it is **stored rule rows** (mostly one per *ticker snapshot* that met the score floor). Renamed table column to **Rule rows** and market-detail stat to **Rule rows** with tooltips. README glossary row explains why that number can be ≫ trade count on active markets.
+#### 2026-04-26 (later) — Uvicorn / Windows: WinError 10013, Vite proxy
+
+- **vite.config.ts** reads `VITE_DEV_API_TARGET` (e.g. `http://127.0.0.1:8001`) so the dev server can follow Uvicorn when the default **:8000** bind is denied on Windows. **README** §Local dev updated.
+
+#### 2026-04-26 (later) — Overview error state
+
+- **Overview** shows an explicit **API error** panel (message + local/prod hints + retry) when `GET /api/dashboard/overview` fails, instead of a nearly blank home page.
 #### 2026-04-26 (later) — Overview bundle, public news windows
 
 - **`GET /api/dashboard/overview`:** one JSON with `stats` + `breakdown` + `top_markets` + `recent_anomalies`; the React home page uses this instead of four fetches. **Tests:** `tests/test_dashboard_api.py` (`test_overview_bundles_expected_keys` when `RUN_INTEGRATION=1`); `tests/test_news_gdelt.py` for pure helpers.

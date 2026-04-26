@@ -1,13 +1,16 @@
 import path from "node:path";
 
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 
-// In dev, the Vite dev server runs on :5173 and proxies `/api/*` to the
-// FastAPI process on :8000. In production, the built bundle is served by
-// FastAPI itself (see app/main.py StaticFiles mount), so no proxy is
-// needed.
-export default defineConfig({
+// In dev, Vite on :5173 proxies `/api/*` to Uvicorn (default :8000). If
+// Windows blocks :8000 (WinError 10013), run Uvicorn on e.g. :8001 and set
+// in `frontend/.env` or `.env.local`:  VITE_DEV_API_TARGET=http://127.0.0.1:8001
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, __dirname, "VITE_");
+  const apiTarget = env.VITE_DEV_API_TARGET || "http://127.0.0.1:8000";
+
+  return {
   plugins: [react()],
   resolve: {
     alias: {
@@ -18,7 +21,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        target: apiTarget,
         changeOrigin: true,
       },
     },
@@ -27,4 +30,5 @@ export default defineConfig({
     outDir: "dist",
     sourcemap: true,
   },
+  };
 });

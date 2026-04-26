@@ -101,6 +101,51 @@ export default function OverviewPage() {
     ? `updated ${fmtAgo(new Date(overview.dataUpdatedAt).toISOString())}`
     : "connecting…";
   const tone = overview.isError ? "error" : overview.isFetching ? "stale" : "live";
+  const errMsg =
+    overview.error instanceof Error
+      ? overview.error.message
+      : String(overview.error ?? "unknown error");
+
+  if (overview.isError) {
+    return (
+      <div className="space-y-4">
+        <section className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <StatusDot tone="error" />
+            <span>API error</span>
+          </div>
+        </section>
+        <Card>
+          <CardBody>
+            <EmptyState>
+              <div className="max-w-lg space-y-3 text-left">
+                <p className="text-sm font-medium">The dashboard data did not load.</p>
+                <p className="text-xs text-muted-foreground break-words font-mono bg-secondary/50 rounded px-2 py-1.5">
+                  {errMsg}
+                </p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  <strong className="text-foreground font-medium">Local dev:</strong> run the API on port 8000 (e.g.{" "}
+                  <code className="text-[11px]">uvicorn app.main:app --reload</code>
+                  ) while <code className="text-[11px]">npm run dev</code> proxies <code className="text-[11px]">/api</code> to it.{" "}
+                  <strong className="text-foreground font-medium">Prod:</strong> set{" "}
+                  <code className="text-[11px]">DATABASE_URL</code>, run migrations, and build the front end with{" "}
+                  <code className="text-[11px]">cd frontend &amp;&amp; npm run build</code> before starting uvicorn.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void overview.refetch()}
+                  className="text-sm rounded-md border border-border bg-card px-3 py-1.5 hover:bg-secondary transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            </EmptyState>
+          </CardBody>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

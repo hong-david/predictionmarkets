@@ -137,9 +137,9 @@ export default function MarketsBrowserPage() {
                 <th className="text-right px-3 py-2.5 font-medium">Trades</th>
                 <th
                   className="text-right px-3 py-2.5 font-medium"
-                  title="Count of materialized rule-score rows; use default sort to surface markets with any evidence"
+                  title="Total stored anomaly rows: one per ticker snapshot (quote) that met the score floor — not one per trade. A hyped event can have many more rows than trade prints."
                 >
-                  Flags
+                  Rule rows
                 </th>
               </tr>
             </thead>

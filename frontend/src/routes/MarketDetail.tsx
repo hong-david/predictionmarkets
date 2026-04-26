@@ -148,7 +148,11 @@ export default function MarketDetailPage() {
 
               <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
                 <Stat label="Trades" value={fmtInt(m.stats.trade_count)} />
-                <Stat label="Anomalies" value={fmtInt(m.anomaly_count)} />
+                <Stat
+                  label="Rule rows"
+                  title="Number of materialized anomaly rows: one per ticker quote snapshot that met the score floor — not one per trade. Hot markets can have many more of these than execution prints."
+                  value={fmtInt(m.anomaly_count)}
+                />
                 <Stat
                   label="Range"
                   value={
@@ -424,10 +428,13 @@ function buildTradeHighlights(
   return out;
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value, title }: { label: string; value: string; title?: string }) {
   return (
     <div>
-      <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+      <div
+        className="text-[11px] uppercase tracking-wider text-muted-foreground"
+        title={title}
+      >
         {label}
       </div>
       <div className="num font-semibold mt-0.5">{value}</div>
