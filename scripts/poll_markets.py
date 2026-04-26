@@ -135,8 +135,8 @@ def main() -> None:
     parser.add_argument(
         "--anomaly-lookback",
         type=int,
-        default=5,
-        help="Snapshots per market the anomaly engine considers.",
+        default=40,
+        help="Snapshots per market the anomaly engine considers (rolling baselines need several).",
     )
     parser.add_argument(
         "--once",

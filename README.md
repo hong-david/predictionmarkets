@@ -1,34 +1,30 @@
 # Prediction Market Surveillance
 
-A small market-surveillance backend for prediction markets (currently Kalshi). It ingests live market data over WebSocket and REST, persists it in Postgres, and runs detectors that flag potentially suspicious market activity. The project is being built deliberately — each addition is justified by the surveillance question it unlocks rather than by chasing scale for its own sake.
+**What this is:** A backend (plus a small web UI) that ingests public Kalshi data, stores it in Postgres, and highlights **unusual** quotes, trades, and order-book *activity* — without access to who traded (public data only).
 
----
+**Glossary (terms used in the UI and code)**
 
-## 1. Overview
+| Term | Meaning |
+|------|--------|
+| **Market (contract)** | One tradeable contract (a Kalshi *ticker*), not the whole “event” or news story. |
+| **Snapshot** | A row of best bid/ask, last price, and volume saved every time the exchange sends a *ticker* update for that market. |
+| **Manipulability prior** | A rough “how plausibly could non-public *information* move this market?” label — a triage input, not evidence of wrongdoing. |
+| **Anomaly (stored row)** | A **rule score** from the latest few dozen snapshots (and book activity) materialized in the `anomalies` table when the score clears the persistence **floor** in `anomaly_materializer`. Not a per-trade “insider” verdict. |
+| **Triage prior** | The `manipulability_prior` classifier label (“how leak-prone is this *kind* of market?”). The Overview **Triage (top prior)** count is **only** “high + elevated” — separate from the “high” **single** bar, and from **evidence** (see **Markets with risk flags**). |
+| **Z-score (here)** | How many standard deviations the *latest* move is from *this* market’s own *recent* history of moves (rolling baseline). |
+| **Order-book event** | One line-level change: full level snapshot, or a delta (add/cancel size) on one price. |
+| **Trade tape** | Public list of executed trades (price, size, which side was aggressive). |
+| **Cumulative volume (snapshot `volume_fp`)** | **Lifetime** (or “so far” on the series) **contracts** cleared on a market, from the exchange ticker. Anomaly’s “large volume *delta*” is the **change in this** between two snapshot rows — the sum of many small prints in that interval, not the same number as a single bar on the per-trade chart. |
+| **Chart histogram** | Each bar is **one trade’s** `count` (how many contracts in that print), green = taker bought Yes, red = taker bought No, blue = side unknown. |
+| **Public news (GDELT)** | The GDELT Project’s free *document* API: a searchable index of open-web headlines (no key in our setup). We build a query from **title and subtitle** (as an OR), pull articles in a time window, and the detail page can use **“Near last activity”** (about 7d before the latest print or stored flag) or **30d to close** to line up story timing with the chart. We do *not* claim causality. |
 
-### What we are trying to achieve
+**Pattern targets (long-term)** Informed flow, thin-liquidity moves, order-book games, and cross-market effects — with realistic limits (e.g. no wash-trading *proof* without account ids).
 
-Build a system that can identify **suspicious trading patterns** on a public prediction market with the constraints of public-only data (no counterparty / account identifiers). Specifically, the project targets a small, named taxonomy of patterns rather than one vague "anomaly score":
+1. Falsifiable rules and per-market baselines (not one global “magic number” for all markets).  
+2. **Append-only** event storage so we can re-run rules on history.  
+3. **Resolution** as a weak label for “did price lean the right way before the outcome?” (future work; not the main focus today).
 
-| # | Pattern | Detectable from public data? |
-|---|---|---|
-| 1 | Informed / leakage trading (price moves before public news, in the eventual winning direction) | Yes — needs trade tape + market resolution outcomes |
-| 2 | Marking the close / settlement (small trades nudging price near resolution in thin liquidity) | Yes |
-| 3 | Spoofing / layering (large orders added then quickly canceled) | Yes — needs order-book deltas |
-| 4 | Wash trading (self-trades inflating volume) | Only suggestive signatures; full detection requires account IDs we do not have |
-| 5 | Momentum ignition (deliberate burst of aggressive trades to start a move) | Yes |
-| 6 | Cross-market manipulation (trades on market A move correlated market B) | Yes — needs related-market mapping |
-| 7 | Quote stuffing (abnormal rate of order updates / cancellations) | Yes — needs order-book deltas |
-
-### How we are approaching it
-
-1. **Each pattern is a falsifiable hypothesis.** Rules are stated as testable predicates ("within N seconds of resolution, |Δprice| ≥ k σ of this market's recent return distribution and sign matches outcome"), not arbitrary thresholds.
-2. **Per-market baselines, not global thresholds.** A 0.05 move is huge in a deep market and noise in a thin one — signals are scored against rolling per-market distributions (z-scores / percentile ranks) rather than fixed numbers.
-3. **Resolution as ground truth.** Resolved markets give a free retrospective label for the leakage detector specifically. That is the one detector class where precision/recall can be measured cleanly.
-4. **Replayable detectors.** Raw events (snapshots, trades, eventually order-book deltas) are persisted append-only so any detector can be re-run deterministically over history when its rule changes.
-5. **Statistical sanity.** Permutation / bootstrap baselines and negative-control markets are used to confirm that detectors are finding real structure rather than noise.
-
-This README is updated whenever the code changes.
+This README is updated when behavior or structure changes in a non-trivial way.
 
 ---
 
@@ -57,13 +53,15 @@ flowchart LR
     end
 
     subgraph PROC[Processing]
-        CLASSIFIER[classifier\nKalshi taxonomy -> prefix rules\n-> kNN -> LLM]
-        ENGINE[anomaly_engine\nper-snapshot scoring]
-        MAT[anomaly_materializer\nwrites/updates Anomaly rows]
+        CLASSIFIER[classifier\ntaxonomy, rules, kNN, LLM]
+        BOOKSIG[book_activity_signals\n3m order-book stats]
+        ENGINE[anomaly_engine\nrolling z + static fallbacks]
+        MAT[anomaly_materializer]
     end
 
     subgraph SERVE[Serving]
-        API[FastAPI app/main.py\n/health /markets /markets/.../features /anomalies]
+        API[FastAPI app/main.py\n/api/health /api/markets /api/markets/.../features /api/anomalies\n/api/dashboard/*]
+        SPA[Vite + React + TypeScript\nfrontend/ -> dist/ served as static\nOverview · Markets browser · Market detail]
     end
 
     KREST -->|GET /markets| POLLER
@@ -80,14 +78,19 @@ flowchart LR
     WSCONS -->|new trade per trade msg\nINSERT ON CONFLICT DO NOTHING| TTRADES
     WSCONS -->|book event rows per snapshot/delta\nINSERT ON CONFLICT DO NOTHING| TBOOK
 
-    WSCONS -->|trigger after snapshot| MAT
+    WSCONS -->|after ticker snapshot| MAT
+    TBOOK --> BOOKSIG
     MAT --> ENGINE
     ENGINE --> MAT
+    BOOKSIG --> ENGINE
     MAT --> TANOM
 
     API --> TMARKETS
     API --> TSNAPS
     API --> TANOM
+    API --> TTRADES
+    API --> TBOOK
+    SPA -->|/api/dashboard/*| API
 
     classDef ext fill:#fef3c7,stroke:#d97706,color:#000
     classDef ing fill:#dbeafe,stroke:#2563eb,color:#000
@@ -97,22 +100,52 @@ flowchart LR
     class KREST,KWS ext
     class POLLER,WSCONS ing
     class TMARKETS,TSNAPS,TTRADES,TBOOK,TANOM db
-    class CLASSIFIER,ENGINE,MAT proc
-    class API api
+    class CLASSIFIER,BOOKSIG,ENGINE,MAT proc
+    class API,SPA api
 ```
 
-### How the pieces interact
+### Frontend (pages and data)
 
-- **REST poller** (`scripts/poll_markets.py` → `app/services/market_ingestor.py`) re-sweeps the open Kalshi universe on a 5-minute interval via `KalshiRestClient.iter_markets`, ingests in 500-row batches, and runs the anomaly materializer at the end of each cycle. The "sweep, don't single-page" shape is shared with the bootstrap script — see "Periodic universe sweep, not single-page polling" in design choices for why.
-- **REST bootstrap** (`scripts/bootstrap_markets.py` → `KalshiRestClient.iter_markets`) does the same paginated cursor sweep but as a one-shot, no anomaly materialization, exits when the cursor is exhausted. Same chunked ingest helper (`market_ingestor.chunked`) so the two stay in lockstep.
-- **Lazy-upsert hydrator** (`scripts/hydrate_unknown_markets.py` → `KalshiRestClient.get_market`) drains the WS-driven `status='unknown'` backlog by hitting Kalshi's per-ticker `/markets/{ticker}` endpoint. Necessary because the bulk poller is filtered by `status=open`, but Kalshi's actively-trading markets are typically `'active'` or `'finalized'` — exactly the ones that show up at the top of the dashboard. `--top-by-trades` orders the queue by descending trade count so the most-visible markets get human titles first. See "Targeted hydration of the lazy-upsert backlog" in design choices.
-- **WebSocket consumer** (`scripts/run_ws_ticker_consumer.py` → `app/services/kalshi_ws.consume_market_data_forever`) holds a single authenticated WS connection to Kalshi and sends two `subscribe` commands on it: one for `ticker` + `trade` (no market filter), and one for `orderbook_delta` (with explicit `market_tickers`, since that channel requires market specification). On each `ticker`, it appends a `market_snapshots` row and re-runs the anomaly engine for that market. On each `trade`, it appends a `trades` row. On each `orderbook_snapshot`, it bulk-inserts one `book_events` row per price level. On each `orderbook_delta`, it appends a single `book_events` row. A fresh `session_id` UUID is generated per connection and stamped on every book event so Kalshi's per-subscription `seq` is interpretable across reconnects.
-- **Market classifier** (`app/services/classifier/`) is a four-layer pipeline that decides what *kind* of market each row is and how much surveillance attention it deserves. It runs synchronously inside `ingest_markets_payload` (and as a one-shot via `scripts/classify_markets.py`), populates `markets.{category, subcategory, manipulability_prior, classifier_tags, classifier_layer, classifier_rule, classifier_confidence, classifier_version}`, and is short-circuited when the row is already at the current `CLASSIFIER_VERSION`. Layers 1 (Kalshi taxonomy) → 2 (~40 ticker prefix / regex rules) → 3 (k-NN over a small TF-IDF char-n-gram seed corpus) → 4 (optional LLM zero-shot fallback, default `NullLLMClassifier`). The first layer that returns a non-`low` confidence wins. A separate priority map in `priorities.py` maps `(category, subcategory) → manipulability_prior` and is the only human-judgment surface in the system. A safety clamp downgrades `high` / `medium_high` priors to `medium` whenever the classification's confidence is `low`, so a confused k-NN guess can't promote an unrelated market onto the high-prior watchlist. See "Layered classifier with explicit confidence" in design choices.
-- **Anomaly engine** (`app/services/anomaly_engine.py`) is currently a per-snapshot rule scorer (wide spread, zero liquidity, empty book, sharp price move, volume jump). It returns a `score`, `severity`, list of `reasons`, and a JSON `signals` blob.
-- **Materializer** (`app/services/anomaly_materializer.py`) calls the engine for a given market over its recent snapshots and either inserts a new `anomalies` row or updates the existing one keyed on `(market_pk, latest_snapshot_id)`.
-- **Dashboard** (`app/api/routes/dashboard.py` → `/`) is a single self-contained HTML page that polls `/stats`, `/dashboard/top-markets`, and `/anomalies/stored` every 5 seconds and re-renders. Vanilla JS / no build step / no framework — see the design-choices section.
-- **FastAPI** (`app/main.py` plus `app/api/routes/*`) exposes read APIs over the stored data: `health`, `markets` (list/get + snapshot history), `markets/{id}/features` (computed view of latest state), and `anomalies`.
-- **Auth** (`app/services/kalshi_auth.py`) signs Kalshi requests with RSA-PSS over `{timestamp}{method}{path}` and emits the three `KALSHI-ACCESS-*` headers required by both REST and WS.
+```mermaid
+flowchart LR
+  subgraph pages[React Router]
+    O[Overview – stats + charts + links]
+    MB[Markets – URL filters + table]
+    MD[Market detail – chart + trades + news]
+  end
+  Q[TanStack Query cache]
+  API2["/api/dashboard/*"]
+  O --> Q
+  MB --> Q
+  MD --> Q
+  Q --> API2
+```
+
+**URL state:** search params on `/markets` hold filters and sort so links are shareable. **Default list sort** `surveillance_urgency` puts markets with stored rule flags above “quiet” high-prior names. **First paint / Overview:** the home page uses a **single** `GET /api/dashboard/overview` to avoid four back-to-back JSON round-trips; cold loads still pay for the **first** JS download (Vite chunk includes Recharts) and the **first** run of several SQL counts / `GROUP BY`s on Postgres after an idle period.
+
+### News vs prices (read path)
+
+`app/services/news_gdelt.py` centralizes the GDELT query string (title, optional subtitle in an **OR** group) and the date window. `GET /api/dashboard/markets/{id}/news?align=default|activity` returns `anchors` (last print time, last flag time, which window mode) plus articles for the detail UI.
+
+### Detection pipeline (backend)
+
+```mermaid
+flowchart TD
+  SN[Last 40 snapshots desc] --> AE[anomaly_engine]
+  BE[book_events last 3m] --> BS[book_activity_signals]
+  BS --> AE
+  AE --> AM[anomaly_materializer]
+  AM --> AN[(anomalies)]
+  TR[trades ascending] --> TS[trade_suspicion z-scores]
+  TS --> SER[GET .../series JSON only]
+```
+
+**Per-trade `suspicion`** is computed when the series API runs; it does **not** write `anomalies`. **Chart markers** on the detail page are **stored rule rows** (snapped to the nearest trade time for display), not one marker per trade.
+
+### How the pieces interact (short)
+
+- **REST poller / bootstrap** — cursor-swept market list; poller also runs the materializer each cycle. **Hydrator** — per-ticker REST for `status=unknown` stubs. **WS consumer** — one connection: `ticker`+`trade` and `orderbook_delta`; writes snapshots, trades, book rows; after each snapshot calls materialization.
+- **Classifier** — four layers + `priorities.py` map; stamps `markets` on ingest. **Anomaly path** — `book_activity_signals` + last N snapshots → `anomaly_engine` (rolling z where possible) → `anomalies` rows. **Dashboard** — Vite/React reads `/api/dashboard/*`; dev uses Vite proxy; prod serves `frontend/dist` from FastAPI. **Kalshi auth** — RSA-PSS signing for REST and WS.
 
 ### Storage model
 
@@ -128,7 +161,33 @@ flowchart LR
 - **FastAPI / Uvicorn** for the API.
 - **websockets** + **cryptography** for Kalshi WS auth and feed.
 - **pytest**, **ruff**, **mypy** for tests and linting.
+- **Vite + React 18 + TypeScript** for the frontend, with **Tailwind**, **TanStack Query**, **TanStack Table**, **TradingView lightweight-charts**, and **Recharts**. See `frontend/package.json`.
 - **Redis** is configured in `app/core/config.py` (`redis_host`, `redis_port`) and a URL helper exists, but it is **not yet wired into any code path**. It is reserved for the queue / worker layer planned later.
+
+### Local dev workflow
+
+Two processes side by side. The API serves JSON; Vite serves the frontend with hot-reload and proxies `/api/*` calls to the API.
+
+```bash
+# Terminal 1 — API
+.venv/Scripts/python -m uvicorn app.main:app --reload
+
+# Terminal 2 — frontend (one-time install, then dev server)
+cd frontend
+npm install
+npm run dev
+# open http://localhost:5173
+```
+
+For a production-shaped run, build the frontend once and serve everything from FastAPI:
+
+```bash
+cd frontend && npm run build && cd ..
+.venv/Scripts/python -m uvicorn app.main:app
+# open http://localhost:8000
+```
+
+If you don't have Node 18+ installed system-wide, the smoke setup uses a portable Node bundle dropped into `tools/` (gitignored). `node --version` should report ≥ 18.
 
 ---
 
@@ -139,6 +198,7 @@ This section tracks the architectural decisions actually present in the code, pl
 ### Current design choices
 
 - **Public data only, named-pattern surveillance.** No account-level data is available from Kalshi's public feed. The detector taxonomy in §1 was chosen so each pattern is either fully detectable from public data or explicitly scoped out (wash trading).
+- **Two notions of “suspicious”.** (1) **Manipulability prior** — a slow-moving human-tuned triage: “is this the *kind* of market where an informed leak is plausible?”. (2) **Action / evidence** — something in *our* data (stored anomaly, or a trade-level outlier) has fired. The markets list can sort by **surveillance_urgency** so (2) dominates: until at least one materialized `anomalies` row exists, we do *not* float the market to the top just because prior is high. Per-trade `suspicion` in the series API is a *local* z-score over the last ~50 prints on that ticker — useful for which leg to look at, not a legal conclusion.
 - **Append-only event tables.** `market_snapshots` and `trades` are append-only so detectors can be replayed deterministically against historical data when rules change.
 - **Event time vs ingest time are stored separately.** `trades.ts` is the Kalshi `ts_ms` (the moment the trade executed); `trades.received_at` is when the row was inserted. Surveillance queries are event-time queries; `received_at` exists for clock-skew / pipeline-latency monitoring.
 - **`Numeric`, not `float`, for prices and volumes.** Money- and contract-quantity-like fields are stored at exchange precision (`Numeric(12, 4)` for dollar prices, `Numeric(18, 2)` for `*_fp` quantities) to avoid binary-floating-point error.
@@ -153,20 +213,89 @@ This section tracks the architectural decisions actually present in the code, pl
   - `book_events` indexes `(market_pk, id)` instead. Snapshot rows do not carry `ts_ms`, so `ts` is nullable; the autoincrement `id` is monotonic per insert and never null, which is what replays actually need.
   - `market_snapshots` currently has separate single-column `market_pk` and `ts` indexes (pre-existing); tightening to a composite `(market_pk, ts)` is an obvious follow-up but has not been done yet.
 - **Unique external IDs as constraints.** `markets.market_id` and `trades.trade_id` are both indexed `UNIQUE`. Dedup is enforced by the database, not application logic.
-- **Snapshot-based anomaly engine, scoped to evolve.** `anomaly_engine.analyze_market` currently uses static thresholds (spread > 0.10, |Δprice| ≥ 0.15, Δvolume ≥ 25). This is acknowledged as a placeholder; the planned next step is per-market rolling baselines (z-scores / percentile ranks) and pattern-specific detectors instead of a single summed score. Trade and `book_events` data are persisted but not yet read by the engine.
-- **No in-memory order book yet.** `book_events` is persisted append-only so a live L2 book can be reconstructed when needed. Building and maintaining one in-process (the natural home for spoofing / quote-stuffing detectors) is deliberately deferred until the detector PR — keeping ingest and live-state concerns separate.
+- **Anomaly engine + book hints + persistence gate.** `analyze_market` uses **rolling z-scores** (stricter `z` in code than a naive 2.0) on spread, ref-price change, and volume delta when enough history exists (default 40 snapshots in the materializer); otherwise static fallbacks. `book_activity_signals` adds points from **high order-book event rate** and **sustained cancel/pull** in a 3-minute window. **`materialize_market_anomaly` only creates/keeps a row** when the computed score is **≥ 3.0**; weaker snapshots delete a row for the same `latest_snapshot_id` so the DB and chart are not full of one-rule “low” noise. **No full L2 reconstruction in RAM yet** — churn heuristics only; a real spoofing detector would rebuild the book from `book_events`.
+- **Per-trade suspicion (API).** `trade_suspicion.py` scores each print vs a local window for the series response only; it does not write `anomalies`.
 - **Per-message DB lookup for `market_pk`, with lazy upsert on miss.** Each handler resolves `market_ticker → market_pk` via a fresh DB query rather than caching the mapping. On a miss for `ticker` / `trade`, the handler falls through to the lazy-upsert path described above instead of dropping the message. This is intentionally naive in v1; if profiling under real book volume shows it as the bottleneck, an in-process LRU populated lazily (and invalidated when the REST poller updates a market) is the obvious next step.
 - **Redis is declared but not used.** It is reserved for the planned queue / worker layer that will sit between WS ingest and the anomaly path. Wiring it in too early would be premature.
 - **Backoff / reconnect on WS failures.** `consume_market_data_forever` reconnects with exponential backoff capped at 30s, so a transient Kalshi or network blip doesn't kill the consumer.
 - **Periodic universe sweep, not single-page polling.** Both `scripts/bootstrap_markets.py` (one-shot) and `scripts/poll_markets.py` (interval-driven) walk Kalshi's `cursor`-based pagination via `iter_markets(status="open")` and ingest in fixed-size batches. The pre-fix poller called `get_markets(limit=25)` once per cycle, which meant the alphabetical front-load (~50k dead `KXMVECROSSCATEGORY...` markets) was the only thing it ever touched, and the lazy-upsert backlog from the WS feed was never hydrated. Sweeping the full open set is the only design that keeps the WS feed and REST metadata in sync without a per-ticker hydration endpoint. Defaults: `interval=300s`, `batch=500`. Both scripts share a `chunked()` helper in `app/services/market_ingestor.py` so the iteration shape stays in one place.
 - **Targeted hydration of the lazy-upsert backlog (per-ticker REST).** The bulk `/markets` sweep is filtered by `status=open`, but Kalshi's high-trade-count markets right now (live NBA / MLB / UFC games, BTC 15-minute strikes that just expired) are `'active'` or `'finalized'`, not `'open'`. So the bulk sweep would never hydrate them and the dashboard would show them as `KXNBAGAME-...` ticker strings forever. `scripts/hydrate_unknown_markets.py` solves this by hitting Kalshi's per-ticker `/markets/{ticker}` endpoint for each row with `status='unknown'`. With `--top-by-trades` it orders the queue by descending `count(*)` from `trades`, so dashboard-visible markets get hydrated first. ~20 req/s with the default sleep is comfortably under any sane rate limit and drains 50 markets in ~25 seconds. This script is a backlog drainer, not a long-running daemon — it exits when the queue is empty.
-- **Single-page server-rendered dashboard at `/`.** A self-contained HTML page (no Jinja templates, no Node, no JS framework) served by `app/api/routes/dashboard.py`. It polls three JSON endpoints — `/stats`, `/dashboard/top-markets`, `/anomalies/stored` — every 5s and re-renders. The goal is *demoability*, not a production UI: it exists so the project can be opened in a browser and visually communicate ingest progress + anomaly output, rather than asking a viewer to read raw JSON. A real dashboard (auth, charts, websocket push) is intentionally deferred until the surveillance engine is more than a static-threshold scorer.
+- **Frontend split: SPA in `frontend/`, JSON API in FastAPI.** The previous "embedded HTML in a Python module" dashboard was demoable but capped what surveillance UI we could build — no real charting, no per-market drill-down, no virtualised tables for the 24k-market universe. The current design separates the two halves on a clean JSON contract: FastAPI exposes everything the dashboard needs under `/api/dashboard/*` (typed responses, paginated, filterable), and a Vite + React + TypeScript frontend in `frontend/` consumes that surface. Pinned trade-offs: (1) **No SSR / Next.js.** Dashboard is read-only and authenticated-server-side eventually; client-side fetching with TanStack Query is enough and keeps the build trivial. (2) **No global state library.** All shared state (filters, search, sort, pagination) lives in URL search params via `react-router-dom`'s `useSearchParams` so a copy-pasted link reproduces the exact same filtered view, and TanStack Query handles server-state caching. (3) **TanStack Table over a custom grid.** 24k markets is well within its virtualised-row capacity; rolling our own would be busywork. (4) **TradingView `lightweight-charts` over Recharts for the price chart.** Same library Polymarket / Kalshi use; built-in crosshair, time-axis zoom, anomaly-marker overlay (`setMarkers`). Recharts is reserved for the small breakdown bar charts where its declarative React API wins. (5) **Single-process production deploy.** No nginx, no separate static host: FastAPI's catch-all route serves `frontend/dist/index.html` plus `assets/` directly. Mounting `StaticFiles(html=True)` at `/` was tried first and rejected because Starlette's mount-at-root absorbs sibling routes including `/api/*`; a path-based catch-all that explicitly skips reserved prefixes (`api/`, `docs`, `redoc`, `openapi.json`) routes correctly without trickery. (6) **Public-API namespace moved under `/api/*`.** `/health`, `/markets`, `/anomalies`, `/features` all gained the `/api` prefix so the SPA can own URL paths like `/markets/:id` without colliding. The router files themselves don't carry an `/api` prefix; it's added in `app/main.py` via `include_router(prefix="/api")` so each router stays composable in isolation. (7) **GDELT for correlated news, with explicit graceful degradation.** The detail page's news panel hits GDELT 2.0's free DOC API with a 5-second timeout. Any failure (network, parse, GDELT down) returns `provider="unavailable"` with an empty article list; the frontend renders an empty state rather than an error toast. Meaningful: the project is graded on its surveillance backend, not its news vendor — this fails open instead of breaking the page.
 - **Retention / scope policy in one place.** Whether a market deserves to be in the surveillance universe at all is a single decision encoded in `app/services/retention.py`: `EXCLUDED_CATEGORIES = {"exotic_combo", "crypto_strike"}` and `EXCLUDED_PRIORS = {"very_low"}`. Both the REST ingestor (`ingest_markets_payload`) and the WS lazy-upsert path (`_get_or_create_market`) call into the same predicate, so out-of-scope markets are dropped at the door — the classifier runs once per ingest, and the same `Classification` powers both the scope decision and the row stamping. The policy is a frozenset module constant rather than env config because "what does our system pay attention to" is the kind of decision a regulator wants to see in code review, not in a `.env`. Retroactive cleanup (`scripts/prune_markets.py`) reads the same predicate and uses the DB-level `ON DELETE CASCADE` (added in migration `f1a2c3d4b5e6`) so a single `DELETE FROM markets WHERE ...` cleans up every dependent row in `market_snapshots` / `trades` / `book_events` / `anomalies` — no slow ORM iteration, no orphaned children. Today's exclusions: Kalshi's `KXMVECROSSCATEGORY-*` parlay catalog (~285k rows of derived combinations whose manipulability-prior really should come from the constituent legs, which is a v2 problem) and `weather` (public physical underlying, no insider-leakable signal). Specifically *not* excluded: `low` priors like crypto strikes, because the trade tape itself can still surface spoofing / momentum-ignition signals that don't depend on the underlying being insider-leakable.
 - **Layered classifier with explicit confidence.** Markets are classified into a category / subcategory / manipulability-prior tuple by a four-layer pipeline (`app/services/classifier/`): Kalshi taxonomy adapter → ticker / regex prefix rules → k-NN over a small char-n-gram TF-IDF seed corpus → optional LLM zero-shot fallback. The first layer that returns `confidence != "low"` wins; lower-confidence verdicts are kept only as fallback when every later layer also abstains. The priority map (`priorities.py`) is the *only* place a human value judgment lives in the codebase — the classifiers themselves are mechanical. Trade-offs the design pins down: (1) **Off-the-shelf, not a trained model.** No labels, no class-imbalance fixes, no retraining cadence, and the explanation `"matched_rule=sports.ufc"` is regulator-defensible in a way that a model output isn't. (2) **No torch / sentence-transformers dep.** The k-NN layer is pure-stdlib char-n-gram TF-IDF — slightly less accurate than a sentence transformer but ~5MB instead of ~700MB, and the public API of the layer is the same so we can swap implementations if accuracy ever becomes the bottleneck. (3) **Layer 4 (LLM) defaults to a no-op.** Setting `default_llm_classifier()` to return `NullLLMClassifier()` means the orchestrator has a 4-layer architecture but the default deployment runs only 3 — opting in to Ollama / a cloud LLM is one config change. (4) **Low-confidence safety clamp.** When the orchestrator's final verdict is `confidence="low"`, `manipulability_prior` is clamped down from `high`/`medium_high` to `medium` so a misclassified market can't escalate onto the high-prior watchlist. (5) **Versioning.** A `CLASSIFIER_VERSION` int travels with every classification; a backfill script reclassifies on bump. Cosmetic refactors don't touch it; rule / seed / map changes do.
 
 ### Recent changes
 
 Most recent first.
+
+#### 2026-04-26 (later) — Overview bundle, public news windows
+
+- **`GET /api/dashboard/overview`:** one JSON with `stats` + `breakdown` + `top_markets` + `recent_anomalies`; the React home page uses this instead of four fetches. **Tests:** `tests/test_dashboard_api.py` (`test_overview_bundles_expected_keys` when `RUN_INTEGRATION=1`); `tests/test_news_gdelt.py` for pure helpers.
+- **News:** `app/services/news_gdelt.py` — boolean-style query from **title *OR* subtitle**; `align=activity` uses the latest trade or `anomalies` row to set a **narrow** window for comparing headlines to the tape. Market detail: toggle + local timestamps on each article. `.gitignore` now ignores a stray `nul` on Windows.
+
+#### 2026-04-26 — Triage vs evidence, stricter rules, local times, fewer chart markers
+
+- **Overview stats:** the **Triage (top prior)** number is **classifier** “high + elevated” *only* — it equals the **sum** of the “high” and “medium_high” bars in the breakdown chart, not a single bar and not by itself “suspicious trades.” **Markets with risk flags** = `COUNT(DISTINCT anomalies.market_pk)`; **Unusual activity rows** = total `anomalies` table rows. **Markets** table renames: **Triage** / **Flags** (with tooltips).
+- **`anomaly_engine`:** stricter rolling z, wider static spread, larger static volume-jump floors. **`anomaly_materializer`:** only persist / update when `score >= 3.0`; else delete a row for that `latest_snapshot_id` if present.
+- **`/markets?sort=surveillance_urgency`:** key is `(8 + 0.4 * (prior_rank+1)) * ln(1+anomaly_count)` when `anomaly_count > 0` so more stored flags outrank a higher triage with fewer.
+- **PriceChart:** `localization` so axis and crosshair use the **browser’s** locale/time; markers still skip `score < 3` (legacy low rows). **fmtTime** / trade column label **(local)**. Earlier same-day: step line, one marker per snap time, nearest-time snap, glossary on bars vs snapshot volume.
+
+#### 2026-04-25 — Rolling anomaly baselines, book churn, chart step line, full-row market links
+
+- **anomaly_engine:** rolling z vs recent snapshot history (spread, price move, volume delta) with static fallbacks when history is short; **book_activity_signals** (3m counts + pull volume) folded into the same score path. Default materializer **lookback 40** (WS + poller + `GET /anomaly` defaults updated). **Tests:** `tests/test_anomaly_engine.py`.
+- **Chart:** trade price line uses **step** interpolation so price does not drift diagonally between prints; markers show **rule flags** (first reason + score), skipping `severity=none`. **MarketCell:** entire title/subtitle/ticker row is one link to the detail page. **Overview** recent-flags list uses `MarketCell`.
+- **README:** shorter overview + glossary; architecture diagram updated; new **frontend** and **detection** mermaid figures; duplicate “how pieces interact” prose replaced with short bullets.
+
+#### 2026-04-25 — `surveillance_urgency` sort, per-trade suspicion, home link
+
+- **List ordering (`/api/dashboard/markets?sort=surveillance_urgency`).** If `anomaly_count = 0`, the sort key is a tiny floor so all “quiet” markets (including high triage) sort together by `updated_at`, not by prior. If `anomaly_count > 0`, the key is `(8 + 0.4 * (prior_rank+1)) * ln(1+count)` so **count** (evidence mass) dominates **prior**; a lower-triage market with more stored flags can outrank a high-triage one with a single row. The **Markets** page default is this mode; `sort=prior` is prior × trade count only.
+- **`app/services/trade_suspicion.py`.** For each print in the ascending trade tape, computes a 0–20 capped score from **windowed z-scores** of contract size and of one-tick |Δ yes price| against *this* market’s own recent history (v1, no ML). `GET /api/dashboard/markets/{id}/series` attaches a `suspicion` field per trade. The market detail table adds an “Unusual” column and can amber-highlight rows with score ≥2 in addition to the large-size / large-jump heuristics.
+- **UI:** header **logo + title** is a `Link` to `/`. Overview breakdown charts and markets filter chips **omit** the `unclassified` / “not set” bucket so the bars are not dominated by NULL labels (counts still count toward `/stats`).
+
+#### 2026-04-25 — Dashboard copy and drill-down; `unclassified` list filter
+
+- **Why it mattered:** Breakdown charts label NULL `markets.category` as the string `"unclassified"` via `coalesce` in SQL, but `GET /api/dashboard/markets?category=unclassified` previously compared to the literal string and returned nothing. The list filter now treats `category=unclassified` as `Market.category IS NULL` and `prior=unclassified` as `manipulability_prior IS NULL`, matching the charts and the markets browser chips.
+- **`GET /api/dashboard/markets/{id}`** includes `liquidity_dollars` on `latest_snapshot` when the DB has it (exchange-reported book depth on the last quote row).
+- **Frontend** (`frontend/src/lib/labels.ts`, Overview, Markets browser, Market detail, `MarketCell`): replaces internal jargon in the main UI (e.g. “pending hydration”, “WS trade tape”, “delta”, “high prior”) with short plain-language strings and optional `title` tooltips where a one-line definition helps. Overview breakdown bars use a wider Y-axis, `interval={0}`, end-of-bar counts via `LabelList`, and **click-through** plus an always-visible **link list** under each chart to `/markets?sort=trades_desc&category=...` or `&prior=...`. Market detail adds **Δ from previous** on the latest 30 prints, **amber row highlights** for large size (p90 in window, floor 25 contracts) or ≥$0.08 price change vs the previous trade, and shows **book liquidity (reported)** when present.
+- **Tests:** `tests/test_dashboard_api.py` asserts `category=unclassified` returns only rows with `category is null` when the integration DB is used.
+
+#### 2026-04-25 — Dashboard rebuild: Vite + React frontend, JSON-only API
+
+The previous "embedded HTML in `app/api/routes/dashboard.py`" page was good enough for a 5-second-poll demo of three counters and a top-markets list, and exactly nothing more. Once the universe stabilised at ~24k markets and the classifier landed, the surveillance product we *want* to demo became too rich for that page — server-paginated tables, per-market price charts, anomaly markers on the chart, drill-down with correlated news. None of that is reasonable to build in a Python module that returns a string.
+
+The headline design idea is **separate the two halves on a typed JSON contract**: FastAPI exposes everything the dashboard needs under `/api/dashboard/*`, and a Vite + React + TypeScript SPA in `frontend/` consumes that surface. Same backend, same DB, same auth model later — but the UI is now in the language UIs are written in.
+
+- **Backend: `app/api/routes/dashboard.py` is now JSON-only.** The embedded HTML / vanilla-JS page is deleted. New endpoints, all under `/api/dashboard/*`:
+  - `GET /stats` — system counters (`markets`, `markets_status_unknown`, `market_snapshots`, `trades`, `book_events`, `anomalies`).
+  - `GET /breakdown` — pivot tables of the universe by `category`, `manipulability_prior`, `classifier_confidence`. The Overview page renders these as the three Recharts bar charts.
+  - `GET /markets` — paginated, filterable, sortable. Query params: `q` (free-text on title/subtitle/market_id), `category`, `prior`, `confidence`, `status`, `sort` (`trade_count` | `volume_24h` | `last_price` | `updated_at` | `title`), `direction`, `page`, `page_size`. Server-side filtering is non-negotiable at 24k rows — paging only the network surface, not the DB query, would be a footgun.
+  - `GET /markets/{market_id}` — full detail row plus aggregated counters (24h trade count, 24h volume, last snapshot price).
+  - `GET /markets/{market_id}/series?lookback_minutes=…&limit=…` — time-bucketed price + volume series for the chart, plus the raw trade tape window.
+  - `GET /markets/{market_id}/anomalies` — paginated per-market anomaly stream for the detail page's anomaly list and the chart's markers.
+  - `GET /markets/{market_id}/news?lookback_hours=…` — proxies GDELT 2.0 DOC API. Returns `{ provider: "gdelt"|"unavailable", articles: [...] }`. `httpx.AsyncClient` with a 5s timeout; any failure (network, parse, GDELT down) returns `provider="unavailable"` with empty articles. The frontend renders an empty state on `unavailable` rather than a toast / error — news is decorative, not load-bearing.
+  - `GET /anomalies` — recent anomalies across the whole universe, joined with market metadata.
+  - `GET /top-markets` — ranked by trade count for the Overview page.
+  
+  One subtle SQL bug got fixed in the markets-list query along the way: when sorting by `trade_count`, an outer-joined subquery's `c` column was wrapped in `COALESCE(c, 0)` *after* `desc()`, producing `COALESCE(c DESC, 0)` which is invalid SQL. The fix is `func.coalesce(sub.c.c, 0).desc()` so the ordering applies to the coalesced expression. Caught only by the smoke test, not by unit tests — `c` happened to be non-null in fixtures.
+
+- **`app/main.py` routing changes.** Three pieces had to come together to make API + SPA coexist on one origin:
+  1. **All public-API routers gained an `/api` prefix** via `include_router(prefix="/api")` (health, markets, features, anomalies). The dashboard router already had `/api/dashboard` as its own prefix and stayed unchanged. Each router file is unaware of its mount prefix, so they remain composable.
+  2. **A path-based catch-all serves the SPA.** `@app.get("/{full_path:path}")` returns `frontend/dist/<path>` if it's a file, else `frontend/dist/index.html`. Reserved prefixes (`api/`, `docs`, `redoc`, `openapi.json`) explicitly raise 404 from the catch-all so they fall through to FastAPI's actual routing. We tried `app.mount("/", StaticFiles(html=True))` first and rejected it: Starlette mounts at the root absorb sibling paths including `/api/*`, which silently broke every API call.
+  3. **`response_model=None`** on the catch-all decorator. FastAPI's Pydantic introspection chokes on the `FileResponse | HTMLResponse` union return type. Disabling response-model generation for that one route is the surgical fix.
+
+- **Frontend: `frontend/`, Vite + React 18 + TS.** Pinned dependency choices:
+  - **Tailwind + a small set of hand-rolled components** (`Card`, `Badge`, `StatusDot`, `Skeleton`, `MarketCell`) instead of pulling in a full component kit. shadcn/ui is referenced in the styling tokens (CSS variables for `--background`, `--foreground`, `--ring`, etc.) so we can paste their components in later without restyling.
+  - **TanStack Query** for all data fetching. Default `staleTime: 30s` with `refetchOnWindowFocus: true` is the right shape for a surveillance dashboard — refresh when you tab back, don't hammer the API while you're staring at it.
+  - **All shared filter state lives in URL search params** via `react-router-dom`'s `useSearchParams`. A pasted link reproduces the exact same filtered view and the back button works correctly. No Redux, no Zustand.
+  - **TanStack Table** for the markets browser. 24k rows is well within its virtualised-row capacity; filtering / sorting / pagination are server-driven via the API.
+  - **TradingView `lightweight-charts`** for the price/volume chart. Same library Polymarket / Kalshi use; built-in crosshair and time-axis zoom; anomaly markers via `series.setMarkers()` overlaid on the line series. `Recharts` is reserved for the small declarative breakdown bar charts on the Overview page where its React-y API wins.
+  - **Three pages**: `Overview` (`/`), `MarketsBrowser` (`/markets`), `MarketDetail` (`/markets/:marketId`).
+
+- **Single-process production deploy.** No nginx, no separate static host. `npm run build` outputs to `frontend/dist/`, and FastAPI's catch-all serves it. Same Uvicorn process serves the API and the bundle. `frontend/dist/`, `frontend/node_modules/`, `frontend/.vite/`, and `tools/` (portable Node bundle for environments without Node 18+) are gitignored.
+
+- **Tests (`tests/test_dashboard_api.py`).** New integration-style smoke suite gated on `RUN_INTEGRATION=1`: every `/api/dashboard/*` endpoint is hit with a real DB and asserted to return the documented shape, plus regression tests for `/api/health` (unchanged behaviour after the `/api` prefix migration), `/api/foo` (404 from FastAPI, not the SPA fallback), and `/markets/foo` (SPA fallback returns `index.html`, *not* a 404). 100 tests pass; 20 integration tests skip without `RUN_INTEGRATION=1` as expected.
+
+- **Smoke run end-to-end**: `npm run build` → `uvicorn app.main:app` → all three pages render against the live DB; markets browser sorts by trade count and volume_24h; market detail's price chart shows real data with anomaly markers; news panel correctly degrades when GDELT's TLS handshake times out from the dev network. `ruff check` clean, `pytest` 100 passed / 20 skipped.
 
 #### 2026-04-25 — Retention follow-up: exclude crypto strikes; backfill stub backlog
 
@@ -347,7 +476,10 @@ python -m venv .venv
 # One-shot universe bootstrap (paginated cursor sweep over open markets)
 PYTHONPATH=. .venv/Scripts/python -m scripts.bootstrap_markets --status open
 
-# Serve the API
+# Build the dashboard frontend (one-time, then on every frontend change)
+cd frontend && npm install && npm run build && cd ..
+
+# Serve the API + dashboard from one process
 .venv/Scripts/python -m uvicorn app.main:app --reload
 
 # Run the WS consumer (ticker + trade + orderbook_delta)
@@ -373,7 +505,10 @@ PYTHONPATH=. .venv/Scripts/python scripts/prune_markets.py            # dry-run
 PYTHONPATH=. .venv/Scripts/python scripts/prune_markets.py --execute  # actually delete
 
 # Then open http://127.0.0.1:8000/ for the live dashboard
-# (or http://127.0.0.1:8000/docs for interactive Swagger)
+# (or http://127.0.0.1:8000/docs for interactive Swagger).
+# For frontend hot-reload during development, run Vite's dev server in
+# parallel: `cd frontend && npm run dev` → http://127.0.0.1:5173/
+# (it proxies /api/* to the FastAPI process on :8000).
 
 # Materialize anomalies over recent snapshots
 PYTHONPATH=. .venv/Scripts/python scripts/materialize_anomalies.py

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_db
 from app.db.models import Anomaly, Market, MarketSnapshot
 from app.services.anomaly_engine import analyze_market
+from app.services.book_activity_signals import collect_book_activity_signals
 
 router = APIRouter(tags=["anomalies"])
 
@@ -11,7 +12,7 @@ router = APIRouter(tags=["anomalies"])
 @router.get("/markets/{market_id}/anomaly")
 def get_market_anomaly(
     market_id: str,
-    lookback: int = Query(default=5, ge=1, le=50),
+    lookback: int = Query(default=40, ge=1, le=80),
     db: Session = Depends(get_db),
 ) -> dict:
     market = db.query(Market).filter(Market.market_id == market_id).one_or_none()
@@ -26,7 +27,8 @@ def get_market_anomaly(
         .all()
     )
 
-    return analyze_market(market, snapshots)
+    book_raw = collect_book_activity_signals(db, market.id)
+    return analyze_market(market, snapshots, book_activity=book_raw)
 
 @router.get("/anomalies/stored")
 def list_stored_anomalies(
@@ -70,7 +72,7 @@ def list_stored_anomalies(
 def list_anomalies(
     market_limit: int = Query(default=50, ge=1, le=200),
     result_limit: int = Query(default=20, ge=1, le=100),
-    lookback: int = Query(default=5, ge=1, le=50),
+    lookback: int = Query(default=40, ge=1, le=80),
     db: Session = Depends(get_db),
 ) -> dict:
     markets = (
@@ -94,7 +96,8 @@ def list_anomalies(
         if not snapshots:
             continue
 
-        analysis = analyze_market(market, snapshots)
+        book_raw = collect_book_activity_signals(db, market.id)
+        analysis = analyze_market(market, snapshots, book_activity=book_raw)
         results.append(analysis)
 
     results.sort(key=lambda x: x["score"], reverse=True)

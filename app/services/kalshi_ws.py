@@ -112,7 +112,7 @@ def handle_ticker_message(data: dict) -> None:
         materialize_market_anomaly(
             db,
             market,
-            lookback=5,
+            lookback=40,
             latest_snapshot_id=snapshot.id,
         )
         db.commit()
