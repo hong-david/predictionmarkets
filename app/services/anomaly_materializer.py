@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 from sqlalchemy.orm import Session
 
 from app.db.models import Anomaly, Market, MarketSnapshot
 from app.services.anomaly_engine import analyze_market
+from app.services.book_activity_signals import collect_book_activity_signals
+
+# Do not store / refresh rows for weak scores — they dominated the market-detail
+# chart. ~3.0 ≈ a single "medium" rule firing with headroom, or a few stacked
+# low signals. Tune alongside `anomaly_engine` thresholds.
+_MIN_SCORE_TO_PERSIST = 3.0
 
 
 def materialize_market_anomaly(
     db: Session,
     market: Market,
-    lookback: int = 5,
+    lookback: int = 40,
     latest_snapshot_id: int | None = None,
 ) -> dict[str, int]:
     snapshots = (
@@ -19,10 +27,16 @@ def materialize_market_anomaly(
     )
 
     if not snapshots:
-        return {"created_anomalies": 0, "updated_anomalies": 0}
+        return {
+            "created_anomalies": 0,
+            "updated_anomalies": 0,
+            "deleted_anomalies": 0,
+        }
 
-    analysis = analyze_market(market, snapshots)
+    book_raw = collect_book_activity_signals(db, market.id)
+    analysis = analyze_market(market, snapshots, book_activity=book_raw)
     effective_latest_snapshot_id = latest_snapshot_id or snapshots[0].id
+    score = float(analysis["score"])
 
     existing = (
         db.query(Anomaly)
@@ -33,12 +47,30 @@ def materialize_market_anomaly(
         .one_or_none()
     )
 
-    if existing:
+    if score < _MIN_SCORE_TO_PERSIST:
+        if existing is not None:
+            db.delete(existing)
+            return {
+                "created_anomalies": 0,
+                "updated_anomalies": 0,
+                "deleted_anomalies": 1,
+            }
+        return {
+            "created_anomalies": 0,
+            "updated_anomalies": 0,
+            "deleted_anomalies": 0,
+        }
+
+    if existing is not None:
         existing.score = analysis["score"]
         existing.severity = analysis["severity"]
         existing.reasons = analysis["reasons"]
         existing.signals = analysis["signals"]
-        return {"created_anomalies": 0, "updated_anomalies": 1}
+        return {
+            "created_anomalies": 0,
+            "updated_anomalies": 1,
+            "deleted_anomalies": 0,
+        }
 
     row = Anomaly(
         market_pk=market.id,
@@ -49,16 +81,21 @@ def materialize_market_anomaly(
         signals=analysis["signals"],
     )
     db.add(row)
-    return {"created_anomalies": 1, "updated_anomalies": 0}
+    return {
+        "created_anomalies": 1,
+        "updated_anomalies": 0,
+        "deleted_anomalies": 0,
+    }
 
 
 def materialize_anomalies(
     db: Session,
     market_limit: int = 100,
-    lookback: int = 5,
+    lookback: int = 40,
 ) -> dict[str, int]:
     created = 0
     updated = 0
+    deleted = 0
 
     markets = db.query(Market).order_by(Market.id.desc()).limit(market_limit).all()
 
@@ -66,10 +103,12 @@ def materialize_anomalies(
         result = materialize_market_anomaly(db, market, lookback=lookback)
         created += result["created_anomalies"]
         updated += result["updated_anomalies"]
+        deleted += result["deleted_anomalies"]
 
     db.commit()
 
     return {
         "created_anomalies": created,
         "updated_anomalies": updated,
+        "deleted_anomalies": deleted,
     }

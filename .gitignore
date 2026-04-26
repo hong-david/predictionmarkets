@@ -4,3 +4,16 @@ __pycache__/
 .env
 *.key
 *.pem
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Local toolchain (portable Node download for environments without modern Node).
+# Not part of the project; do not commit ~200MB of binaries.
+tools/
+
+# Windows creates this filename when a command line is wrong; never commit.
+nul
