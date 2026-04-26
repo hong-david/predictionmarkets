@@ -40,6 +40,7 @@ from app.db.session import SessionLocal
 from app.services.anomaly_materializer import materialize_anomalies
 from app.services.kalshi_rest import KalshiRestClient
 from app.services.market_ingestor import chunked, ingest_markets_payload
+from scripts.hydrate_unknown_markets import hydrate_unknown_tickers
 
 
 def _utc_now() -> str:
@@ -53,6 +54,8 @@ def run_cycle(
     max_markets: int | None,
     anomaly_market_limit: int,
     anomaly_lookback: int,
+    hydrate_unknown_max: int,
+    hydrate_unknown_sleep: float,
 ) -> dict[str, int]:
     """Single sweep over Kalshi /markets, batched ingest, then anomaly materialize.
 
@@ -97,6 +100,16 @@ def run_cycle(
         )
     finally:
         db.close()
+
+    if hydrate_unknown_max > 0:
+        hydrate_result = hydrate_unknown_tickers(
+            top_by_trades=True,
+            max_markets=hydrate_unknown_max,
+            sleep_seconds=hydrate_unknown_sleep,
+        )
+        totals["hydrated_unknown"] = hydrate_result["hydrated"]
+        totals["missing_unknown"] = hydrate_result["missing"]
+        totals["errored_unknown"] = hydrate_result["errored"]
 
     return totals
 
@@ -143,6 +156,18 @@ def main() -> None:
         action="store_true",
         help="Run a single cycle and exit (useful for cron / CI / smoke tests).",
     )
+    parser.add_argument(
+        "--hydrate-unknown-max",
+        type=int,
+        default=250,
+        help="Per cycle, hydrate this many status='unknown' tickers by per-market REST lookup. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--hydrate-unknown-sleep",
+        type=float,
+        default=0.02,
+        help="Seconds between per-ticker hydration calls. Default: 0.02.",
+    )
     args = parser.parse_args()
 
     status = None if args.status == "all" else args.status
@@ -161,6 +186,8 @@ def main() -> None:
                 max_markets=args.max,
                 anomaly_market_limit=args.anomaly_market_limit,
                 anomaly_lookback=args.anomaly_lookback,
+                hydrate_unknown_max=args.hydrate_unknown_max,
+                hydrate_unknown_sleep=args.hydrate_unknown_sleep,
             )
             if args.once:
                 return

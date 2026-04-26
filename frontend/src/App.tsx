@@ -1,6 +1,7 @@
 import { Activity } from "lucide-react";
 import { Link, NavLink, Route, Routes } from "react-router-dom";
 
+import EventGroupPage from "./routes/EventGroup";
 import MarketDetailPage from "./routes/MarketDetail";
 import MarketsBrowserPage from "./routes/MarketsBrowser";
 import OverviewPage from "./routes/Overview";
@@ -42,7 +43,7 @@ export default function App() {
                 Prediction Market Surveillance
               </div>
               <div className="text-[11px] text-muted-foreground">
-                Live data from Kalshi · flags for unusual prices and volume
+                Monitoring public Kalshi data for unusual market activity
               </div>
             </div>
           </Link>
@@ -56,6 +57,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<OverviewPage />} />
           <Route path="/markets" element={<MarketsBrowserPage />} />
+          <Route path="/events/:eventId" element={<EventGroupPage />} />
           <Route path="/markets/:marketId" element={<MarketDetailPage />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

@@ -1,19 +1,28 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { ArrowLeft, ExternalLink } from "lucide-react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { api } from "@/api/client";
 import type { AnomalyRow, TradePoint } from "@/api/types";
 import { Badge, priorVariant, severityVariant } from "@/components/Badge";
 import { layerDisplay, priorDisplay } from "@/lib/labels";
+import { humanizeAnomalyReason } from "@/lib/reasonPhrases";
 import { Card, CardBody, CardHeader } from "@/components/Card";
 import { PriceChart } from "@/components/PriceChart";
 import { EmptyState, Skeleton } from "@/components/StatusBits";
-import { fmtAgo, fmtInt, fmtPrice, fmtTime } from "@/lib/utils";
+import {
+  fmtAgo,
+  fmtInt,
+  fmtPrice,
+  fmtTime,
+  tradeTimestampsForAudit,
+} from "@/lib/utils";
 
 export default function MarketDetailPage() {
   const { marketId = "" } = useParams<{ marketId: string }>();
+  const [searchParams] = useSearchParams();
+  const highlightedTradeTs = searchParams.get("trade_ts");
   const [newsAlign, setNewsAlign] = useState<"default" | "activity">("activity");
 
   const detail = useQuery({
@@ -60,10 +69,40 @@ export default function MarketDetailPage() {
   }
 
   const m = detail.data;
-  const tradeHighlights = useMemo(
-    () => buildTradeHighlights(series.data?.trades),
-    [series.data?.trades],
-  );
+  const { tradeHighlights, topSuspiciousTrades } = useMemo(() => {
+    const trades = series.data?.trades;
+    if (!trades?.length) {
+      return {
+        tradeHighlights: new Map<
+          TradePoint,
+          { bigSize: boolean; bigJump: boolean; delta: number | null }
+        >(),
+        topSuspiciousTrades: [] as TradePoint[],
+      };
+    }
+    const highlights = buildTradeHighlights(trades);
+    const topSuspiciousTrades = [...trades]
+      .sort((a, b) => compareTradesBySuspiciousness(a, b, highlights))
+      .slice(0, 30);
+    return { tradeHighlights: highlights, topSuspiciousTrades };
+  }, [series.data?.trades]);
+
+  const alertWhyBullets = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const a of anomalies.data?.anomalies ?? []) {
+      for (const r of a.reasons ?? []) {
+        const h = humanizeAnomalyReason(r);
+        if (!seen.has(h)) {
+          seen.add(h);
+          out.push(h);
+        }
+        if (out.length >= 10) break;
+      }
+      if (out.length >= 10) break;
+    }
+    return out;
+  }, [anomalies.data?.anomalies]);
 
   return (
     <div className="space-y-4">
@@ -95,7 +134,10 @@ export default function MarketDetailPage() {
                     </div>
                   ) : null}
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                    <code className="font-mono text-xs text-muted-foreground">
+                    <code
+                      className="font-mono text-xs text-muted-foreground"
+                      title="Kalshi market ticker (this contract’s tape and chart)"
+                    >
                       {m.market_id}
                     </code>
                     {m.status ? (
@@ -125,6 +167,24 @@ export default function MarketDetailPage() {
                       </Badge>
                     ) : null}
                   </div>
+                  {m.event_id ? (
+                    <div className="mt-2 text-xs text-muted-foreground">
+                      <span className="text-[11px] uppercase tracking-wider">
+                        Event (Kalshi event_ticker)
+                      </span>
+                      <div className="mt-0.5 flex items-center gap-2 flex-wrap">
+                        <code className="font-mono text-[11px] break-all">
+                          {m.event_id}
+                        </code>
+                        <Link
+                          to={`/events/${encodeURIComponent(m.event_id)}`}
+                          className="text-primary hover:underline whitespace-nowrap"
+                        >
+                          All contracts in this event
+                        </Link>
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
                 <div className="text-right">
                   <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -149,8 +209,8 @@ export default function MarketDetailPage() {
               <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
                 <Stat label="Trades" value={fmtInt(m.stats.trade_count)} />
                 <Stat
-                  label="Rule rows"
-                  title="Number of materialized anomaly rows: one per ticker quote snapshot that met the score floor — not one per trade. Hot markets can have many more of these than execution prints."
+                  label="Stored alerts"
+                  title="Rows in the alerts table for this market — mostly one per quote snapshot that met the score floor, not one per trade."
                   value={fmtInt(m.anomaly_count)}
                 />
                 <Stat
@@ -166,6 +226,31 @@ export default function MarketDetailPage() {
                   value={fmtAgo(m.stats.last_trade_ts)}
                 />
               </div>
+              <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm border-t border-border pt-3">
+                <Stat
+                  label="Evidence (0–100)"
+                  title="From stored alert rows and how many there are, not the manipulability prior alone."
+                  value={String(m.evidence_score ?? "—")}
+                />
+                <Stat
+                  label="Urgency (0–100)"
+                  title="Combined ‘Alerts first’ score: evidence + category priority, same family as the markets list sort."
+                  value={String(m.urgency_score ?? "—")}
+                />
+                <Stat
+                  label="Category priority"
+                  title="Classifier `manipulability_prior` bucket (what to watch), separate from whether alerts fired."
+                  value={m.market_priority ?? "—"}
+                />
+              </div>
+              {m.reasons && m.reasons.length > 0 ? (
+                <div
+                  className="mt-2 text-xs text-muted-foreground font-mono"
+                  title="Machine-readable reason slugs from materialized alert rows (deduped)"
+                >
+                  Reason codes: {m.reasons.join(" · ")}
+                </div>
+              ) : null}
             </>
           ) : null}
         </CardBody>
@@ -175,9 +260,22 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="Step price. Bars: contracts in that print (green = taker yes, red = taker no). Arrows: rule scores on quote updates — ‘volume’ uses cumulative exchange volume between polls vs recent history, not bar height, so active minutes can show many flags with tiny bars. Nearest print time. X-axis shows seconds. Pan and zoom."
+          subtitle="Each point is a trade’s yes price. Curve: spline through prints (peaks are real prints, not a bid/ask band). Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. If several prints share one second, the x-axis nudges +1s so every print is visible. Bars: contracts in that print. Arrows: materialized rule rows on quotes (volume uses cumulative exchange volume, not bar height). Pan and zoom."
           right={
-            series.data ? `${fmtInt(series.data.trades.length)} trades shown` : ""
+            series.data
+              ? [
+                  `${fmtInt(series.data.trades.length)} trades shown`,
+                  series.data.tape_cluster
+                    ? ` · tape burst ${series.data.tape_cluster.burst_score_0_10.toFixed(1)}/10 (${series.data.tape_cluster.largest_window_count} in ${series.data.tape_cluster.window_sec}s${
+                        series.data.tape_cluster.dominant_side
+                          ? `, ${series.data.tape_cluster.dominant_side}`
+                          : ""
+                      })`
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join("")
+              : ""
           }
         />
         <CardBody className="p-0">
@@ -192,6 +290,7 @@ export default function MarketDetailPage() {
               <PriceChart
                 series={series.data}
                 anomalies={anomalies.data?.anomalies}
+                highlightTs={highlightedTradeTs}
               />
             </div>
           )}
@@ -202,8 +301,8 @@ export default function MarketDetailPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader
-            title="Unusual activity"
-            subtitle="Heuristic flags from each quote snapshot (spread, move size, etc.)"
+            title="Stored alerts"
+            subtitle="Rules on each quote snapshot (spread, volume step, book activity) — not one row per trade."
             right={
               anomalies.data ? `${fmtInt(anomalies.data.count)} total` : ""
             }
@@ -214,13 +313,27 @@ export default function MarketDetailPage() {
                 <Skeleton className="h-32" />
               </div>
             ) : !anomalies.data?.anomalies.length ? (
-              <EmptyState>No anomalies detected for this market.</EmptyState>
+              <EmptyState>No stored alerts for this market.</EmptyState>
             ) : (
-              <ul className="divide-y divide-border max-h-[480px] overflow-auto">
-                {anomalies.data.anomalies.map((a) => (
-                  <AnomalyRowItem key={a.id} a={a} />
-                ))}
-              </ul>
+              <>
+                {alertWhyBullets.length > 0 ? (
+                  <div className="px-4 py-3 border-b border-border bg-secondary/20 text-xs text-muted-foreground">
+                    <div className="font-medium text-foreground mb-2">
+                      Why you might see an alert
+                    </div>
+                    <ul className="list-disc pl-4 space-y-1.5 leading-snug">
+                      {alertWhyBullets.map((t) => (
+                        <li key={t}>{t}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                <ul className="divide-y divide-border max-h-[480px] overflow-auto">
+                  {anomalies.data.anomalies.map((a) => (
+                    <AnomalyRowItem key={a.id} a={a} />
+                  ))}
+                </ul>
+              </>
             )}
           </div>
         </Card>
@@ -324,41 +437,64 @@ export default function MarketDetailPage() {
       {series.data?.trades.length ? (
         <Card>
           <CardHeader
-            title="Recent trades (latest 30)"
-            subtitle="Amber rows: large or jumpy print (heuristic) or a high “unusual” score vs this market’s own recent history — not a fraud judgment. “Side” is who was aggressive on the feed."
+            title="Trades (top 30 by outlier signal)"
+            subtitle="Ranked by local outlier score, then cluster score, then size/move heuristics, then time — not chronology. Same tape as the chart. Amber rows: large or jumpy print, outlier ≥3.5, or cluster ≥3.5 — not a fraud judgment. Clustering is from public tape only, not account identity."
           />
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead>
                 <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
-                  <th className="text-left px-4 py-2 font-medium">Time (local)</th>
+                  <th
+                    className="text-left px-4 py-2 font-medium"
+                    title="Local browser time, US Eastern, and UTC for the same exchange timestamp — use when comparing to Kalshi’s site."
+                  >
+                    Time
+                  </th>
                   <th className="text-left px-4 py-2 font-medium">Side</th>
                   <th className="text-right px-4 py-2 font-medium">Yes price</th>
                   <th className="text-right px-4 py-2 font-medium">Δ from prev</th>
                   <th
                     className="text-right px-3 py-2 font-medium"
-                    title="Size and |Δ price| vs a rolling local window; higher = more atypical for this market only (0–20 cap)"
+                    title="Local trade outlier score: size and |Δ yes price| vs recent prints on this market (0–10, not a verdict)"
                   >
-                    Unusual
+                    Outlier
+                  </th>
+                  <th
+                    className="text-right px-3 py-2 font-medium"
+                    title="0–10: many prints in a short window with skewed taker side (behavioral cluster, not an account id)"
+                  >
+                    Cluster
                   </th>
                   <th className="text-right px-4 py-2 font-medium">Contracts</th>
                 </tr>
               </thead>
               <tbody>
-                {series.data.trades.slice(-30).reverse().map((t, i) => {
+                {topSuspiciousTrades.map((t, i) => {
                   const h = tradeHighlights?.get(t) ?? { bigSize: false, bigJump: false, delta: null as number | null };
                   const sus = t.suspicion;
-                  const susHigh = sus != null && sus >= 2.0;
+                  const cl = t.cluster_0_10;
+                  const susHigh = sus != null && sus >= 3.5;
+                  const clHigh = cl != null && cl >= 3.5;
+                  const selected = highlightedTradeTs && t.ts === highlightedTradeTs;
                   const rowFlash =
-                    h.bigSize || h.bigJump || susHigh
+                    selected || h.bigSize || h.bigJump || susHigh || clHigh
                       ? "bg-[hsl(var(--severity-medium))]/15 ring-1 ring-inset ring-[hsl(var(--severity-medium))]/40"
                       : "";
+                  const ts3 = tradeTimestampsForAudit(t.ts);
                   return (
                     <tr
-                      key={i}
+                      key={`${t.ts ?? ""}-${i}-${t.suspicion ?? 0}`}
                       className={`border-b border-border last:border-0 text-sm ${rowFlash}`}
                     >
-                      <td className="px-4 py-1.5 num text-muted-foreground">{fmtTime(t.ts)}</td>
+                      <td
+                        className="px-4 py-1.5 text-muted-foreground"
+                        title={`Local: ${ts3.local}\nET: ${ts3.eastern}\nUTC: ${ts3.utc}`}
+                      >
+                        <div className="text-foreground text-xs num">{ts3.local}</div>
+                        <div className="text-[10px] num leading-tight">
+                          {ts3.eastern} · {ts3.utc}
+                        </div>
+                      </td>
                       <td className="px-4 py-1.5">
                         {t.taker_side === "yes" ? (
                           <span className="text-[hsl(var(--severity-low))] uppercase text-[11px] tracking-wider font-semibold" title="Taker bought yes">yes</span>
@@ -374,6 +510,9 @@ export default function MarketDetailPage() {
                       </td>
                       <td className="px-3 py-1.5 text-right num text-muted-foreground">
                         {sus == null ? "—" : sus.toFixed(2)}
+                      </td>
+                      <td className="px-3 py-1.5 text-right num text-muted-foreground">
+                        {cl == null ? "—" : cl.toFixed(2)}
                       </td>
                       <td className="px-4 py-1.5 text-right num">
                         {fmtInt(t.count != null ? Math.round(t.count) : null)}
@@ -394,6 +533,24 @@ export default function MarketDetailPage() {
       ) : null}
     </div>
   );
+}
+
+/** Sort descending: API outlier, burst cluster, then heuristic flags, then newest. */
+function compareTradesBySuspiciousness(
+  a: TradePoint,
+  b: TradePoint,
+  h: Map<TradePoint, { bigSize: boolean; bigJump: boolean; delta: number | null }>,
+): number {
+  const sa = a.suspicion ?? 0;
+  const sb = b.suspicion ?? 0;
+  if (sb !== sa) return sb - sa;
+  const ca = a.cluster_0_10 ?? 0;
+  const cb = b.cluster_0_10 ?? 0;
+  if (cb !== ca) return cb - ca;
+  const ha = (h.get(a)?.bigSize ? 2 : 0) + (h.get(a)?.bigJump ? 1 : 0);
+  const hb = (h.get(b)?.bigSize ? 2 : 0) + (h.get(b)?.bigJump ? 1 : 0);
+  if (hb !== ha) return hb - ha;
+  return String(b.ts ?? "").localeCompare(String(a.ts ?? ""));
 }
 
 function buildTradeHighlights(

@@ -1,5 +1,6 @@
 import type {
   Breakdown,
+  EventGroup,
   MarketAnomalies,
   MarketDetail,
   MarketNews,
@@ -7,6 +8,7 @@ import type {
   MarketsList,
   DashboardOverview,
   RecentAnomaliesList,
+  SuspiciousTradesList,
   SystemStats,
   TopMarketsList,
 } from "./types";
@@ -52,6 +54,7 @@ export const api = {
     prior?: string;
     confidence?: string;
     status?: string;
+    include_unhydrated?: boolean;
     sort?:
       | "trades_desc"
       | "trades_asc"
@@ -64,6 +67,9 @@ export const api = {
     limit?: number;
     offset?: number;
   }) => get<MarketsList>("/api/dashboard/markets", params),
+  /** Kalshi `event_ticker` = `Market.event_id`: all leg contracts in one event. */
+  eventGroup: (eventId: string) =>
+    get<EventGroup>(`/api/dashboard/events/${encodeURIComponent(eventId)}`),
   marketDetail: (id: string) =>
     get<MarketDetail>(`/api/dashboard/markets/${encodeURIComponent(id)}`),
   marketSeries: (id: string, limit = 2000) =>
@@ -88,4 +94,6 @@ export const api = {
     get<TopMarketsList>("/api/dashboard/top-markets", { limit }),
   recentAnomalies: (limit = 20, severity?: string) =>
     get<RecentAnomaliesList>("/api/dashboard/anomalies", { limit, severity }),
+  suspiciousTrades: (limit = 25) =>
+    get<SuspiciousTradesList>("/api/dashboard/suspicious-trades", { limit }),
 };

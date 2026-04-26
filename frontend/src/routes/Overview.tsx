@@ -12,13 +12,13 @@ import {
 import { Link, useNavigate } from "react-router-dom";
 
 import { api } from "@/api/client";
-import type { BreakdownEntry } from "@/api/types";
+import type { BreakdownEntry, SuspiciousTrade } from "@/api/types";
 import { Badge, severityVariant } from "@/components/Badge";
 import { Card, CardBody, CardHeader } from "@/components/Card";
 import { MarketCell } from "@/components/MarketCell";
 import { categoryDisplay, priorDisplay, priorShort } from "@/lib/labels";
 import { EmptyState, Skeleton, StatusDot } from "@/components/StatusBits";
-import { fmtAgo, fmtInt } from "@/lib/utils";
+import { fmtAgo, fmtInt, fmtPrice, fmtTime } from "@/lib/utils";
 
 /** Order priors high → low so chart bars line up with intuition. */
 const PRIOR_ORDER: Record<string, number> = {
@@ -96,6 +96,7 @@ export default function OverviewPage() {
   const br = overview.data?.breakdown;
   const topM = overview.data?.top_markets;
   const recentFlags = overview.data?.recent_anomalies;
+  const suspiciousTrades = overview.data?.suspicious_trades;
 
   const updated = overview.dataUpdatedAt
     ? `updated ${fmtAgo(new Date(overview.dataUpdatedAt).toISOString())}`
@@ -175,15 +176,15 @@ export default function OverviewPage() {
               sub={`${fmtInt(st.markets_status_unknown)} still loading titles from the exchange`}
             />
             <StatTile
-              label="Triage (top prior)"
+              label="High-priority markets"
               value={fmtInt(st.markets_high_prior)}
-              sub="“High” + “elevated” classifier buckets only — equals the sum of those two bars below, not one bar and not by itself “suspicious trades”"
+              sub="“High” + “elevated” priority (classifier) — sum of the two left bars, not a single bar and not “bad trades” by itself"
               tone="primary"
             />
             <StatTile
-              label="Markets with risk flags"
+              label="Markets with alerts"
               value={fmtInt(st.markets_with_flags)}
-              sub="At least one stored rule score on the market (see list default sort)"
+              sub="At least one stored alert row; use the Markets list default sort to rank them"
             />
             <StatTile
               label="Trades stored"
@@ -196,9 +197,9 @@ export default function OverviewPage() {
               sub="Full book snapshots and price-level updates (how the order book changes)"
             />
             <StatTile
-              label="Unusual activity rows"
+              label="Stored alerts"
               value={fmtInt(st.anomalies)}
-              sub={`${fmtInt(st.anomalies_high_severity)} marked “high” — total stored scoring rows in the DB`}
+              sub={`${fmtInt(st.anomalies_high_severity)} “high” — total materialized rule rows in the DB (mostly per quote, not per trade)`}
               tone={st.anomalies_high_severity > 0 ? "danger" : "default"}
             />
           </>
@@ -208,8 +209,8 @@ export default function OverviewPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader
-            title="By surveillance priority"
-            subtitle="Classifier triage only. The “high” bar is not the same as the *Triage (top prior)* stat — that stat is **high + elevated** combined. Markets with no prior label are hidden from the bars but still in the total market count."
+            title="Markets by priority"
+            subtitle="Classifier only (sensitivity of this market type). The “High-priority markets” stat is the sum of “high + elevated” in those bars. “Markets with alerts” is separate (evidence). Markets with no prior label are hidden from this chart."
           />
           <CardBody>
             <BreakdownBarChart
@@ -393,7 +394,85 @@ export default function OverviewPage() {
           </div>
         </Card>
       </section>
+
+      <Card>
+        <CardHeader
+          title="Most unusual prints"
+          subtitle="Local outlier score from public tape only: size vs this market's recent prints, price jump, and same-side clustering. This is triage, not an insider-trading verdict."
+          right={
+            suspiciousTrades
+              ? `${fmtInt(suspiciousTrades.count)} shown from latest ${fmtInt(suspiciousTrades.sample)} prints`
+              : undefined
+          }
+        />
+        <div className="overflow-x-auto">
+          {overview.isPending ? (
+            <div className="p-4">
+              <Skeleton className="h-32" />
+            </div>
+          ) : !suspiciousTrades?.trades.length ? (
+            <EmptyState>No unusual prints found in the recent sample.</EmptyState>
+          ) : (
+            <table className="w-full">
+              <thead>
+                <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-card/40">
+                  <th className="text-left px-4 py-2.5 font-medium">Market</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Time</th>
+                  <th className="text-right px-3 py-2.5 font-medium">Score</th>
+                  <th className="text-right px-3 py-2.5 font-medium">Yes</th>
+                  <th className="text-right px-3 py-2.5 font-medium">Contracts</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {suspiciousTrades.trades.map((t) => (
+                  <SuspiciousTradeRow key={`${t.market_id}-${t.trade_id}`} trade={t} />
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </Card>
     </div>
+  );
+}
+
+function SuspiciousTradeRow({ trade }: { trade: SuspiciousTrade }) {
+  const href = `/markets/${encodeURIComponent(trade.market_id)}?trade_ts=${encodeURIComponent(
+    trade.ts ?? "",
+  )}`;
+  return (
+    <tr className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors">
+      <td className="px-4 py-2.5">
+        <Link to={href}>
+          <MarketCell market={trade} showPrior link={false} />
+        </Link>
+      </td>
+      <td className="px-3 py-2.5 text-xs text-muted-foreground">
+        {fmtTime(trade.ts)}
+      </td>
+      <td className="px-3 py-2.5 text-right num font-semibold text-[hsl(var(--severity-medium))]">
+        {trade.suspicion.toFixed(2)}
+      </td>
+      <td className="px-3 py-2.5 text-right num text-sm">
+        {fmtPrice(trade.yes_price)}
+      </td>
+      <td className="px-3 py-2.5 text-right num text-sm">
+        {fmtInt(trade.count != null ? Math.round(trade.count) : null)}
+      </td>
+      <td className="px-3 py-2.5">
+        <div className="flex flex-wrap gap-1">
+          {(trade.reasons.length ? trade.reasons : ["statistical_outlier"]).map((r) => (
+            <code
+              key={r}
+              className="text-[10px] rounded bg-secondary px-1.5 py-0.5 font-mono text-muted-foreground"
+            >
+              {r}
+            </code>
+          ))}
+        </div>
+      </td>
+    </tr>
   );
 }
 

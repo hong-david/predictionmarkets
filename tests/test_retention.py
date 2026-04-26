@@ -12,7 +12,11 @@ Two layers of coverage:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 from app.services.classifier import Classification
 from app.services.retention import (
@@ -21,6 +25,7 @@ from app.services.retention import (
     is_in_scope,
     is_market_in_scope,
     is_ticker_in_scope,
+    should_persist_raw_tape,
 )
 
 
@@ -191,7 +196,8 @@ class _FakeSession:
 
 
 class TestIngestSkipsOutOfScope:
-    def test_skips_exotic_combo(self) -> None:
+    @patch("app.services.market_ingestor.should_skip_duplicate_snapshot", return_value=False)
+    def test_skips_exotic_combo(self, _skip_dup: object) -> None:
         from app.services.market_ingestor import ingest_markets_payload
 
         payload = {
@@ -216,7 +222,8 @@ class TestIngestSkipsOutOfScope:
         assert len(db.market_rows) == 1
         assert db.market_rows[0].market_id == "KXCPI-26FEB-T3.0"
 
-    def test_skips_crypto_strike(self) -> None:
+    @patch("app.services.market_ingestor.should_skip_duplicate_snapshot", return_value=False)
+    def test_skips_crypto_strike(self, _skip_dup: object) -> None:
         # KXBTC15M-* matches the crypto.btc_15m prefix rule which maps
         # to category=crypto_strike — should now be excluded at ingest.
         from app.services.market_ingestor import ingest_markets_payload
@@ -242,7 +249,8 @@ class TestIngestSkipsOutOfScope:
         assert result["inserted_markets"] == 1
         assert db.market_rows[0].market_id == "KXCPI-26FEB-T3.0"
 
-    def test_skips_very_low_prior(self) -> None:
+    @patch("app.services.market_ingestor.should_skip_duplicate_snapshot", return_value=False)
+    def test_skips_very_low_prior(self, _skip_dup: object) -> None:
         from app.services.market_ingestor import ingest_markets_payload
 
         payload = {
@@ -270,3 +278,77 @@ class TestIngestSkipsOutOfScope:
         db = _FakeSession()
         result = ingest_markets_payload(db, {"markets": []})
         assert result["skipped_out_of_scope"] == 0
+
+
+# ---------- should_persist_raw_tape (second-tier disk policy) --------------
+
+
+class TestShouldPersistRawTape:
+    def test_high_priors_always_tape(self) -> None:
+        t0 = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        for p in ("high", "medium_high"):
+            m = SimpleNamespace(
+                manipulability_prior=p,
+                close_time=None,
+            )
+            assert (
+                should_persist_raw_tape(
+                    m,
+                    volume_24h_fp=Decimal("0"),
+                    open_interest_fp=Decimal("0"),
+                    has_materialized_anomaly=False,
+                    now=t0,
+                )
+                is True
+            )
+
+    def test_materialized_anomaly_overrides_cold(self) -> None:
+        t0 = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        m = SimpleNamespace(manipulability_prior="low", close_time=None)
+        assert should_persist_raw_tape(
+            m,
+            volume_24h_fp=Decimal("0"),
+            open_interest_fp=Decimal("0"),
+            has_materialized_anomaly=True,
+            now=t0,
+        ) is True
+
+    def test_closing_soon_allows_tape(self) -> None:
+        t0 = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # Resolves 5d after `now` — within RAW_TAPE_CLOSING_SOON_DAYS
+        m = SimpleNamespace(
+            manipulability_prior="low",
+            close_time=t0 + timedelta(days=5),
+        )
+        assert should_persist_raw_tape(
+            m,
+            volume_24h_fp=None,
+            open_interest_fp=None,
+            has_materialized_anomaly=False,
+            now=t0,
+        ) is True
+
+    def test_low_volume_oi_and_no_close_is_cold(self) -> None:
+        t0 = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        m = SimpleNamespace(
+            manipulability_prior="low",
+            close_time=None,
+        )
+        assert should_persist_raw_tape(
+            m,
+            volume_24h_fp=Decimal("10"),
+            open_interest_fp=Decimal("1"),
+            has_materialized_anomaly=False,
+            now=t0,
+        ) is False
+
+    def test_24h_volume_floor_allows_tape(self) -> None:
+        t0 = datetime(2025, 6, 1, tzinfo=timezone.utc)
+        m = SimpleNamespace(manipulability_prior="medium", close_time=None)
+        assert should_persist_raw_tape(
+            m,
+            volume_24h_fp=Decimal("400"),
+            open_interest_fp=None,
+            has_materialized_anomaly=False,
+            now=t0,
+        ) is True

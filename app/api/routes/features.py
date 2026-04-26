@@ -4,16 +4,21 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
+from app.api.serialization import decimal_to_float, isoformat_or_none
 from app.db.models import Market, MarketSnapshot
 
-router = APIRouter(prefix="/markets", tags=["features"])
+router = APIRouter(
+    prefix="/markets",
+    tags=["features (legacy)"],
+    deprecated=True,
+)
 
 
-def decimal_to_float(value: Decimal | None) -> float | None:
-    return float(value) if value is not None else None
-
-
-@router.get("/{market_id}/features")
+@router.get(
+    "/{market_id}/features",
+    summary="Per-market feature flags (legacy)",
+    description="Prefer `GET /api/dashboard/markets/{market_id}` for a richer read bundle.",
+)
 def get_market_features(
     market_id: str,
     db: Session = Depends(get_db),
@@ -55,7 +60,7 @@ def get_market_features(
         "title": market.title,
         "status": market.status,
         "latest_snapshot_id": latest_snapshot.id,
-        "latest_snapshot_ts": latest_snapshot.ts.isoformat() if latest_snapshot.ts else None,
+        "latest_snapshot_ts": isoformat_or_none(latest_snapshot.ts),
         "yes_bid_dollars": decimal_to_float(latest_snapshot.yes_bid_dollars),
         "yes_ask_dollars": decimal_to_float(latest_snapshot.yes_ask_dollars),
         "last_price_dollars": decimal_to_float(latest_snapshot.last_price_dollars),

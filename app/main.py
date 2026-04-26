@@ -33,10 +33,9 @@ from app.core.config import settings
 
 app = FastAPI(title=settings.app_name)
 
-# All public JSON routes live under /api/* so the React frontend can own
-# clean URL paths like /markets/:id without colliding. The dashboard
-# router already declares its full prefix internally; the others are
-# given /api here so we don't have to touch their files.
+# The React app’s canonical read API is /api/dashboard/* (see dashboard_router).
+# Other routers below stay on /api/* for scripts and old tests; they are
+# marked deprecated in OpenAPI — prefer the dashboard path for new clients.
 app.include_router(health_router, prefix="/api")
 app.include_router(markets_router, prefix="/api")
 app.include_router(features_router, prefix="/api")

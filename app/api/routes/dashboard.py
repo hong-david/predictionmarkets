@@ -32,20 +32,53 @@ Performance notes:
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
+from threading import Lock
+from typing import Callable, TypeVar
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, desc, distinct, func, or_, select
+from sqlalchemy import and_, case, desc, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
-from app.db.models import Anomaly, BookEvent, Market, MarketSnapshot, Trade
+from app.db.models import Anomaly, Market, MarketSnapshot, Trade
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
-from app.services.trade_suspicion import score_trades_against_window
+from app.services.surveillance_scores import (
+    aggregate_reason_codes,
+    collect_reason_strings_from_anomaly_json,
+    evidence_score_0_100,
+    market_priority_value,
+    prior_rank,
+    urgency_score_0_100,
+)
+from app.services.trade_burst import analyze_tape_bursts
+from app.services.trade_suspicion import explain_trades_against_window
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
+_DASHBOARD_CACHE_TTL_SEC = 30.0
+_TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
+_SUSPICIOUS_TRADE_SAMPLE = 20_000
+_dashboard_cache_lock = Lock()
+_dashboard_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
+    now = time.monotonic()
+    with _dashboard_cache_lock:
+        cached = _dashboard_cache.get(key)
+        if cached and now - cached[0] < _DASHBOARD_CACHE_TTL_SEC:
+            return cached[1]  # type: ignore[return-value]
+
+    payload = build()
+    with _dashboard_cache_lock:
+        _dashboard_cache[key] = (time.monotonic(), payload)
+    return payload
 
 
 # --- helpers ----------------------------------------------------------------
@@ -68,6 +101,22 @@ def _prior_rank() -> case:
     return case(_PRIOR_RANK, value=Market.manipulability_prior, else_=-1)
 
 
+def _reason_codes_for_market_pks(db: Session, market_pks: list[int]) -> dict[int, list[str]]:
+    """Snake_case reason codes (deduped) from all `anomalies.reasons` JSON for a market."""
+    if not market_pks:
+        return {}
+    rows = (
+        db.query(Anomaly.market_pk, Anomaly.reasons)
+        .filter(Anomaly.market_pk.in_(market_pks))
+        .all()
+    )
+    by_m: dict[int, list[str]] = defaultdict(list)
+    for m_pk, reasons in rows:
+        for r in collect_reason_strings_from_anomaly_json(reasons):
+            by_m[m_pk].append(r)
+    return {k: aggregate_reason_codes(v)[:24] for k, v in by_m.items()}
+
+
 def _serialize_market_row(
     market: Market,
     *,
@@ -75,9 +124,14 @@ def _serialize_market_row(
     anomaly_count: int = 0,
     last_price: float | None = None,
     volume_24h: float | None = None,
+    reason_codes: list[str] | None = None,
+    event_market_count: int | None = None,
 ) -> dict:
+    prk = prior_rank(market.manipulability_prior)
+    ac = int(anomaly_count or 0)
     return {
         "market_id": market.market_id,
+        "event_id": market.event_id,
         "title": market.title,
         "subtitle": market.subtitle,
         "status": market.status,
@@ -90,37 +144,64 @@ def _serialize_market_row(
         "open_time": market.open_time.isoformat() if market.open_time else None,
         "close_time": market.close_time.isoformat() if market.close_time else None,
         "trade_count": int(trade_count or 0),
-        "anomaly_count": int(anomaly_count or 0),
+        "anomaly_count": ac,
         "last_price": float(last_price) if last_price is not None else None,
         "volume_24h": float(volume_24h) if volume_24h is not None else None,
+        "market_priority": market_priority_value(market.manipulability_prior),
+        "evidence_score": evidence_score_0_100(anomaly_count=ac),
+        "urgency_score": urgency_score_0_100(prior_rank=prk, anomaly_count=ac),
+        "reasons": list(reason_codes or []),
+        "event_market_count": event_market_count,
     }
 
 
 # --- /stats and /breakdown --------------------------------------------------
 
 
+def _estimated_table_count(db: Session, table_name: str) -> int:
+    """Fast approximate row count from Postgres planner stats.
+
+    Multi-million-row exact counts are a poor fit for the overview header:
+    they block first paint, and the values change continuously under ingest.
+    `reltuples` is maintained by VACUUM/ANALYZE and is close enough for a
+    live dashboard counter.
+    """
+    estimate = db.execute(
+        text("select reltuples::bigint from pg_class where oid = to_regclass(:table_name)"),
+        {"table_name": table_name},
+    ).scalar()
+    return max(0, int(estimate or 0))
+
+
+def _hydrated_market_filters() -> list:
+    return [
+        Market.status.notin_(("unknown", "out_of_scope")),
+        Market.title != Market.market_id,
+    ]
+
+
 def _stats_payload(db: Session) -> dict:
     """Coarse system-wide counts. Used by `GET /stats` and `GET /overview`."""
-    markets = db.query(func.count(Market.id)).scalar() or 0
+    hydrated = _hydrated_market_filters()
+    markets = db.query(func.count(Market.id)).filter(*hydrated).scalar() or 0
     markets_unknown = (
         db.query(func.count(Market.id)).filter(Market.status == "unknown").scalar() or 0
     )
     markets_high_prior = (
         db.query(func.count(Market.id))
+        .filter(*hydrated)
         .filter(Market.manipulability_prior.in_(("high", "medium_high")))
         .scalar()
         or 0
     )
-    trades = db.query(func.count(Trade.id)).scalar() or 0
-    snapshots = db.query(func.count(MarketSnapshot.id)).scalar() or 0
-    book_events = db.query(func.count(BookEvent.id)).scalar() or 0
-    anomalies = db.query(func.count(Anomaly.id)).scalar() or 0
+    trades = _estimated_table_count(db, "trades")
+    snapshots = _estimated_table_count(db, "market_snapshots")
+    book_events = _estimated_table_count(db, "book_events")
+    anomalies = _estimated_table_count(db, "anomalies")
     anomalies_high = (
         db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar() or 0
     )
-    markets_with_flags = (
-        db.query(func.count(distinct(Anomaly.market_pk))).scalar() or 0
-    )
+    markets_with_flags = min(markets, anomalies)
 
     return {
         "markets": markets,
@@ -138,9 +219,12 @@ def _stats_payload(db: Session) -> dict:
 def _breakdown_payload(db: Session) -> dict:
     """Classification pivots for the overview page."""
 
+    hydrated = _hydrated_market_filters()
+
     def _group_count(col):
         rows = (
             db.query(func.coalesce(col, "unclassified").label("k"), func.count(Market.id))
+            .filter(*hydrated)
             .group_by("k")
             .order_by(func.count(Market.id).desc())
             .all()
@@ -158,6 +242,7 @@ def _breakdown_payload(db: Session) -> dict:
             func.coalesce(Market.manipulability_prior, "unclassified").label("prior"),
             func.count(Market.id).label("c"),
         )
+        .filter(*hydrated)
         .group_by("cat", "prior")
         .order_by(desc("c"))
         .limit(40)
@@ -179,7 +264,7 @@ def _breakdown_payload(db: Session) -> dict:
 @router.get("/stats")
 def get_stats(db: Session = Depends(get_db)) -> dict:
     """Coarse system-wide counts. Drives the overview header."""
-    return _stats_payload(db)
+    return _cached_dashboard_payload("stats", lambda: _stats_payload(db))
 
 
 @router.get("/breakdown")
@@ -193,39 +278,54 @@ def get_breakdown(db: Session = Depends(get_db)) -> dict:
     `"unclassified"` so the frontend can render them without special
     casing.
     """
-    return _breakdown_payload(db)
+    return _cached_dashboard_payload("breakdown", lambda: _breakdown_payload(db))
 
 
 def _top_markets_payload(db: Session, limit: int) -> dict:
-    trade_count_sq = (
-        select(Trade.market_pk, func.count(Trade.id).label("c"))
-        .group_by(Trade.market_pk)
+    recent_trades = (
+        select(Trade.market_pk, Trade.ts, Trade.id)
+        .join(Market, Market.id == Trade.market_pk)
+        .where(*_hydrated_market_filters())
+        .order_by(Trade.ts.desc(), Trade.id.desc())
+        .limit(_TOP_MARKETS_RECENT_TRADE_SAMPLE)
         .subquery()
     )
-    rows = (
-        db.query(
-            Market,
-            func.coalesce(trade_count_sq.c.c, 0).label("trade_count"),
-        )
-        .outerjoin(trade_count_sq, trade_count_sq.c.market_pk == Market.id)
-        .order_by(func.coalesce(trade_count_sq.c.c, 0).desc())
+    trade_rows = (
+        db.query(recent_trades.c.market_pk, func.count().label("trade_count"))
+        .group_by(recent_trades.c.market_pk)
+        .order_by(func.count().desc())
         .limit(limit)
         .all()
     )
+
+    pks = [int(r.market_pk) for r in trade_rows]
+    if not pks:
+        return {"count": 0, "markets": []}
+
+    trade_counts = {int(r.market_pk): int(r.trade_count or 0) for r in trade_rows}
+    markets_by_pk = {
+        m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()
+    }
+
+    rows = [markets_by_pk[pk] for pk in pks if pk in markets_by_pk]
     return {
         "count": len(rows),
         "markets": [
-            _serialize_market_row(r[0], trade_count=r.trade_count)
-            for r in rows
+            _serialize_market_row(
+                market,
+                trade_count=trade_counts.get(market.id, 0),
+            )
+            for market in rows
         ],
     }
 
 
 def _recent_anomalies_payload(db: Session, limit: int, severity: str | None) -> dict:
     base = db.query(Anomaly, Market).join(Market, Market.id == Anomaly.market_pk)
+    base = base.filter(*_hydrated_market_filters())
     if severity:
         base = base.filter(Anomaly.severity == severity)
-    rows = base.order_by(Anomaly.score.desc(), Anomaly.id.desc()).limit(limit).all()
+    rows = base.order_by(Anomaly.created_at.desc(), Anomaly.id.desc()).limit(limit).all()
     return {
         "count": len(rows),
         "anomalies": [
@@ -246,6 +346,75 @@ def _recent_anomalies_payload(db: Session, limit: int, severity: str | None) -> 
     }
 
 
+def _suspicious_trades_payload(
+    db: Session,
+    *,
+    limit: int,
+    sample: int = _SUSPICIOUS_TRADE_SAMPLE,
+) -> dict:
+    rows = (
+        db.query(Trade, Market)
+        .join(Market, Market.id == Trade.market_pk)
+        .filter(*_hydrated_market_filters())
+        .order_by(Trade.ts.desc(), Trade.id.desc())
+        .limit(sample)
+        .all()
+    )
+
+    by_market: dict[int, list[tuple[Trade, Market]]] = defaultdict(list)
+    for trade, market in rows:
+        by_market[market.id].append((trade, market))
+
+    candidates: list[dict] = []
+    for market_rows in by_market.values():
+        market_rows = sorted(market_rows, key=lambda x: (x[0].ts, x[0].id))
+        payloads = [
+            {
+                "ts": t.ts.isoformat() if t.ts else None,
+                "yes_price": float(t.yes_price_dollars)
+                if t.yes_price_dollars is not None
+                else None,
+                "no_price": float(t.no_price_dollars)
+                if t.no_price_dollars is not None
+                else None,
+                "count": float(t.count_fp) if t.count_fp is not None else None,
+                "taker_side": t.taker_side,
+            }
+            for t, _m in market_rows
+        ]
+        explanations = explain_trades_against_window(payloads, window=50)
+        for (trade, market), payload, explanation in zip(
+            market_rows, payloads, explanations
+        ):
+            if explanation is None:
+                continue
+            score = float(explanation["score"])
+            if score <= 0:
+                continue
+            candidates.append(
+                {
+                    "market_id": market.market_id,
+                    "event_id": market.event_id,
+                    "title": market.title,
+                    "subtitle": market.subtitle,
+                    "category": market.category,
+                    "manipulability_prior": market.manipulability_prior,
+                    "trade_id": trade.trade_id,
+                    **payload,
+                    "suspicion": score,
+                    "reasons": explanation["reasons"],
+                    "features": explanation["features"],
+                }
+            )
+
+    candidates.sort(key=lambda x: (x["suspicion"], x["ts"] or ""), reverse=True)
+    return {
+        "count": min(len(candidates), limit),
+        "trades": candidates[:limit],
+        "sample": sample,
+    }
+
+
 @router.get("/overview")
 def get_dashboard_overview(
     top: int = Query(default=15, ge=1, le=50),
@@ -260,12 +429,17 @@ def get_dashboard_overview(
 
     Cuts TTFB vs four separate fetches; still runs the same SQL as those routes.
     """
-    return {
-        "stats": _stats_payload(db),
-        "breakdown": _breakdown_payload(db),
-        "top_markets": _top_markets_payload(db, top),
-        "recent_anomalies": _recent_anomalies_payload(db, anomalies, severity),
-    }
+    cache_key = f"overview:{top}:{anomalies}:{severity or ''}"
+    return _cached_dashboard_payload(
+        cache_key,
+        lambda: {
+            "stats": _stats_payload(db),
+            "breakdown": _breakdown_payload(db),
+            "top_markets": _top_markets_payload(db, top),
+            "recent_anomalies": _recent_anomalies_payload(db, anomalies, severity),
+            "suspicious_trades": _suspicious_trades_payload(db, limit=12),
+        },
+    )
 
 
 # --- /markets list ----------------------------------------------------------
@@ -292,6 +466,10 @@ def list_markets(
     prior: str | None = Query(default=None),
     confidence: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    include_unhydrated: bool = Query(
+        default=False,
+        description="Include lazy WS-created rows whose exchange metadata/title has not been hydrated yet.",
+    ),
     sort: str = Query(
         default="surveillance_urgency",
         description=(
@@ -313,28 +491,46 @@ def list_markets(
     Both subqueries hit indexed FK columns and return at most one row
     per market, so they're cheap.
     """
-    trade_count_sq = (
-        select(Trade.market_pk, func.count(Trade.id).label("c"))
-        .group_by(Trade.market_pk)
-        .subquery()
+    cache_key = (
+        "markets:"
+        f"q={q or ''}:category={category or ''}:prior={prior or ''}:"
+        f"confidence={confidence or ''}:status={status or ''}:"
+        f"include_unhydrated={int(include_unhydrated)}:sort={sort}:"
+        f"limit={limit}:offset={offset}"
     )
-    anomaly_count_sq = (
-        select(Anomaly.market_pk, func.count(Anomaly.id).label("c"))
-        .group_by(Anomaly.market_pk)
-        .subquery()
+    return _cached_dashboard_payload(
+        cache_key,
+        lambda: _list_markets_uncached(
+            q=q,
+            category=category,
+            prior=prior,
+            confidence=confidence,
+            status=status,
+            include_unhydrated=include_unhydrated,
+            sort=sort,
+            limit=limit,
+            offset=offset,
+            db=db,
+        ),
     )
 
-    base = (
-        db.query(
-            Market,
-            func.coalesce(trade_count_sq.c.c, 0).label("trade_count"),
-            func.coalesce(anomaly_count_sq.c.c, 0).label("anomaly_count"),
-        )
-        .outerjoin(trade_count_sq, trade_count_sq.c.market_pk == Market.id)
-        .outerjoin(anomaly_count_sq, anomaly_count_sq.c.market_pk == Market.id)
-    )
 
+def _list_markets_uncached(
+    *,
+    q: str | None,
+    category: str | None,
+    prior: str | None,
+    confidence: str | None,
+    status: str | None,
+    include_unhydrated: bool,
+    sort: str,
+    limit: int,
+    offset: int,
+    db: Session,
+) -> dict:
     filters = []
+    if not include_unhydrated:
+        filters.extend(_hydrated_market_filters())
     if q:
         like = f"%{q}%"
         filters.append(
@@ -362,14 +558,36 @@ def list_markets(
     if status:
         filters.append(Market.status == status)
 
-    if filters:
-        base = base.filter(and_(*filters))
-
-    total = db.query(func.count(Market.id)).scalar() or 0
+    total_filters = [] if include_unhydrated else _hydrated_market_filters()
+    total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
     filtered = (
         db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
         if filters
         else total
+    )
+
+    candidate_sq = select(Market.id).where(and_(*filters)).subquery()
+    trade_count_sq = (
+        select(Trade.market_pk, func.count(Trade.id).label("c"))
+        .join(candidate_sq, candidate_sq.c.id == Trade.market_pk)
+        .group_by(Trade.market_pk)
+        .subquery()
+    )
+    anomaly_count_sq = (
+        select(Anomaly.market_pk, func.count(Anomaly.id).label("c"))
+        .join(candidate_sq, candidate_sq.c.id == Anomaly.market_pk)
+        .group_by(Anomaly.market_pk)
+        .subquery()
+    )
+    base = (
+        db.query(
+            Market,
+            func.coalesce(trade_count_sq.c.c, 0).label("trade_count"),
+            func.coalesce(anomaly_count_sq.c.c, 0).label("anomaly_count"),
+        )
+        .join(candidate_sq, candidate_sq.c.id == Market.id)
+        .outerjoin(trade_count_sq, trade_count_sq.c.market_pk == Market.id)
+        .outerjoin(anomaly_count_sq, anomaly_count_sq.c.market_pk == Market.id)
     )
 
     sort_key, sort_dir = _SORT_OPTIONS.get(
@@ -410,11 +628,28 @@ def list_markets(
 
     rows = base.offset(offset).limit(limit).all()
 
+    event_ids = [r[0].event_id for r in rows if r[0].event_id]
+    event_counts = {}
+    if event_ids:
+        event_counts = {
+            event_id: int(count)
+            for event_id, count in (
+                db.query(Market.event_id, func.count(Market.id))
+                .filter(Market.event_id.in_(event_ids))
+                .filter(*_hydrated_market_filters())
+                .group_by(Market.event_id)
+                .all()
+            )
+        }
+
     items = [
         _serialize_market_row(
             r[0],
             trade_count=r.trade_count,
             anomaly_count=r.anomaly_count,
+            event_market_count=event_counts.get(r[0].event_id)
+            if r[0].event_id
+            else None,
         )
         for r in rows
     ]
@@ -425,6 +660,98 @@ def list_markets(
         "limit": limit,
         "offset": offset,
         "markets": items,
+    }
+
+
+# --- /events/{event_id} (Kalshi `event_ticker` = `markets.event_id`) -------
+
+
+def _trade_counts_by_market(db: Session, pks: list[int]) -> dict[int, int]:
+    if not pks:
+        return {}
+    rows = (
+        db.query(Trade.market_pk, func.count(Trade.id).label("c"))
+        .filter(Trade.market_pk.in_(pks))
+        .group_by(Trade.market_pk)
+        .all()
+    )
+    return {int(mpk): int(c) for mpk, c in rows}
+
+
+def _anomaly_counts_by_market(db: Session, pks: list[int]) -> dict[int, int]:
+    if not pks:
+        return {}
+    rows = (
+        db.query(Anomaly.market_pk, func.count(Anomaly.id).label("c"))
+        .filter(Anomaly.market_pk.in_(pks))
+        .group_by(Anomaly.market_pk)
+        .all()
+    )
+    return {int(mpk): int(c) for mpk, c in rows}
+
+
+@router.get("/events/{event_id}")
+def get_event_group(event_id: str, db: Session = Depends(get_db)) -> dict:
+    """All `markets` rows sharing Kalshi’s ``event_ticker`` (e.g. date slices for one question).
+
+    Each contract (``market_id``) stays separate; this endpoint only groups
+    the UI and rolled-up read models — trades and book data remain per-ticker.
+    """
+    eid = (event_id or "").strip()
+    if not eid:
+        raise HTTPException(status_code=400, detail="event_id is required")
+
+    markets_list = (
+        db.query(Market)
+        .filter(Market.event_id == eid)
+        .order_by(Market.close_time.asc().nullsfirst(), Market.market_id.asc())
+        .all()
+    )
+    if not markets_list:
+        raise HTTPException(
+            status_code=404,
+            detail="No markets for this event_id. Check Kalshi `event_ticker` or hydrate unknown markets so `event_id` is filled.",
+        )
+
+    pks = [m.id for m in markets_list]
+    tcount = _trade_counts_by_market(db, pks)
+    acount = _anomaly_counts_by_market(db, pks)
+    rmap = _reason_codes_for_market_pks(db, pks)
+
+    market_payloads: list[dict] = []
+    for m in markets_list:
+        latest_snap = (
+            db.query(MarketSnapshot)
+            .filter(MarketSnapshot.market_pk == m.id)
+            .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
+            .first()
+        )
+        last_price = (
+            float(latest_snap.last_price_dollars)
+            if latest_snap and latest_snap.last_price_dollars is not None
+            else None
+        )
+        volume_24h = (
+            float(latest_snap.volume_24h_fp)
+            if latest_snap and latest_snap.volume_24h_fp is not None
+            else None
+        )
+        market_payloads.append(
+            _serialize_market_row(
+                m,
+                trade_count=tcount.get(m.id, 0),
+                anomaly_count=acount.get(m.id, 0),
+                last_price=last_price,
+                volume_24h=volume_24h,
+                reason_codes=rmap.get(m.id, []),
+            )
+        )
+
+    return {
+        "event_id": eid,
+        "title": markets_list[0].title,
+        "market_count": len(market_payloads),
+        "markets": market_payloads,
     }
 
 
@@ -471,6 +798,8 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
     anomaly_count = (
         db.query(func.count(Anomaly.id)).filter(Anomaly.market_pk == market.id).scalar() or 0
     )
+    rmap = _reason_codes_for_market_pks(db, [market.id])
+    reason_codes = rmap.get(market.id, [])
 
     return {
         **_serialize_market_row(
@@ -483,6 +812,7 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
             volume_24h=float(latest_snap.volume_24h_fp)
             if latest_snap and latest_snap.volume_24h_fp is not None
             else None,
+            reason_codes=reason_codes,
         ),
         "classifier_tags": market.classifier_tags or [],
         "stats": {
@@ -563,13 +893,25 @@ def get_market_series(
         }
         for t in trade_rows
     ]
-    sus = score_trades_against_window(trade_payloads, window=50)
-    for i, s in enumerate(sus):
-        if s is not None:
-            trade_payloads[i]["suspicion"] = s
+    explanations = explain_trades_against_window(trade_payloads, window=50)
+    for i, explanation in enumerate(explanations):
+        if explanation is not None:
+            trade_payloads[i]["suspicion"] = explanation["score"]
+            trade_payloads[i]["suspicion_reasons"] = explanation["reasons"]
+            trade_payloads[i]["suspicion_features"] = explanation["features"]
+
+    burst = analyze_tape_bursts(trade_payloads, window_sec=30.0)
+    for i, c in enumerate(burst["per_trade_cluster_0_10"]):
+        trade_payloads[i]["cluster_0_10"] = c
 
     return {
         "market_id": market.market_id,
+        "tape_cluster": {
+            "burst_score_0_10": burst["burst_score_0_10"],
+            "largest_window_count": burst["largest_window_count"],
+            "window_sec": burst["window_sec"],
+            "dominant_side": burst["dominant_side"],
+        },
         "trades": trade_payloads,
         "snapshots": [
             {
@@ -630,7 +972,11 @@ def list_recent_anomalies(
     classifier metadata so the frontend can render a category badge
     without a second round trip.
     """
-    return _recent_anomalies_payload(db, limit, severity)
+    cache_key = f"recent_anomalies:{limit}:{severity or ''}"
+    return _cached_dashboard_payload(
+        cache_key,
+        lambda: _recent_anomalies_payload(db, limit, severity),
+    )
 
 
 @router.get("/top-markets")
@@ -639,7 +985,21 @@ def get_top_markets(
     db: Session = Depends(get_db),
 ) -> dict:
     """Top markets by trade count, for the overview leaderboard."""
-    return _top_markets_payload(db, limit)
+    return _cached_dashboard_payload(
+        f"top_markets:{limit}",
+        lambda: _top_markets_payload(db, limit),
+    )
+
+
+@router.get("/suspicious-trades")
+def get_suspicious_trades(
+    limit: int = Query(default=25, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _cached_dashboard_payload(
+        f"suspicious_trades:{limit}",
+        lambda: _suspicious_trades_payload(db, limit=limit),
+    )
 
 
 # --- /news (GDELT 2.0 DOC API with graceful degradation) --------------------

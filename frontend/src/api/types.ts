@@ -51,6 +51,8 @@ export interface Breakdown {
 
 export interface MarketRow {
   market_id: string;
+  /** Kalshi `event_ticker` when hydrated; groups date/outcome legs of one event. */
+  event_id: string | null;
   title: string;
   subtitle: string | null;
   status: string;
@@ -66,6 +68,16 @@ export interface MarketRow {
   anomaly_count: number;
   last_price: number | null;
   volume_24h: number | null;
+  /** Classifier `manipulability_prior` bucket; “unclassified” if unknown. */
+  market_priority: string;
+  /** 0–100 from stored `anomalies` row mass (not prior). */
+  evidence_score: number;
+  /** 0–100 combined urgency aligned with the “Alerts first” sort. */
+  urgency_score: number;
+  /** Deduped snake_case slugs from materialized `reasons[]` on alert rows. */
+  reasons: string[];
+  /** Number of hydrated contracts sharing the same Kalshi event_ticker. */
+  event_market_count: number | null;
 }
 
 export interface MarketsList {
@@ -73,6 +85,14 @@ export interface MarketsList {
   filtered: number;
   limit: number;
   offset: number;
+  markets: MarketRow[];
+}
+
+/** All contracts under the same Kalshi `event_ticker` (`Market.event_id`). */
+export interface EventGroup {
+  event_id: string;
+  title: string;
+  market_count: number;
   markets: MarketRow[];
 }
 
@@ -104,8 +124,43 @@ export interface TradePoint {
   no_price: number | null;
   count: number | null;
   taker_side: string | null;
-  /** Windowed z-style outlier score vs this market’s own recent tape. */
+  /** Local trade outlier score 0..10 vs this market’s own recent tape (API field name unchanged). */
   suspicion?: number | null;
+  suspicion_reasons?: string[];
+  suspicion_features?: Record<string, number | null>;
+  /** 0..10 local burst / same-side cluster intensity in a sliding window. */
+  cluster_0_10?: number;
+}
+
+export interface SuspiciousTrade {
+  market_id: string;
+  event_id: string | null;
+  title: string;
+  subtitle: string | null;
+  category: string | null;
+  manipulability_prior: Prior | null;
+  trade_id: string;
+  ts: string | null;
+  yes_price: number | null;
+  no_price: number | null;
+  count: number | null;
+  taker_side: string | null;
+  suspicion: number;
+  reasons: string[];
+  features: Record<string, number | null>;
+}
+
+export interface SuspiciousTradesList {
+  count: number;
+  sample: number;
+  trades: SuspiciousTrade[];
+}
+
+export interface TapeCluster {
+  burst_score_0_10: number;
+  largest_window_count: number;
+  window_sec: number;
+  dominant_side: string | null;
 }
 
 export interface SnapshotPoint {
@@ -119,6 +174,8 @@ export interface SnapshotPoint {
 
 export interface MarketSeries {
   market_id: string;
+  /** Rolling burst detector on the same tape as `trades` (30s default window). */
+  tape_cluster: TapeCluster;
   trades: TradePoint[];
   snapshots: SnapshotPoint[];
 }
@@ -189,6 +246,7 @@ export interface DashboardOverview {
   breakdown: Breakdown;
   top_markets: TopMarketsList;
   recent_anomalies: RecentAnomaliesList;
+  suspicious_trades: SuspiciousTradesList;
 }
 
 export interface TopMarketsList {

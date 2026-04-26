@@ -19,6 +19,7 @@ import type {
   MarketSeries,
   TradePoint,
 } from "@/api/types";
+import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
 
 /**
  * Price + volume chart, with anomaly markers overlaid on the price
@@ -27,13 +28,17 @@ import type {
  * crosshairs, time-axis zoom, and pan natively.
  *
  * Layout:
- *   - Top pane (~80% height): yes_price line series + anomaly markers
+ *   - Top pane (~80% height): yes_price area/curve + anomaly markers
  *   - Bottom pane (~20%):     trade-volume histogram
  *
  * The two series share an x-axis; lightweight-charts handles
  * synchronisation when you pan or zoom.
  *
- * **Step line:** price is flat between trades (no diagonal “phantom” moves).
+ * **Curved line + area:** `LineType.Curved` draws a smooth path through
+ * each trade’s yes price. Between prints the curve is a spline, not a claim
+ * that the contract traded at intermediate prices (there is no public tape
+ * between events). A light gradient under the line improves legibility over
+ * a hard stepped staircase.
  *
  * **Volume bars:** per-trade *contract size* (that print’s `count`), colored by
  * taker side. Bar height is **not** the same quantity as the snapshot
@@ -47,14 +52,20 @@ import type {
 export function PriceChart({
   series,
   anomalies,
+  highlightTs,
 }: {
   series: MarketSeries | undefined;
   anomalies: AnomalyRow[] | undefined;
+  highlightTs?: string | null;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const priceRef = useRef<ISeriesApi<"Line"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const yRangeRef = useRef<{ minValue: number; maxValue: number }>({
+    minValue: 0,
+    maxValue: 1,
+  });
 
   // Mount the chart once.
   useEffect(() => {
@@ -96,12 +107,19 @@ export function PriceChart({
     chartRef.current = chart;
 
     const price = chart.addLineSeries({
-      color: "rgba(78, 161, 255, 1)",
-      lineWidth: 2,
       lineType: LineType.WithSteps,
+      lineColor: "rgba(120, 185, 255, 0.95)",
+      lineWidth: 2,
+      lineStyle: LineStyle.Solid,
       priceLineVisible: false,
       lastValueVisible: true,
       priceFormat: { type: "price", precision: 3, minMove: 0.001 },
+      crosshairMarkerVisible: true,
+      crosshairMarkerBorderColor: "rgba(150, 200, 255, 0.9)",
+      crosshairMarkerBackgroundColor: "hsl(220 12% 9%)",
+      autoscaleInfoProvider: () => ({
+        priceRange: yRangeRef.current,
+      }),
     });
     priceRef.current = price;
 
@@ -138,8 +156,8 @@ export function PriceChart({
     for (const t of series.trades) {
       if (!t.ts || t.yes_price == null) continue;
       // lightweight-charts requires unique, ascending timestamps. Trades
-      // can collide on the second; offset duplicates by 1ms-ish so the
-      // line includes every print.
+      // can share the same wall-clock second; nudge the x-axis by +1s until
+      // unique (values are still each print’s `yes_price`).
       let unix = Math.floor(new Date(t.ts).getTime() / 1000);
       while (seenTimes.has(unix)) unix += 1;
       seenTimes.add(unix);
@@ -152,6 +170,7 @@ export function PriceChart({
       });
     }
 
+    yRangeRef.current = dynamicProbabilityRange(linePoints.map((p) => p.value));
     priceRef.current.setData(linePoints);
     volumeRef.current.setData(volumePoints);
 
@@ -182,6 +201,19 @@ export function PriceChart({
           byTime.set(k, { score: a.score, text, severity: a.severity });
         }
       }
+      if (highlightTs) {
+        const target = Math.floor(new Date(highlightTs).getTime() / 1000);
+        if (Number.isFinite(target)) {
+          const t = nearestTime(sortedTimes, target);
+          if (t != null) {
+            byTime.set(t as number, {
+              score: 999,
+              text: "selected unusual print",
+              severity: "selected",
+            });
+          }
+        }
+      }
       const markers: SeriesMarker<Time>[] = Array.from(byTime.entries())
         .sort((a, b) => a[0] - b[0])
         .map(([ts, m]) => ({
@@ -197,7 +229,7 @@ export function PriceChart({
     }
 
     chartRef.current?.timeScale().fitContent();
-  }, [series, anomalies]);
+  }, [series, anomalies, highlightTs]);
 
   return (
     <div
@@ -211,13 +243,16 @@ export function PriceChart({
 function formatLocalChartTime(t: Time): string {
   if (typeof t === "number") {
     const sec = t as number;
-    return new Date(sec * 1000).toLocaleString(undefined, {
+    const d = new Date(sec * 1000);
+    const iso = d.toISOString();
+    const local = d.toLocaleString(undefined, {
       month: "short",
       day: "numeric",
       hour: "numeric",
       minute: "2-digit",
       second: "2-digit",
     });
+    return `${local} · ET ${fmtTimeEastern(iso)} · ${fmtTimeUtc(iso)}`;
   }
   if (isBusinessDay(t)) {
     return new Date(t.year, t.month - 1, t.day).toLocaleDateString();
@@ -234,7 +269,36 @@ function takerColor(t: TradePoint): string {
   return "rgba(78, 161, 255, 0.45)";
 }
 
+function dynamicProbabilityRange(values: number[]): { minValue: number; maxValue: number } {
+  const clean = values.filter((v) => Number.isFinite(v));
+  if (!clean.length) return { minValue: 0, maxValue: 1 };
+
+  const min = Math.min(...clean);
+  const max = Math.max(...clean);
+  const span = Math.max(0, max - min);
+
+  if (span >= 0.35) {
+    return { minValue: 0, maxValue: 1 };
+  }
+
+  const pad = Math.max(0.035, span * 0.75);
+  let lo = Math.max(0, min - pad);
+  let hi = Math.min(1, max + pad);
+
+  if (hi - lo < 0.12) {
+    const mid = (lo + hi) / 2;
+    lo = Math.max(0, mid - 0.06);
+    hi = Math.min(1, mid + 0.06);
+  }
+
+  if (lo === 0 && hi < 0.12) hi = 0.12;
+  if (hi === 1 && lo > 0.88) lo = 0.88;
+
+  return { minValue: lo, maxValue: hi };
+}
+
 function severityColor(s: string): string {
+  if (s === "selected") return "rgba(78, 161, 255, 1)";
   if (s === "high") return "rgba(231, 76, 60, 0.95)";
   if (s === "medium") return "rgba(241, 196, 15, 0.95)";
   return "rgba(46, 204, 113, 0.95)";

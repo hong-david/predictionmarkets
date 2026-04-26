@@ -46,3 +46,51 @@ export function fmtTime(iso: string | null | undefined): string {
     second: "2-digit",
   });
 }
+
+/** Same instant in UTC (for comparing to stored `timestamptz` and to Kalshi API docs). */
+export function fmtTimeUtc(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(d);
+}
+
+/** US Eastern, for lining up with Kalshi’s public charts (ET). */
+export function fmtTimeEastern(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+  }).format(d);
+}
+
+/** Local, Eastern, and UTC strings for the same print (trade tape audit). */
+export function tradeTimestampsForAudit(iso: string | null | undefined): {
+  local: string;
+  eastern: string;
+  utc: string;
+} {
+  if (!iso) return { local: "—", eastern: "—", utc: "—" };
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return { local: "—", eastern: "—", utc: "—" };
+  return {
+    local: fmtTime(iso),
+    eastern: fmtTimeEastern(iso),
+    utc: fmtTimeUtc(iso),
+  };
+}

@@ -135,7 +135,12 @@ def test_lazy_upsert_creates_stub_market(engine):
     This covers the lazy-upsert path that the unit tests can only stub out:
     the round-trip INSERT ... ON CONFLICT DO NOTHING -> SELECT must actually
     materialise the new row in Postgres for the handler to keep going.
+
+    Raw-tape gating in production may skip persisting the trade for a cold
+    stub; this test is about DB idempotence, not policy — bypass the gate.
     """
+    from unittest.mock import patch
+
     from app.db.models import Trade
     from app.services.kalshi_ws import handle_trade_message
 
@@ -152,7 +157,10 @@ def test_lazy_upsert_creates_stub_market(engine):
         },
     }
 
-    handle_trade_message(payload)
+    with patch(
+        "app.services.kalshi_ws._raw_tape_allowed", return_value=True
+    ):
+        handle_trade_message(payload)
 
     with Session(engine) as db:
         market = db.query(Market).filter(Market.market_id == unique_ticker).one_or_none()
@@ -168,25 +176,33 @@ def test_lazy_upsert_creates_stub_market(engine):
 
 def test_lazy_upsert_is_idempotent_under_repeated_calls(engine):
     """Two trades on the same brand-new ticker must result in exactly one
-    Market row, exercising the ON CONFLICT DO NOTHING branch."""
+    Market row, exercising the ON CONFLICT DO NOTHING branch.
+
+    (Tape gate bypass: same as `test_lazy_upsert_creates_stub_market`.)
+    """
+    from unittest.mock import patch
+
     from app.services.kalshi_ws import handle_trade_message
 
     unique_ticker = f"KXLAZY-{uuid.uuid4().hex[:8]}"
 
     for i in range(2):
-        handle_trade_message(
-            {
-                "type": "trade",
-                "msg": {
-                    "market_ticker": unique_ticker,
-                    "trade_id": f"t-{uuid.uuid4().hex}",
-                    "ts_ms": 1_700_000_000_000 + i,
-                    "yes_price_dollars": "0.42",
-                    "count_fp": "100.00",
-                    "taker_side": "yes",
-                },
-            }
-        )
+        with patch(
+            "app.services.kalshi_ws._raw_tape_allowed", return_value=True
+        ):
+            handle_trade_message(
+                {
+                    "type": "trade",
+                    "msg": {
+                        "market_ticker": unique_ticker,
+                        "trade_id": f"t-{uuid.uuid4().hex}",
+                        "ts_ms": 1_700_000_000_000 + i,
+                        "yes_price_dollars": "0.42",
+                        "count_fp": "100.00",
+                        "taker_side": "yes",
+                    },
+                }
+            )
 
     with Session(engine) as db:
         n_markets = (

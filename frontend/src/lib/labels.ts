@@ -4,33 +4,26 @@
  */
 
 /** Insider-surveillance priority bucket (manipulability_prior). */
+const PRIOR_LABELS: Record<string, string> = {
+  high: "High",
+  medium_high: "Elevated",
+  medium: "Medium",
+  low: "Lower",
+  very_low: "Minimal",
+  unclassified: "Not set",
+};
+
 export function priorDisplay(p: string): string {
-  const m: Record<string, string> = {
-    high: "High",
-    medium_high: "Elevated",
-    medium: "Medium",
-    low: "Lower",
-    very_low: "Minimal",
-    unclassified: "Not set",
-  };
-  return m[p] ?? p.replace(/_/g, " ");
+  return PRIOR_LABELS[p] ?? p.replace(/_/g, " ");
 }
 
 export function priorShort(p: string): string {
-  const m: Record<string, string> = {
-    high: "High",
-    medium_high: "Elevated",
-    medium: "Medium",
-    low: "Lower",
-    very_low: "Minimal",
-    unclassified: "Not set",
-  };
-  return m[p] ?? p.replace(/_/g, " ");
+  return priorDisplay(p);
 }
 
 /** One-line explainer for tooltips / help text. */
 export function priorHelp(): string {
-  return "Triage: how plausibly non-public *information* could move this *kind* of market (classifier). Not the same as “unusual activity” in the flags column or sort — use the default list sort to rank markets that already have stored rule flags.";
+  return "Classifier *priority* (leak-sensitivity of this market type) — not the same as “alerts” in the right column, which count stored **evidence** rows. Use default sort to rank markets with alerts.";
 }
 
 /** Market category / axis key from charts (includes literal “unclassified”). */

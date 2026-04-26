@@ -4,12 +4,19 @@ __pycache__/
 .env
 *.key
 *.pem
+*.log
+.codex-*.err
 
 # Frontend
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
+
+# Local caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 
 # Local toolchain (portable Node download for environments without modern Node).
 # Not part of the project; do not commit ~200MB of binaries.

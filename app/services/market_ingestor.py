@@ -1,5 +1,4 @@
 from datetime import datetime
-from decimal import Decimal
 from itertools import islice
 from typing import Iterable, Iterator, TypeVar
 
@@ -7,7 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Market, MarketSnapshot
 from app.services.classifier import CLASSIFIER_VERSION, classify
+from app.services.decimal_utils import parse_decimal
 from app.services.retention import is_market_in_scope
+from app.services.snapshot_dedup import should_skip_duplicate_snapshot
 
 T = TypeVar("T")
 
@@ -70,12 +71,6 @@ def parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def parse_decimal(value: str | None) -> Decimal | None:
-    if value is None or value == "":
-        return None
-    return Decimal(value)
-
-
 def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
     markets = payload.get("markets", [])
     if not markets:
@@ -100,6 +95,26 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         # is in scope, so the filter is free in the keep-path.
         in_scope, classification = is_market_in_scope(item)
         if not in_scope:
+            existing = (
+                db.query(Market)
+                .filter(Market.market_id == external_market_id)
+                .one_or_none()
+            )
+            if existing is not None and (
+                existing.status == "unknown" or existing.title == existing.market_id
+            ):
+                existing.event_id = item.get("event_ticker")
+                existing.ticker = item.get("ticker")
+                existing.title = item.get("title") or external_market_id
+                existing.subtitle = (
+                    item.get("yes_sub_title")
+                    or item.get("no_sub_title")
+                    or item.get("subtitle")
+                )
+                existing.status = "out_of_scope"
+                existing.open_time = parse_dt(item.get("open_time"))
+                existing.close_time = parse_dt(item.get("close_time"))
+                _stamp_classification(existing, classification)
             # If the market already exists in the DB and *was* in scope
             # at some earlier ingest (e.g. a category we used to track
             # and have since removed), we leave the row alone. Removal
@@ -154,17 +169,41 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         if market.classifier_version != CLASSIFIER_VERSION:
             _stamp_classification(market, classification)
 
+        lp = parse_decimal(item.get("last_price_dollars"))
+        yb = parse_decimal(item.get("yes_bid_dollars"))
+        ya = parse_decimal(item.get("yes_ask_dollars"))
+        nb = parse_decimal(item.get("no_bid_dollars"))
+        na = parse_decimal(item.get("no_ask_dollars"))
+        vol = parse_decimal(item.get("volume_fp"))
+        v24 = parse_decimal(item.get("volume_24h_fp"))
+        oi = parse_decimal(item.get("open_interest_fp"))
+        liq = parse_decimal(item.get("liquidity_dollars"))
+        if should_skip_duplicate_snapshot(
+            db,
+            market.id,
+            last_price_dollars=lp,
+            yes_bid_dollars=yb,
+            yes_ask_dollars=ya,
+            no_bid_dollars=nb,
+            no_ask_dollars=na,
+            volume_fp=vol,
+            volume_24h_fp=v24,
+            open_interest_fp=oi,
+            liquidity_dollars=liq,
+        ):
+            continue
+
         snapshot = MarketSnapshot(
             market_pk=market.id,
-            last_price_dollars=parse_decimal(item.get("last_price_dollars")),
-            yes_bid_dollars=parse_decimal(item.get("yes_bid_dollars")),
-            yes_ask_dollars=parse_decimal(item.get("yes_ask_dollars")),
-            no_bid_dollars=parse_decimal(item.get("no_bid_dollars")),
-            no_ask_dollars=parse_decimal(item.get("no_ask_dollars")),
-            volume_fp=parse_decimal(item.get("volume_fp")),
-            volume_24h_fp=parse_decimal(item.get("volume_24h_fp")),
-            open_interest_fp=parse_decimal(item.get("open_interest_fp")),
-            liquidity_dollars=parse_decimal(item.get("liquidity_dollars")),
+            last_price_dollars=lp,
+            yes_bid_dollars=yb,
+            yes_ask_dollars=ya,
+            no_bid_dollars=nb,
+            no_ask_dollars=na,
+            volume_fp=vol,
+            volume_24h_fp=v24,
+            open_interest_fp=oi,
+            liquidity_dollars=liq,
         )
         db.add(snapshot)
         snapshots_created += 1

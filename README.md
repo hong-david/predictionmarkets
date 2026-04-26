@@ -8,10 +8,10 @@
 |------|--------|
 | **Market (contract)** | One tradeable contract (a Kalshi *ticker*), not the whole “event” or news story. |
 | **Snapshot** | A row of best bid/ask, last price, and volume saved every time the exchange sends a *ticker* update for that market. |
-| **Manipulability prior** | A rough “how plausibly could non-public *information* move this market?” label — a triage input, not evidence of wrongdoing. |
-| **Anomaly (stored row)** | A **rule score** from the latest few dozen snapshots (and book activity) materialized in the `anomalies` table when the score clears the persistence **floor** in `anomaly_materializer`. Not a per-trade “insider” verdict. |
-| **Triage prior** | The `manipulability_prior` classifier label (“how leak-prone is this *kind* of market?”). The Overview **Triage (top prior)** count is **only** “high + elevated” — separate from the “high” **single** bar, and from **evidence** (see **Markets with risk flags**). |
-| **Rule row count** (per market) | `COUNT(*)` in `anomalies` for that market. The materializer **inserts a new row** for each *new* `latest_snapshot_id` (ticker/quote) that produces a high enough rule score. **Trades** are a separate, much sparser count — a hyped event can have thousands of quote updates and hundreds of those stored as “rule rows” but only a few hundred **executions** on the tape, so 1255 vs 283 is normal. |
+| **Manipulability prior** | A rough “how plausibly could non-public *information* move this market?” label — a **priority** input (what to watch), not **evidence** that something happened. |
+| **Anomaly (stored row)** | A **rule score** from the latest few dozen snapshots (and book activity) materialized in the `anomalies` table when the score clears the persistence **floor** in `anomaly_materializer`. The UI calls these **stored alerts**; not a per-trade “insider” verdict. |
+| **Priority prior** | The `manipulability_prior` classifier label (“how leak-prone is this *kind* of market?”). The Overview **High-priority markets** count is **only** “high + elevated” — separate from the “high” **single** bar, and from **evidence** (see **Markets with alerts**). |
+| **Stored alert count** (per market) | `COUNT(*)` in `anomalies` for that market. The materializer **inserts a new row** for each *new* `latest_snapshot_id` (ticker/quote) that produces a high enough rule score. **Trades** are a separate, much sparser count — a hyped event can have thousands of quote updates and hundreds of those stored as alerts but only a few hundred **executions** on the tape, so 1255 vs 283 is normal. |
 | **Z-score (here)** | How many standard deviations the *latest* move is from *this* market’s own *recent* history of moves (rolling baseline). |
 | **Order-book event** | One line-level change: full level snapshot, or a delta (add/cancel size) on one price. |
 | **Trade tape** | Public list of executed trades (price, size, which side was aggressive). |
@@ -61,8 +61,8 @@ flowchart LR
     end
 
     subgraph SERVE[Serving]
-        API[FastAPI app/main.py\n/api/health /api/markets /api/markets/.../features /api/anomalies\n/api/dashboard/*]
-        SPA[Vite + React + TypeScript\nfrontend/ -> dist/ served as static\nOverview · Markets browser · Market detail]
+        API[FastAPI app/main.py\n/api/health + legacy /api/markets* (deprecated in OpenAPI)\n/api/dashboard/* canonical for the SPA]
+        SPA[Vite + React + TypeScript\nfrontend/ -> dist/ static\nOverview · Markets · event group · market detail]
     end
 
     KREST -->|GET /markets| POLLER
@@ -122,7 +122,9 @@ flowchart LR
   Q --> API2
 ```
 
-**URL state:** search params on `/markets` hold filters and sort so links are shareable. **Default list sort** `surveillance_urgency` puts markets with stored rule flags above “quiet” high-prior names. **First paint / Overview:** the home page uses a **single** `GET /api/dashboard/overview` to avoid four back-to-back JSON round-trips; cold loads still pay for the **first** JS download (Vite chunk includes Recharts) and the **first** run of several SQL counts / `GROUP BY`s on Postgres after an idle period.
+**Price chart (market detail):** `frontend/src/components/PriceChart.tsx` uses an **area** series with `LineType.Curved` and a light gradient under the line. The curve between trade times is a spline for readability, not a claim that the contract transacted at intermediate prices (public tape is discrete). Volume remains a per-trade histogram below.
+
+**URL state:** search params on `/markets` hold filters and sort so links are shareable. **Event grouping:** `GET /api/dashboard/events/{event_id}` (Kalshi `event_ticker` = `markets.event_id`) lists all leg contracts; the SPA route `/events/:eventId` shows the same. **Default list sort** `surveillance_urgency` puts markets with stored rule flags above “quiet” high-prior names. **First paint / Overview:** the home page uses a **single** `GET /api/dashboard/overview` to avoid four back-to-back JSON round-trips; cold loads still pay for the **first** JS download (Vite chunk includes Recharts) and the **first** run of several SQL counts / `GROUP BY`s on Postgres after an idle period.
 
 ### News vs prices (read path)
 
@@ -137,8 +139,10 @@ flowchart TD
   BS --> AE
   AE --> AM[anomaly_materializer]
   AM --> AN[(anomalies)]
-  TR[trades ascending] --> TS[trade_suspicion z-scores]
+  TR[trades ascending] --> TS[trade_suspicion 0-10 outlier]
+  TR --> TB[trade_burst 30s window]
   TS --> SER[GET .../series JSON only]
+  TB --> SER
 ```
 
 **Per-trade `suspicion`** is computed when the series API runs; it does **not** write `anomalies`. **Chart markers** on the detail page are **stored rule rows** (snapped to the nearest trade time for display), not one marker per trade.
@@ -162,7 +166,7 @@ flowchart TD
 - **FastAPI / Uvicorn** for the API.
 - **websockets** + **cryptography** for Kalshi WS auth and feed.
 - **pytest**, **ruff**, **mypy** for tests and linting.
-- **Vite + React 18 + TypeScript** for the frontend, with **Tailwind**, **TanStack Query**, **TanStack Table**, **TradingView lightweight-charts**, and **Recharts**. See `frontend/package.json`.
+- **Vite 2.9 (not 4/5) + React 18 + TypeScript** for the frontend, with **Tailwind**, **TanStack Query**, **TanStack Table**, **TradingView lightweight-charts**, and **Recharts** — Vite 4+ requires **^14.18.0**; Vite 5 targets Node 18+ ESM. **Vite 2.9.18** runs on **Node ≥12.2** so 14.17.x and similar “almost LTS” runtimes do not need a system Node upgrade. See `frontend/package.json`.
 - **Redis** is configured in `app/core/config.py` (`redis_host`, `redis_port`) and a URL helper exists, but it is **not yet wired into any code path**. It is reserved for the queue / worker layer planned later.
 
 ### Local dev workflow
@@ -179,6 +183,10 @@ Two processes side by side. The API serves JSON; Vite serves the frontend with h
 # .venv/Scripts/python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 
 # Terminal 2 — frontend (one-time install, then dev server)
+# The stack pins **Vite 2.9** so Node 12–**14.17** (inclusive) can run the
+# dev server without hitting Vite 4’s floor (`^14.18.0`) or Vite 5’s
+# Node 18+ ESM. If you are already on **Node 14.18+** or 16+, you may
+# prefer a newer Vite; this repo values “works on the old Node the OS ships”.
 cd frontend
 npm install
 # If Uvicorn is on :8001, create `frontend/.env.local` with:
@@ -186,6 +194,10 @@ npm install
 npm run dev
 # open http://localhost:5173
 ```
+
+**Blank or white page in the browser:** A completely white/empty view usually means the JS bundle did not run (check **Network** for red `index.*.js` or `main.tsx` 404) or a runtime error ran before React could paint. Open **Console (F12)**. For **`npm run dev`**, the shell URL may not be 5173 if that port is busy — use the `Local: http://localhost:…` line Vite prints, and start the API on the port the Vite proxy targets (default 8000) so the Overview is not stuck on the error card. The SPA’s `index.html` includes a short boot line inside `#root` and `frontend/src/main.tsx` wraps the app in an error boundary so a render error shows a message instead of a blank screen.
+
+If the dev server errors with **Cannot find module** under `vite/dist/node/chunks/dep-….js`, that is almost always a **broken or mixed `node_modules`** (e.g. half of Vite 5 left on disk while `package.json` pins Vite 2). Delete `frontend/node_modules` and `frontend/package-lock.json`, run `npm install` again, and ensure you are not invoking a **global** `vite` (the npm scripts call the local `node_modules/vite/bin/vite.js` explicitly).
 
 For a production-shaped run, build the frontend once and serve everything from FastAPI:
 
@@ -195,7 +207,7 @@ cd frontend && npm run build && cd ..
 # open http://localhost:8000
 ```
 
-If you don't have Node 18+ installed system-wide, the smoke setup uses a portable Node bundle dropped into `tools/` (gitignored). `node --version` should report ≥ 18.
+If you don't have a current Node, the smoke setup can use a portable Node bundle in `tools/` (gitignored). Any **Node ≥12.2** matches Vite 2.9; use that bundle or your OS install.
 
 ---
 
@@ -206,10 +218,10 @@ This section tracks the architectural decisions actually present in the code, pl
 ### Current design choices
 
 - **Public data only, named-pattern surveillance.** No account-level data is available from Kalshi's public feed. The detector taxonomy in §1 was chosen so each pattern is either fully detectable from public data or explicitly scoped out (wash trading).
-- **Two notions of “suspicious”.** (1) **Manipulability prior** — a slow-moving human-tuned triage: “is this the *kind* of market where an informed leak is plausible?”. (2) **Action / evidence** — something in *our* data (stored anomaly, or a trade-level outlier) has fired. The markets list can sort by **surveillance_urgency** so (2) dominates: until at least one materialized `anomalies` row exists, we do *not* float the market to the top just because prior is high. Per-trade `suspicion` in the series API is a *local* z-score over the last ~50 prints on that ticker — useful for which leg to look at, not a legal conclusion.
+- **Two notions: priority vs evidence.** (1) **Manipulability prior** — a slow-moving human-tuned **priority**: “is this the *kind* of market where an informed leak is plausible?”. (2) **Evidence / action** — something in *our* data (a **stored alert** row, or a **trade outlier** column on the series response) has fired. The markets list can sort by **surveillance_urgency** so (2) dominates: until at least one materialized `anomalies` row exists, we do *not* float the market to the top just because prior is high. Per-trade `suspicion` in the series API is a *local* **0..10** outlier score from z-features over the last ~50 prints on that ticker (JSON field name unchanged) — useful for which leg to look at, not a legal conclusion.
 - **Append-only event tables.** `market_snapshots` and `trades` are append-only so detectors can be replayed deterministically against historical data when rules change.
 - **Event time vs ingest time are stored separately.** `trades.ts` is the Kalshi `ts_ms` (the moment the trade executed); `trades.received_at` is when the row was inserted. Surveillance queries are event-time queries; `received_at` exists for clock-skew / pipeline-latency monitoring.
-- **`Numeric`, not `float`, for prices and volumes.** Money- and contract-quantity-like fields are stored at exchange precision (`Numeric(12, 4)` for dollar prices, `Numeric(18, 2)` for `*_fp` quantities) to avoid binary-floating-point error.
+- **`Numeric`, not `float`, for prices and volumes.** Money- and contract-quantity-like fields are stored at exchange precision (`Numeric(12, 4)` for dollar prices, `Numeric(18, 2)` for `*_fp` quantities) to avoid binary-floating-point error. The SQLAlchemy ORM types those columns as **`Decimal` / `Decimal | None` in `app/db/models.py`**; JSON responses still convert with `float()` at the API boundary.
 - **Idempotent ingest via `INSERT … ON CONFLICT DO NOTHING`.** Reconnects can replay messages. Trade ingest dedupes on `trade_id`; book-event ingest dedupes on `(session_id, seq, side, price_dollars)`. Either way, duplicates are a single cheap statement, not an exception path.
 - **One WebSocket connection, multiple channels, multiple `subscribe` commands.** `consume_market_data_forever` opens one authenticated WS and sends two `subscribe` commands on it — one for `ticker` + `trade` (no market filter), one for `orderbook_delta` with explicit `market_tickers`. Two commands rather than one because the channels need different `params` shapes; one connection rather than two because we want a single auth handshake, single heartbeat, and a single dispatcher in the message loop.
 - **Per-connection `session_id` for the book stream.** Kalshi's `seq` is per-subscription and resets on reconnect, so it is not a globally stable identifier. We generate a UUID per WS connection and stamp it on every `book_events` row. Idempotency, gap detection, and replay all use `(session_id, seq)`; a new `is_snapshot=true` row inside a new `session_id` is the natural marker of a session boundary.
@@ -222,19 +234,73 @@ This section tracks the architectural decisions actually present in the code, pl
   - `market_snapshots` currently has separate single-column `market_pk` and `ts` indexes (pre-existing); tightening to a composite `(market_pk, ts)` is an obvious follow-up but has not been done yet.
 - **Unique external IDs as constraints.** `markets.market_id` and `trades.trade_id` are both indexed `UNIQUE`. Dedup is enforced by the database, not application logic.
 - **Anomaly engine + book hints + persistence gate.** `analyze_market` uses **rolling z-scores** (stricter `z` in code than a naive 2.0) on spread, ref-price change, and volume delta when enough history exists (default 40 snapshots in the materializer); otherwise static fallbacks. `book_activity_signals` adds points from **high order-book event rate** and **sustained cancel/pull** in a 3-minute window. **`materialize_market_anomaly` only creates/keeps a row** when the computed score is **≥ 3.0**; weaker snapshots delete a row for the same `latest_snapshot_id` so the DB and chart are not full of one-rule “low” noise. **No full L2 reconstruction in RAM yet** — churn heuristics only; a real spoofing detector would rebuild the book from `book_events`.
-- **Per-trade suspicion (API).** `trade_suspicion.py` scores each print vs a local window for the series response only; it does not write `anomalies`.
+- **Per-trade outlier (API).** `trade_suspicion.py` scores each print vs a local window and returns **0..10** for the series response only; it does not write `anomalies`. The market-detail table labels this **Outlier** (not “suspicious trade”).
+- **Burst / cluster (API, tape-only).** `trade_burst.py` measures dense same-side windows (default 30s) on the same ascending tape as the chart; the series response adds per-trade `cluster_0_10` and a `tape_cluster` summary. It is a behavioral cluster *hypothesis* — Kalshi’s public API does not expose account ids, so the UI phrasing does not assert identity.
+- **Explicit priority vs evidence in JSON.** `app/services/surveillance_scores.py` defines **0..100** `evidence_score` and `urgency_score`, plus a string `market_priority` (classifier `manipulability_prior` or `unclassified`) and `reasons[]` (deduped **snake_case** slugs from materialized `anomalies.reasons` for that market). The dashboard list/detail/series endpoints in `app/api/routes/dashboard.py` expose these in addition to the legacy `manipulability_prior` / `anomaly_count` fields the UI already had.
+- **Legacy JSON routes (compat only).** `app/api/routes/markets.py`, `app/api/routes/features.py`, and `app/api/routes/anomalies.py` remain registered under `/api/...` for old scripts, but the routers and operations are **marked deprecated** in the OpenAPI schema; the product contract is `/api/dashboard/*` used by the React app.
 - **Per-message DB lookup for `market_pk`, with lazy upsert on miss.** Each handler resolves `market_ticker → market_pk` via a fresh DB query rather than caching the mapping. On a miss for `ticker` / `trade`, the handler falls through to the lazy-upsert path described above instead of dropping the message. This is intentionally naive in v1; if profiling under real book volume shows it as the bottleneck, an in-process LRU populated lazily (and invalidated when the REST poller updates a market) is the obvious next step.
 - **Redis is declared but not used.** It is reserved for the planned queue / worker layer that will sit between WS ingest and the anomaly path. Wiring it in too early would be premature.
 - **Backoff / reconnect on WS failures.** `consume_market_data_forever` reconnects with exponential backoff capped at 30s, so a transient Kalshi or network blip doesn't kill the consumer.
 - **Periodic universe sweep, not single-page polling.** Both `scripts/bootstrap_markets.py` (one-shot) and `scripts/poll_markets.py` (interval-driven) walk Kalshi's `cursor`-based pagination via `iter_markets(status="open")` and ingest in fixed-size batches. The pre-fix poller called `get_markets(limit=25)` once per cycle, which meant the alphabetical front-load (~50k dead `KXMVECROSSCATEGORY...` markets) was the only thing it ever touched, and the lazy-upsert backlog from the WS feed was never hydrated. Sweeping the full open set is the only design that keeps the WS feed and REST metadata in sync without a per-ticker hydration endpoint. Defaults: `interval=300s`, `batch=500`. Both scripts share a `chunked()` helper in `app/services/market_ingestor.py` so the iteration shape stays in one place.
 - **Targeted hydration of the lazy-upsert backlog (per-ticker REST).** The bulk `/markets` sweep is filtered by `status=open`, but Kalshi's high-trade-count markets right now (live NBA / MLB / UFC games, BTC 15-minute strikes that just expired) are `'active'` or `'finalized'`, not `'open'`. So the bulk sweep would never hydrate them and the dashboard would show them as `KXNBAGAME-...` ticker strings forever. `scripts/hydrate_unknown_markets.py` solves this by hitting Kalshi's per-ticker `/markets/{ticker}` endpoint for each row with `status='unknown'`. With `--top-by-trades` it orders the queue by descending `count(*)` from `trades`, so dashboard-visible markets get hydrated first. ~20 req/s with the default sleep is comfortably under any sane rate limit and drains 50 markets in ~25 seconds. This script is a backlog drainer, not a long-running daemon — it exits when the queue is empty.
 - **Frontend split: SPA in `frontend/`, JSON API in FastAPI.** The previous "embedded HTML in a Python module" dashboard was demoable but capped what surveillance UI we could build — no real charting, no per-market drill-down, no virtualised tables for the 24k-market universe. The current design separates the two halves on a clean JSON contract: FastAPI exposes everything the dashboard needs under `/api/dashboard/*` (typed responses, paginated, filterable), and a Vite + React + TypeScript frontend in `frontend/` consumes that surface. Pinned trade-offs: (1) **No SSR / Next.js.** Dashboard is read-only and authenticated-server-side eventually; client-side fetching with TanStack Query is enough and keeps the build trivial. (2) **No global state library.** All shared state (filters, search, sort, pagination) lives in URL search params via `react-router-dom`'s `useSearchParams` so a copy-pasted link reproduces the exact same filtered view, and TanStack Query handles server-state caching. (3) **TanStack Table over a custom grid.** 24k markets is well within its virtualised-row capacity; rolling our own would be busywork. (4) **TradingView `lightweight-charts` over Recharts for the price chart.** Same library Polymarket / Kalshi use; built-in crosshair, time-axis zoom, anomaly-marker overlay (`setMarkers`). Recharts is reserved for the small breakdown bar charts where its declarative React API wins. (5) **Single-process production deploy.** No nginx, no separate static host: FastAPI's catch-all route serves `frontend/dist/index.html` plus `assets/` directly. Mounting `StaticFiles(html=True)` at `/` was tried first and rejected because Starlette's mount-at-root absorbs sibling routes including `/api/*`; a path-based catch-all that explicitly skips reserved prefixes (`api/`, `docs`, `redoc`, `openapi.json`) routes correctly without trickery. (6) **Public-API namespace moved under `/api/*`.** `/health`, `/markets`, `/anomalies`, `/features` all gained the `/api` prefix so the SPA can own URL paths like `/markets/:id` without colliding. The router files themselves don't carry an `/api` prefix; it's added in `app/main.py` via `include_router(prefix="/api")` so each router stays composable in isolation. (7) **GDELT for correlated news, with explicit graceful degradation.** The detail page's news panel hits GDELT 2.0's free DOC API with a 5-second timeout. Any failure (network, parse, GDELT down) returns `provider="unavailable"` with an empty article list; the frontend renders an empty state rather than an error toast. Meaningful: the project is graded on its surveillance backend, not its news vendor — this fails open instead of breaking the page.
+- **Raw tape / L2 (second disk tier).** In-scope markets still get `market_snapshots` and `anomaly_materializer`. **`trades` and `book_events` are further gated** in `app/services/retention.py` via `should_persist_raw_tape`: we append raw tape and order-book rows only if `manipulability_prior` is `high` or `medium_high`, or 24h volume / OI are above code constants, or the market’s `close_time` is within the next 14 days, or a materialized `anomalies` row exists. `app/services/kalshi_ws.py` enforces that at ingest (ticker message updates an in-process volume cache; cold markets that later earn an `anomalies` row then persist tape). The market-detail chart is empty for markets that are cold on all dimensions — the UI can still use REST snapshot fields. **One-off space reclaim (optional):** `scripts/prune_old_book_events.py` (dry-run by default) mass-deletes old `book_events` by `received_at`.
 - **Retention / scope policy in one place.** Whether a market deserves to be in the surveillance universe at all is a single decision encoded in `app/services/retention.py`: `EXCLUDED_CATEGORIES = {"exotic_combo", "crypto_strike"}` and `EXCLUDED_PRIORS = {"very_low"}`. Both the REST ingestor (`ingest_markets_payload`) and the WS lazy-upsert path (`_get_or_create_market`) call into the same predicate, so out-of-scope markets are dropped at the door — the classifier runs once per ingest, and the same `Classification` powers both the scope decision and the row stamping. The policy is a frozenset module constant rather than env config because "what does our system pay attention to" is the kind of decision a regulator wants to see in code review, not in a `.env`. Retroactive cleanup (`scripts/prune_markets.py`) reads the same predicate and uses the DB-level `ON DELETE CASCADE` (added in migration `f1a2c3d4b5e6`) so a single `DELETE FROM markets WHERE ...` cleans up every dependent row in `market_snapshots` / `trades` / `book_events` / `anomalies` — no slow ORM iteration, no orphaned children. Today's exclusions: Kalshi's `KXMVECROSSCATEGORY-*` parlay catalog (~285k rows of derived combinations whose manipulability-prior really should come from the constituent legs, which is a v2 problem) and `weather` (public physical underlying, no insider-leakable signal). Specifically *not* excluded: `low` priors like crypto strikes, because the trade tape itself can still surface spoofing / momentum-ignition signals that don't depend on the underlying being insider-leakable.
 - **Layered classifier with explicit confidence.** Markets are classified into a category / subcategory / manipulability-prior tuple by a four-layer pipeline (`app/services/classifier/`): Kalshi taxonomy adapter → ticker / regex prefix rules → k-NN over a small char-n-gram TF-IDF seed corpus → optional LLM zero-shot fallback. The first layer that returns `confidence != "low"` wins; lower-confidence verdicts are kept only as fallback when every later layer also abstains. The priority map (`priorities.py`) is the *only* place a human value judgment lives in the codebase — the classifiers themselves are mechanical. Trade-offs the design pins down: (1) **Off-the-shelf, not a trained model.** No labels, no class-imbalance fixes, no retraining cadence, and the explanation `"matched_rule=sports.ufc"` is regulator-defensible in a way that a model output isn't. (2) **No torch / sentence-transformers dep.** The k-NN layer is pure-stdlib char-n-gram TF-IDF — slightly less accurate than a sentence transformer but ~5MB instead of ~700MB, and the public API of the layer is the same so we can swap implementations if accuracy ever becomes the bottleneck. (3) **Layer 4 (LLM) defaults to a no-op.** Setting `default_llm_classifier()` to return `NullLLMClassifier()` means the orchestrator has a 4-layer architecture but the default deployment runs only 3 — opting in to Ollama / a cloud LLM is one config change. (4) **Low-confidence safety clamp.** When the orchestrator's final verdict is `confidence="low"`, `manipulability_prior` is clamped down from `high`/`medium_high` to `medium` so a misclassified market can't escalate onto the high-prior watchlist. (5) **Versioning.** A `CLASSIFIER_VERSION` int travels with every classification; a backfill script reclassifies on bump. Cosmetic refactors don't touch it; rule / seed / map changes do.
 
 ### Recent changes
 
 Most recent first.
+
+#### 2026-04-26 — Frontend: blank page diagnostics (error boundary + boot HTML)
+
+- **`frontend/src/main.tsx`:** `RootErrorBoundary` wraps `<App />` so an uncaught render error shows a short message and still suggests opening the devtools instead of a white screen. **`index.html`:** a styled “Loading the dashboard…” line inside `#root` until React mounts, so a missing or broken JS load is easier to interpret.
+- **README** local dev: what “blank/white” usually means and F12 / correct dev URL (port from Vite, API on the proxy target).
+
+#### 2026-04-26 — Frontend: local Vite binary in npm scripts
+
+- **`frontend/package.json`:** `dev` / `build` / `preview` call `node ./node_modules/vite/bin/vite.js` so the shell never picks up a **global** Vite or a mixed `node_modules/.bin` shim. **README** local-dev: troubleshooting for missing `dep-*.js` chunks (clean reinstall).
+
+#### 2026-04-26 — Frontend: Vite 2.9 for Node 14.17 and older (no Vite 4/5)
+
+- **`frontend/package.json`:** **`vite` 2.9.18** and **`@vitejs/plugin-react` 1.3.2** — Vite 4 requires **^14.18.0** and Vite 5 targets Node 18+ (both can throw `??=` on older parsers). Vite 2.9.18 is the last 2.x line and supports **Node ≥12.2**, covering e.g. **14.17.4** without a Node upgrade. Removed `predev` / `check-node` and `engines` pin.
+#### 2026-04-26 — Tier-2 storage: gate trades and book events
+
+- **`app/services/kalshi_ws.py`:** when the tape gate skips a trade but the lazy-upsert path created a new `Market` stub, the handler **`commit()`s** so the stub is not rolled back with the skipped `INSERT` into `trades`.
+- **`app/services/retention.py`:** `should_persist_raw_tape` and constants (`RAW_TAPE_HIGH_PRIORS`, volume / OI floors, 14d close window) decide whether the WebSocket may append to **`trades`** and **`book_events`**. If `should_persist_raw_tape` is false on cheap inputs, the consumer checks for any **`anomalies`** row for that market and keeps tape in that case.
+- **`app/services/kalshi_ws.py`:** per-market volume/OI **hint cache** from ticker messages (with DB fallbacks) drives the gate; order-book handlers use the same `_raw_tape_allowed` as trades.
+- **`scripts/prune_old_book_events.py`:** dry-run by default, deletes aged `book_events` when operators need disk back (L2 is often the largest table).
+- **Tests** (`tests/test_retention.py`, `tests/test_kalshi_ws_handlers.py`) and **README** design choices.
+#### 2026-04-26 — Event page, multi-timezone trade audit, chart crosshair
+
+- **`GET /api/dashboard/events/{event_id}`** (already in `app/api/routes/dashboard.py`) is now used by the SPA: route **`/events/:eventId`** in `frontend/src/routes/EventGroup.tsx`, client **`api.eventGroup`** in `frontend/src/api/client.ts`. **Markets** table adds an **Event** link column when `event_id` is set. **Market detail** shows the Kalshi `event_ticker` and a link to “All contracts in this event” when `event_id` is present.
+- **Trade table & chart time:** `lib/utils.ts` adds **`fmtTimeUtc`**, **`fmtTimeEastern`**, and **`tradeTimestampsForAudit`**; market detail prints local, ET, and UTC per print (and crosshair in `PriceChart` shows local · ET · UTC). **`PriceChart`:** comment fixed — duplicate x-axis times are nudged by **+1 second**, not 1ms.
+- **README:** URL-state paragraph and diagram note the event view.
+
+#### 2026-04-25 — Smoother market-detail price chart
+
+- **`frontend/src/components/PriceChart.tsx`:** yes price is drawn as a **curved** area series (`LineType.Curved` + `topColor` / `bottomColor` gradient) instead of a stepped line, so the top pane is less stair-step blocky. **Market detail** chart subtitle text updated to say the curve is a visual spline between prints.
+
+#### 2026-04-25 — Market detail: trades table by outlier, not time
+
+- **`frontend/src/routes/MarketDetail.tsx`:** the trades table is the **top 30** rows in the series payload **sorted** by per-print `suspicion` (outlier 0–10), then `cluster_0_10`, then size/jump heuristics, then time — not “latest 30 by clock.”
+
+#### 2026-04-25 — Scores, burst detector, Decimal ORM, deprecated legacy /api
+
+- **`app/services/surveillance_scores.py`:** 0..100 `evidence_score` / `urgency_score`, `market_priority` string, `reasons[]` as deduped machine slugs from materialized `anomalies`; wired into `GET /api/dashboard/markets` (batch), detail, and top-markets.
+- **`app/services/trade_burst.py`:** sliding-window burst intensity on the trade tape; `GET /api/dashboard/markets/{id}/series` returns `tape_cluster` plus per-print `cluster_0_10`. **Tests:** `tests/test_surveillance_scores.py`, `tests/test_trade_burst.py`, updated `tests/test_dashboard_api.py`.
+- **ORM `app/db/models.py`:** `Numeric` money/volume/quantity columns use **`Decimal` / `Decimal | None` mapped types** (serialization still `float()` in routes).
+- **OpenAPI:** `app/api/routes/markets.py`, `features.py`, `anomalies.py` routers/operations **deprecated**; product path remains **`/api/dashboard/*`**.
+- **Frontend** (`api/types.ts`, `MarketsBrowser.tsx`, `MarketDetail.tsx`): new columns and cluster detail.
+- **README** detection diagram, design choices, and this entry (see project rule: keep in sync with non-trivial code changes).
+
+#### 2026-04-26 (later) — Product copy, trade outlier 0–10, “why” reasons
+
+- **UI** (`frontend/src/routes/Overview.tsx`, `MarketsBrowser.tsx`, `MarketDetail.tsx`, `App.tsx`, `lib/labels.ts`): user-facing **priority** vs **stored alerts** (replacing “triage / flags / rule rows” in most surfaces), sort labels like **Alerts first** and **Priority, then volume**, market-detail **Outlier** column (0–10), app tagline “Monitoring public Kalshi data for unusual market activity.”
+- **`app/services/trade_suspicion.py`:** per-print score is **0..10** (linear map from capped z-features of size and |Δ yes price|); the old `min(20, …)` scale could not exceed ~6 and was misleading.
+- **`frontend/src/lib/reasonPhrases.ts`:** `humanizeAnomalyReason()` for short plain-English lines; market detail **Why you might see an alert** lists deduped reasons from materialized `anomalies.reasons[]`.
+- **Amber row highlight** on the trade table: outlier **≥3.5** (aligned with 0–10), plus the existing large-size / large-jump heuristics.
+- **Changelog / glossary (this file):** glossary and “current design choices” updated so **priority** and **evidence** are not conflated.
 
 #### 2026-04-26 (later) — “Flags” vs trade count: copy
 
@@ -267,7 +333,7 @@ Most recent first.
 #### 2026-04-25 — `surveillance_urgency` sort, per-trade suspicion, home link
 
 - **List ordering (`/api/dashboard/markets?sort=surveillance_urgency`).** If `anomaly_count = 0`, the sort key is a tiny floor so all “quiet” markets (including high triage) sort together by `updated_at`, not by prior. If `anomaly_count > 0`, the key is `(8 + 0.4 * (prior_rank+1)) * ln(1+count)` so **count** (evidence mass) dominates **prior**; a lower-triage market with more stored flags can outrank a high-triage one with a single row. The **Markets** page default is this mode; `sort=prior` is prior × trade count only.
-- **`app/services/trade_suspicion.py`.** For each print in the ascending trade tape, computes a 0–20 capped score from **windowed z-scores** of contract size and of one-tick |Δ yes price| against *this* market’s own recent history (v1, no ML). `GET /api/dashboard/markets/{id}/series` attaches a `suspicion` field per trade. The market detail table adds an “Unusual” column and can amber-highlight rows with score ≥2 in addition to the large-size / large-jump heuristics.
+- **`app/services/trade_suspicion.py`.** For each print in the ascending trade tape, computes a **0–10** score from **windowed z-scores** of contract size and of one-tick |Δ yes price| against *this* market’s own recent history (v1, no ML). `GET /api/dashboard/markets/{id}/series` attaches a `suspicion` field per trade. The market detail table adds an **Outlier** column and can amber-highlight rows with score **≥3.5** in addition to the large-size / large-jump heuristics. *(Earlier drafts used a 0–20 cap with a ~6 true max; removed — see the 2026-04-26 “Product copy, trade outlier 0–10” changelog entry.)*
 - **UI:** header **logo + title** is a `Link` to `/`. Overview breakdown charts and markets filter chips **omit** the `unclassified` / “not set” bucket so the bars are not dominated by NULL labels (counts still count toward `/stats`).
 
 #### 2026-04-25 — Dashboard copy and drill-down; `unclassified` list filter
@@ -309,7 +375,7 @@ The headline design idea is **separate the two halves on a typed JSON contract**
   - **TradingView `lightweight-charts`** for the price/volume chart. Same library Polymarket / Kalshi use; built-in crosshair and time-axis zoom; anomaly markers via `series.setMarkers()` overlaid on the line series. `Recharts` is reserved for the small declarative breakdown bar charts on the Overview page where its React-y API wins.
   - **Three pages**: `Overview` (`/`), `MarketsBrowser` (`/markets`), `MarketDetail` (`/markets/:marketId`).
 
-- **Single-process production deploy.** No nginx, no separate static host. `npm run build` outputs to `frontend/dist/`, and FastAPI's catch-all serves it. Same Uvicorn process serves the API and the bundle. `frontend/dist/`, `frontend/node_modules/`, `frontend/.vite/`, and `tools/` (portable Node bundle for environments without Node 18+) are gitignored.
+- **Single-process production deploy.** No nginx, no separate static host. `npm run build` outputs to `frontend/dist/`, and FastAPI's catch-all serves it. Same Uvicorn process serves the API and the bundle. `frontend/dist/`, `frontend/node_modules/`, `frontend/.vite/`, and `tools/` (portable Node bundle for environments without a system `node` / older PATH) are gitignored.
 
 - **Tests (`tests/test_dashboard_api.py`).** New integration-style smoke suite gated on `RUN_INTEGRATION=1`: every `/api/dashboard/*` endpoint is hit with a real DB and asserted to return the documented shape, plus regression tests for `/api/health` (unchanged behaviour after the `/api` prefix migration), `/api/foo` (404 from FastAPI, not the SPA fallback), and `/markets/foo` (SPA fallback returns `index.html`, *not* a 404). 100 tests pass; 20 integration tests skip without `RUN_INTEGRATION=1` as expected.
 

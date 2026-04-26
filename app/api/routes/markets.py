@@ -1,21 +1,15 @@
-from datetime import datetime
-from decimal import Decimal
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
+from app.api.serialization import decimal_to_float, isoformat_or_none
 from app.db.models import Market, MarketSnapshot
 
-router = APIRouter(prefix="/markets", tags=["markets"])
-
-
-def serialize_datetime(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
-
-
-def serialize_decimal(value: Decimal | None) -> float | None:
-    return float(value) if value is not None else None
+router = APIRouter(
+    prefix="/markets",
+    tags=["markets (legacy)"],
+    deprecated=True,
+)
 
 
 def serialize_market(market: Market) -> dict:
@@ -28,10 +22,10 @@ def serialize_market(market: Market) -> dict:
         "title": market.title,
         "subtitle": market.subtitle,
         "status": market.status,
-        "open_time": serialize_datetime(market.open_time),
-        "close_time": serialize_datetime(market.close_time),
-        "created_at": serialize_datetime(market.created_at),
-        "updated_at": serialize_datetime(market.updated_at),
+        "open_time": isoformat_or_none(market.open_time),
+        "close_time": isoformat_or_none(market.close_time),
+        "created_at": isoformat_or_none(market.created_at),
+        "updated_at": isoformat_or_none(market.updated_at),
     }
 
 
@@ -39,20 +33,24 @@ def serialize_snapshot(snapshot: MarketSnapshot) -> dict:
     return {
         "id": snapshot.id,
         "market_pk": snapshot.market_pk,
-        "ts": serialize_datetime(snapshot.ts),
-        "last_price_dollars": serialize_decimal(snapshot.last_price_dollars),
-        "yes_bid_dollars": serialize_decimal(snapshot.yes_bid_dollars),
-        "yes_ask_dollars": serialize_decimal(snapshot.yes_ask_dollars),
-        "no_bid_dollars": serialize_decimal(snapshot.no_bid_dollars),
-        "no_ask_dollars": serialize_decimal(snapshot.no_ask_dollars),
-        "volume_fp": serialize_decimal(snapshot.volume_fp),
-        "volume_24h_fp": serialize_decimal(snapshot.volume_24h_fp),
-        "open_interest_fp": serialize_decimal(snapshot.open_interest_fp),
-        "liquidity_dollars": serialize_decimal(snapshot.liquidity_dollars),
+        "ts": isoformat_or_none(snapshot.ts),
+        "last_price_dollars": decimal_to_float(snapshot.last_price_dollars),
+        "yes_bid_dollars": decimal_to_float(snapshot.yes_bid_dollars),
+        "yes_ask_dollars": decimal_to_float(snapshot.yes_ask_dollars),
+        "no_bid_dollars": decimal_to_float(snapshot.no_bid_dollars),
+        "no_ask_dollars": decimal_to_float(snapshot.no_ask_dollars),
+        "volume_fp": decimal_to_float(snapshot.volume_fp),
+        "volume_24h_fp": decimal_to_float(snapshot.volume_24h_fp),
+        "open_interest_fp": decimal_to_float(snapshot.open_interest_fp),
+        "liquidity_dollars": decimal_to_float(snapshot.liquidity_dollars),
     }
 
 
-@router.get("")
+@router.get(
+    "",
+    summary="List markets (legacy)",
+    description="Prefer `GET /api/dashboard/markets` for classifier fields, scores, and filters.",
+)
 def list_markets(
     limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -64,7 +62,11 @@ def list_markets(
     }
 
 
-@router.get("/{market_id}")
+@router.get(
+    "/{market_id}",
+    summary="Get market (legacy)",
+    description="Prefer `GET /api/dashboard/markets/{market_id}` for the detail bundle.",
+)
 def get_market(
     market_id: str,
     db: Session = Depends(get_db),
@@ -76,7 +78,10 @@ def get_market(
     return serialize_market(market)
 
 
-@router.get("/{market_id}/snapshots")
+@router.get(
+    "/{market_id}/snapshots",
+    summary="Market snapshots (legacy)",
+)
 def get_market_snapshots(
     market_id: str,
     limit: int = Query(default=20, ge=1, le=100),

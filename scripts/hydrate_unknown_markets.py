@@ -64,6 +64,65 @@ def select_unknown_tickers(
         db.close()
 
 
+def hydrate_unknown_tickers(
+    *,
+    top_by_trades: bool,
+    max_markets: int | None,
+    sleep_seconds: float,
+) -> dict[str, int]:
+    tickers = select_unknown_tickers(
+        top_by_trades=top_by_trades, max_markets=max_markets
+    )
+    if not tickers:
+        print(f"[{_utc_now()}] no markets with status='unknown'; nothing to do")
+        return {"hydrated": 0, "missing": 0, "errored": 0}
+
+    print(
+        f"[{_utc_now()}] hydrating {len(tickers)} unknown ticker(s) "
+        f"(top_by_trades={top_by_trades}, sleep={sleep_seconds}s)",
+        flush=True,
+    )
+
+    client = KalshiRestClient()
+    hydrated = 0
+    missing = 0
+    errored = 0
+
+    db = SessionLocal()
+    try:
+        for i, ticker in enumerate(tickers, start=1):
+            try:
+                market = client.get_market(ticker)
+            except Exception as e:
+                errored += 1
+                print(f"  {ticker}: error {e!r}", flush=True)
+                time.sleep(sleep_seconds)
+                continue
+
+            if market is None:
+                missing += 1
+            else:
+                ingest_markets_payload(db, {"markets": [market]})
+                hydrated += 1
+
+            if i % 50 == 0 or i == len(tickers):
+                print(
+                    f"  [{_utc_now()}] progress {i}/{len(tickers)} "
+                    f"hydrated={hydrated} missing={missing} errored={errored}",
+                    flush=True,
+                )
+
+            time.sleep(sleep_seconds)
+    finally:
+        db.close()
+
+    print(
+        f"[{_utc_now()}] done. hydrated={hydrated} missing={missing} errored={errored}",
+        flush=True,
+    )
+    return {"hydrated": hydrated, "missing": missing, "errored": errored}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -85,55 +144,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    tickers = select_unknown_tickers(
-        top_by_trades=args.top_by_trades, max_markets=args.max
-    )
-    if not tickers:
-        print(f"[{_utc_now()}] no markets with status='unknown'; nothing to do")
-        return
-
-    print(
-        f"[{_utc_now()}] hydrating {len(tickers)} unknown ticker(s) "
-        f"(top_by_trades={args.top_by_trades}, sleep={args.sleep}s)",
-        flush=True,
-    )
-
-    client = KalshiRestClient()
-    hydrated = 0
-    missing = 0
-    errored = 0
-
-    db = SessionLocal()
-    try:
-        for i, ticker in enumerate(tickers, start=1):
-            try:
-                market = client.get_market(ticker)
-            except Exception as e:
-                errored += 1
-                print(f"  {ticker}: error {e!r}", flush=True)
-                time.sleep(args.sleep)
-                continue
-
-            if market is None:
-                missing += 1
-            else:
-                ingest_markets_payload(db, {"markets": [market]})
-                hydrated += 1
-
-            if i % 50 == 0 or i == len(tickers):
-                print(
-                    f"  [{_utc_now()}] progress {i}/{len(tickers)} "
-                    f"hydrated={hydrated} missing={missing} errored={errored}",
-                    flush=True,
-                )
-
-            time.sleep(args.sleep)
-    finally:
-        db.close()
-
-    print(
-        f"[{_utc_now()}] done. hydrated={hydrated} missing={missing} errored={errored}",
-        flush=True,
+    hydrate_unknown_tickers(
+        top_by_trades=args.top_by_trades,
+        max_markets=args.max,
+        sleep_seconds=args.sleep,
     )
 
 

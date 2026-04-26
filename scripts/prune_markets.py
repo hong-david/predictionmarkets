@@ -28,6 +28,10 @@ Usage:
 
   # Or limit by manipulability prior:
   python scripts/prune_markets.py --execute --prior very_low
+
+  # Drop unresolved WebSocket stub rows that still have no exchange metadata:
+  python scripts/prune_markets.py --stale-unknown
+  python scripts/prune_markets.py --stale-unknown --execute
 """
 
 from __future__ import annotations
@@ -36,10 +40,10 @@ import argparse
 import sys
 import time
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Market
+from app.db.models import Anomaly, BookEvent, Market, MarketSnapshot, Trade
 from app.db.session import SessionLocal
 from app.services.retention import EXCLUDED_CATEGORIES, EXCLUDED_PRIORS
 
@@ -65,6 +69,34 @@ def _scope_filter(category: str | None, prior: str | None):
         Market.category.in_(cats),
         Market.manipulability_prior.in_(pris),
     )
+
+
+def _stale_unknown_filter():
+    return (Market.status == "unknown") & (Market.title == Market.market_id)
+
+
+def _delete_stale_unknown_batch(db: Session, batch_size: int) -> int:
+    ids = [
+        row[0]
+        for row in db.execute(
+            select(Market.id)
+            .where(_stale_unknown_filter())
+            .order_by(Market.id)
+            .limit(batch_size)
+        ).all()
+    ]
+    if not ids:
+        return 0
+
+    for model in (Anomaly, BookEvent, Trade, MarketSnapshot):
+        db.execute(delete(model).where(model.market_pk.in_(ids)))
+    deleted = (
+        db.query(Market)
+        .filter(Market.id.in_(ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return int(deleted or 0)
 
 
 def _summarise(db: Session, where) -> None:
@@ -97,6 +129,34 @@ def _summarise(db: Session, where) -> None:
     for pri, n in by_prior:
         print(f"    {(pri or '<null>'):<16s} {n:>10,}")
 
+    market_ids = select(Market.id).where(where).subquery()
+    child_counts = {
+        "market_snapshots": db.execute(
+            select(func.count())
+            .select_from(MarketSnapshot)
+            .join(market_ids, market_ids.c.id == MarketSnapshot.market_pk)
+        ).scalar_one(),
+        "trades": db.execute(
+            select(func.count())
+            .select_from(Trade)
+            .join(market_ids, market_ids.c.id == Trade.market_pk)
+        ).scalar_one(),
+        "book_events": db.execute(
+            select(func.count())
+            .select_from(BookEvent)
+            .join(market_ids, market_ids.c.id == BookEvent.market_pk)
+        ).scalar_one(),
+        "anomalies": db.execute(
+            select(func.count())
+            .select_from(Anomaly)
+            .join(market_ids, market_ids.c.id == Anomaly.market_pk)
+        ).scalar_one(),
+    }
+    print()
+    print("  child rows that will cascade:")
+    for table, n in child_counts.items():
+        print(f"    {table:<30s} {int(n):>10,}")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -115,14 +175,31 @@ def main() -> int:
         default=None,
         help="Narrow deletion to a single manipulability prior (e.g. very_low).",
     )
+    parser.add_argument(
+        "--stale-unknown",
+        action="store_true",
+        help="Delete unresolved WS stub rows: status='unknown' and title=market_id.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="For --stale-unknown --execute, delete this many markets per transaction.",
+    )
     args = parser.parse_args()
 
     db = SessionLocal()
     try:
-        where = _scope_filter(args.category, args.prior)
+        where = (
+            _stale_unknown_filter()
+            if args.stale_unknown
+            else _scope_filter(args.category, args.prior)
+        )
 
         print("=== PRUNE PLAN ===")
-        if args.category or args.prior:
+        if args.stale_unknown:
+            print("  filter: status='unknown' AND title=market_id")
+        elif args.category or args.prior:
             print(f"  filter: category={args.category!r} prior={args.prior!r}")
         else:
             print(
@@ -142,6 +219,20 @@ def main() -> int:
         # SQLAlchemy synchronize_session=False is essential here — the
         # ORM otherwise tries to keep its identity map consistent across
         # every cascaded child row, which collapses on a 285k delete.
+        if args.stale_unknown:
+            total_deleted = 0
+            while True:
+                deleted = _delete_stale_unknown_batch(db, args.batch_size)
+                if deleted == 0:
+                    break
+                total_deleted += deleted
+                print(f"  deleted {total_deleted:,} stale unknown markets...", flush=True)
+            elapsed = time.time() - t0
+            print(
+                f"  deleted {total_deleted:,} markets (+ child rows) in {elapsed:.1f}s"
+            )
+            return 0
+
         deleted = (
             db.query(Market)
             .filter(where)

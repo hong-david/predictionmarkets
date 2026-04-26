@@ -6,10 +6,15 @@ from app.db.models import Anomaly, Market, MarketSnapshot
 from app.services.anomaly_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
 
-router = APIRouter(tags=["anomalies"])
+router = APIRouter(tags=["anomalies (legacy on-the-fly)"], deprecated=True)
 
 
-@router.get("/markets/{market_id}/anomaly")
+@router.get(
+    "/markets/{market_id}/anomaly",
+    summary="Recompute anomaly from snapshots (legacy)",
+    description="Prefer `GET /api/dashboard/markets/{id}/anomalies` for materialized rule rows; "
+    "this endpoint re-runs the engine for debugging.",
+)
 def get_market_anomaly(
     market_id: str,
     lookback: int = Query(default=40, ge=1, le=80),
@@ -30,7 +35,12 @@ def get_market_anomaly(
     book_raw = collect_book_activity_signals(db, market.id)
     return analyze_market(market, snapshots, book_activity=book_raw)
 
-@router.get("/anomalies/stored")
+
+@router.get(
+    "/anomalies/stored",
+    summary="List stored anomalies (legacy)",
+    description="Prefer `GET /api/dashboard/anomalies` for the same materialized list shape.",
+)
 def list_stored_anomalies(
     limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -67,8 +77,14 @@ def list_stored_anomalies(
         "count": len(results),
         "anomalies": results,
     }
-    
-@router.get("/anomalies")
+
+
+@router.get(
+    "/anomalies",
+    summary="Scan + analyze markets (legacy, heavy)",
+    description="Prefer the dashboard: `GET /api/dashboard/overview` and `GET /api/dashboard/anomalies` "
+    "read precomputed `anomalies` without scanning large snapshot windows per request.",
+)
 def list_anomalies(
     market_limit: int = Query(default=50, ge=1, le=200),
     result_limit: int = Query(default=20, ge=1, le=100),

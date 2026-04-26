@@ -106,6 +106,10 @@ def test_markets_list_pagination_and_filters(client: TestClient) -> None:
             "manipulability_prior",
             "trade_count",
             "anomaly_count",
+            "market_priority",
+            "evidence_score",
+            "urgency_score",
+            "reasons",
         } <= m.keys()
 
     r2 = client.get(
@@ -159,6 +163,10 @@ def test_market_detail_returns_stats_and_classifier(client: TestClient) -> None:
     } <= body["stats"].keys()
     assert "latest_snapshot" in body
     assert "classifier_tags" in body
+    assert "market_priority" in body
+    assert "evidence_score" in body
+    assert "urgency_score" in body
+    assert "reasons" in body
 
 
 def test_market_series_shape(client: TestClient) -> None:
@@ -174,10 +182,21 @@ def test_market_series_shape(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     assert body["market_id"] == market_id
+    assert "tape_cluster" in body
+    assert {
+        "burst_score_0_10",
+        "largest_window_count",
+        "window_sec",
+        "dominant_side",
+    } <= body["tape_cluster"].keys()
     assert isinstance(body["trades"], list)
     assert isinstance(body["snapshots"], list)
     for t in body["trades"]:
         assert {"ts", "yes_price", "count", "taker_side"} <= t.keys()
+        if "suspicion" in t and t["suspicion"] is not None:
+            assert 0.0 <= float(t["suspicion"]) <= 10.0
+        if "cluster_0_10" in t and t["cluster_0_10"] is not None:
+            assert 0.0 <= float(t["cluster_0_10"]) <= 10.0
 
 
 def test_news_endpoint_returns_payload_shape(client: TestClient) -> None:

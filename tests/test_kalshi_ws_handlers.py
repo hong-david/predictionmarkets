@@ -63,9 +63,17 @@ class _FakeSession:
 
 
 class _FakeMarket:
-    def __init__(self, pk: int = 1, market_id: str = "KXTEST-25") -> None:
+    def __init__(
+        self,
+        pk: int = 1,
+        market_id: str = "KXTEST-25",
+        manipulability_prior: str = "high",
+        close_time: datetime | None = None,
+    ) -> None:
         self.id = pk
         self.market_id = market_id
+        self.manipulability_prior = manipulability_prior
+        self.close_time = close_time
 
 
 class _RecordingInsert:
@@ -206,7 +214,7 @@ def test_handle_orderbook_snapshot_expands_one_row_per_level():
 
     with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
         kalshi_ws, "pg_insert", recorder
-    ):
+    ), patch.object(kalshi_ws, "_raw_tape_allowed", return_value=True):
         kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
 
     rows = recorder.captured_rows
@@ -233,6 +241,25 @@ def test_handle_orderbook_snapshot_expands_one_row_per_level():
     assert no_row["size_fp"] == Decimal("20.00")
 
 
+def test_handle_orderbook_snapshot_skips_when_tape_gated_out():
+    market = _FakeMarket(manipulability_prior="medium", close_time=None)
+    fake = _FakeSession(market_lookup_result=market)
+    payload = {
+        "type": "orderbook_snapshot",
+        "seq": 7,
+        "msg": {
+            "market_ticker": "KXTEST-25",
+            "yes_dollars_fp": [["0.0800", "300.00"]],
+            "no_dollars_fp": [],
+        },
+    }
+    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
+        kalshi_ws, "_raw_tape_allowed", return_value=False
+    ):
+        kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
+    assert fake.executed_stmts == []
+
+
 def test_handle_orderbook_snapshot_with_empty_book_is_a_noop():
     market = _FakeMarket()
     fake = _FakeSession(market_lookup_result=market)
@@ -243,7 +270,9 @@ def test_handle_orderbook_snapshot_with_empty_book_is_a_noop():
         "msg": {"market_ticker": "KXTEST-25", "market_id": "uuid-here"},
     }
 
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake):
+    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
+        kalshi_ws, "_raw_tape_allowed", return_value=True
+    ):
         kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
 
     assert fake.executed_stmts == []

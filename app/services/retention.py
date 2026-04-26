@@ -64,6 +64,10 @@ How operators can override:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Protocol
+
 from app.services.classifier import Classification, classify
 
 # Categories that are entirely dropped from the surveillance universe.
@@ -77,6 +81,79 @@ EXCLUDED_CATEGORIES: frozenset[str] = frozenset({"exotic_combo", "crypto_strike"
 # carry spoofing / momentum-ignition signal that doesn't depend on the
 # underlying being insider-leakable.
 EXCLUDED_PRIORS: frozenset[str] = frozenset({"very_low"})
+
+# --- Raw tape + order-book row persistence (second tier) -------------------
+#
+# In-scope markets (above) still get `markets` + quote snapshots and the
+# anomaly materializer. The **trades** and **book_events** tables are the
+# main disk amplifiers. We only persist those rows when at least one
+# “surveillance-relevant” signal is true: high / medium_high prior, near
+# resolution, 24h volume or OI over a floor, or a materialized `anomalies`
+# row. Everything else is still visible in the UI via REST snapshots, but
+# the per-print tape and L2 history are not retained — matching a tiered
+# retention model without an offline cold store in v1.
+#
+# Constants are code (not env) for the same reason as EXCLUDED_CATEGORIES.
+RAW_TAPE_HIGH_PRIORS: frozenset[str] = frozenset({"high", "medium_high"})
+RAW_TAPE_MIN_VOLUME_24H = Decimal("250")  # contracts; from ticker 24h field
+RAW_TAPE_MIN_OPEN_INTEREST = Decimal("200")
+RAW_TAPE_CLOSING_SOON_DAYS = 14
+
+
+class _MarketForTape(Protocol):
+    """Duck-typed `Market` row field access for `should_persist_raw_tape`."""
+
+    manipulability_prior: str | None
+    close_time: datetime | None
+
+
+def _market_closes_within_days(
+    market: _MarketForTape,
+    now: datetime,
+    *,
+    days: int,
+) -> bool:
+    """True if the market’s close is in (now, now+days] (surveillance: soon to resolve)."""
+    ct = market.close_time
+    if ct is None:
+        return False
+    if ct.tzinfo is None:
+        ct = ct.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    deadline = now + timedelta(days=days)
+    return now < ct <= deadline
+
+
+def should_persist_raw_tape(
+    market: _MarketForTape,
+    *,
+    volume_24h_fp: Decimal | None,
+    open_interest_fp: Decimal | None,
+    has_materialized_anomaly: bool = False,
+    now: datetime | None = None,
+) -> bool:
+    """Decide whether to write **trades** and **book_events** rows for this market.
+
+    Quote snapshots and anomaly materialization are unchanged — this only
+    gates the append-only tape and L2 tables.
+
+    Callers that already know a materialized `anomalies` row exists should
+    pass ``has_materialized_anomaly=True`` to avoid a DB round-trip; otherwise
+    the WS path queries once when the cheap predicates fail.
+    """
+    if has_materialized_anomaly:
+        return True
+    tnow = now or datetime.now(timezone.utc)
+    if market.manipulability_prior in RAW_TAPE_HIGH_PRIORS:
+        return True
+    if _market_closes_within_days(market, tnow, days=RAW_TAPE_CLOSING_SOON_DAYS):
+        return True
+    if volume_24h_fp is not None and volume_24h_fp >= RAW_TAPE_MIN_VOLUME_24H:
+        return True
+    if open_interest_fp is not None and open_interest_fp >= RAW_TAPE_MIN_OPEN_INTEREST:
+        return True
+    return False
 
 
 def is_in_scope(c: Classification) -> bool:

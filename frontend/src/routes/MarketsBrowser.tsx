@@ -1,7 +1,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronLeft, ChevronRight, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { api } from "@/api/client";
 import { Badge, priorVariant } from "@/components/Badge";
@@ -14,12 +14,12 @@ import { cn, fmtInt, fmtPrice } from "@/lib/utils";
 const SORT_OPTIONS = [
   {
     value: "surveillance_urgency",
-    label: "Action first (evidence × priority)",
+    label: "Alerts first (evidence, then priority)",
   },
-  { value: "priority", label: "Attention rank, then volume" },
+  { value: "priority", label: "Priority, then volume" },
   { value: "trades_desc", label: "Most trades" },
   { value: "trades_asc", label: "Fewest trades" },
-  { value: "anomalies", label: "Most flags" },
+  { value: "anomalies", label: "Most stored alerts" },
   { value: "recent", label: "Newest in database" },
   { value: "title", label: "Title A–Z" },
 ];
@@ -62,6 +62,7 @@ export default function MarketsBrowserPage() {
     queryKey: ["markets", params],
     queryFn: () => api.markets(params),
     placeholderData: keepPreviousData,
+    staleTime: 30_000,
   });
 
   const setParam = (key: string, value: string | null) => {
@@ -130,16 +131,39 @@ export default function MarketsBrowserPage() {
                   className="text-left px-3 py-2.5 font-medium"
                   title={priorHelp()}
                 >
-                  Triage
+                  Priority
                 </th>
-                <th className="text-left px-3 py-2.5 font-medium">Confidence</th>
+                <th
+                  className="text-left px-3 py-2.5 font-medium"
+                  title="How sure the pipeline was about the category/priority tags"
+                >
+                  Classifier
+                </th>
                 <th className="text-right px-3 py-2.5 font-medium">Last</th>
                 <th className="text-right px-3 py-2.5 font-medium">Trades</th>
                 <th
                   className="text-right px-3 py-2.5 font-medium"
                   title="Total stored anomaly rows: one per ticker snapshot (quote) that met the score floor — not one per trade. A hyped event can have many more rows than trade prints."
                 >
-                  Rule rows
+                  Alerts
+                </th>
+                <th
+                  className="text-right px-3 py-2.5 font-medium"
+                  title="0–100 from how many materialized alert rows exist for this market (not manipulability prior)"
+                >
+                  Evidence
+                </th>
+                <th
+                  className="text-right px-3 py-2.5 font-medium"
+                  title="0–100 combined ‘Alerts first’ signal: evidence + category priority"
+                >
+                  Urgency
+                </th>
+                <th
+                  className="text-right px-3 py-2.5 font-medium w-28"
+                  title="Kalshi event: all date/outcome legs that share the same event_ticker"
+                >
+                  Event contracts
                 </th>
               </tr>
             </thead>
@@ -148,7 +172,7 @@ export default function MarketsBrowserPage() {
                 <SkeletonRows />
               ) : list.isError ? (
                 <tr>
-                  <td colSpan={6}>
+                  <td colSpan={9}>
                     <EmptyState>Failed to load markets: {String(list.error)}</EmptyState>
                   </td>
                 </tr>
@@ -190,11 +214,32 @@ export default function MarketsBrowserPage() {
                         <span className="text-muted-foreground">0</span>
                       )}
                     </td>
+                    <td className="px-3 py-2.5 text-right num text-sm align-top text-muted-foreground">
+                      {m.evidence_score}
+                    </td>
+                    <td className="px-3 py-2.5 text-right num text-sm align-top text-muted-foreground">
+                      {m.urgency_score}
+                    </td>
+                    <td className="px-3 py-2.5 text-right align-top">
+                      {m.event_id ? (
+                        <Link
+                          to={`/events/${encodeURIComponent(m.event_id)}`}
+                          className="text-xs text-primary hover:underline"
+                          title={m.event_id}
+                        >
+                          {m.event_market_count && m.event_market_count > 1
+                            ? `${fmtInt(m.event_market_count)} contracts`
+                            : "1 contract"}
+                        </Link>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                    </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={6}>
+                  <td colSpan={9}>
                     <EmptyState>No markets match these filters.</EmptyState>
                   </td>
                 </tr>
@@ -385,6 +430,15 @@ function SkeletonRows() {
           </td>
           <td className="px-3 py-3">
             <Skeleton className="h-4 w-10 ml-auto" />
+          </td>
+          <td className="px-3 py-3">
+            <Skeleton className="h-4 w-8 ml-auto" />
+          </td>
+          <td className="px-3 py-3">
+            <Skeleton className="h-4 w-8 ml-auto" />
+          </td>
+          <td className="px-2 py-3">
+            <Skeleton className="h-4 w-8 mx-auto" />
           </td>
         </tr>
       ))}
