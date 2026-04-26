@@ -31,6 +31,19 @@ class Market(Base):
     open_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Classifier output (see app/services/classifier/). Populated lazily by
+    # the layered classifier on every ingest. `classifier_version` lets a
+    # bump in the rule set trigger a reclassification sweep without touching
+    # rows that are already at the current version.
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    subcategory: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    manipulability_prior: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    classifier_tags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    classifier_layer: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    classifier_rule: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    classifier_confidence: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    classifier_version: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

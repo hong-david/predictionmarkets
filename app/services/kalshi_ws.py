@@ -5,19 +5,80 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import websockets
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
 from app.db.models import BookEvent, Market, MarketSnapshot, Trade
 from app.db.session import SessionLocal
 from app.services.anomaly_materializer import materialize_market_anomaly
+from app.services.classifier import CLASSIFIER_VERSION
 from app.services.kalshi_auth import create_ws_headers
+from app.services.retention import is_ticker_in_scope
 
 
 def parse_decimal(value) -> Decimal | None:
     if value is None or value == "":
         return None
     return Decimal(str(value))
+
+
+def _get_or_create_market(db, market_ticker: str) -> Market | None:
+    """Idempotently fetch (or stub-create) a Market row for `market_ticker`.
+
+    The Kalshi `/markets` endpoint paginates alphabetically across tens of
+    thousands of markets, so a bounded one-shot backfill cannot guarantee the
+    actively-trading mainstream markets are present at consumer startup.
+    Rather than dropping every WS message for an unknown ticker, we
+    auto-create a stub Market row carrying `status='unknown'` as a sentinel
+    that means "seen on the wire, REST metadata not yet hydrated". The REST
+    poller is the single writer that fills in title, event_ticker, open/close
+    times, etc.
+
+    Concurrency: this uses Postgres `INSERT ... ON CONFLICT DO NOTHING`
+    against the `markets.market_id` unique constraint, so concurrent inserts
+    of the same ticker race safely. The follow-up SELECT then returns
+    whichever row won.
+    """
+    market = db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+    if market is not None:
+        return market
+
+    # Scope filter for never-before-seen tickers. We only have the
+    # ticker string here (no title, no Kalshi metadata), so the
+    # classifier runs Layer 2 (prefix rules) only. That's enough to
+    # catch the obvious noise — `KXMVECROSSCATEGORY-...` prefixes match
+    # `exotic.cross_category` and get rejected before we ever insert.
+    # If the ticker matches no rule, we keep it (Layer 2's fallback is
+    # `other.unclassified` with prior `medium`); the REST poller will
+    # later hydrate metadata and re-classify with full information.
+    in_scope, classification = is_ticker_in_scope(market_ticker)
+    if not in_scope:
+        return None
+
+    stmt = (
+        pg_insert(Market)
+        .values(
+            platform="kalshi",
+            market_id=market_ticker,
+            title=market_ticker,
+            status="unknown",
+            # Stamp the ticker-only classification onto the stub. The
+            # REST poller will overwrite this on the next sweep with the
+            # richer Layer 1 / 3 verdict.
+            category=classification.category,
+            subcategory=classification.subcategory,
+            manipulability_prior=classification.manipulability_prior,
+            classifier_tags=list(classification.tags),
+            classifier_layer=classification.layer,
+            classifier_rule=classification.rule,
+            classifier_confidence=classification.confidence,
+            classifier_version=CLASSIFIER_VERSION,
+        )
+        .on_conflict_do_nothing(index_elements=["market_id"])
+    )
+    db.execute(stmt)
+    return db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
 
 
 def handle_ticker_message(data: dict) -> None:
@@ -28,9 +89,9 @@ def handle_ticker_message(data: dict) -> None:
 
     db = SessionLocal()
     try:
-        market = db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        market = _get_or_create_market(db, market_ticker)
         if market is None:
-            print(f"Skipping unknown market_ticker={market_ticker}")
+            print(f"Failed to upsert market {market_ticker}; skipping ticker")
             return
 
         snapshot = MarketSnapshot(
@@ -79,9 +140,9 @@ def handle_trade_message(data: dict) -> None:
 
     db = SessionLocal()
     try:
-        market = db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        market = _get_or_create_market(db, market_ticker)
         if market is None:
-            print(f"Skipping trade for unknown market_ticker={market_ticker}")
+            print(f"Failed to upsert market {market_ticker}; skipping trade")
             return
 
         ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
@@ -247,16 +308,57 @@ def resolve_book_market_tickers() -> list[str]:
     """Resolve which markets to subscribe to orderbook_delta for.
 
     Order of precedence:
-      1. Explicit `kalshi_book_market_tickers` from settings.
-      2. The most recently updated active markets in the DB, capped by
-         `kalshi_book_market_limit`. We treat both 'active' and 'open' as
-         tradeable since Kalshi has used both labels.
+      1. Explicit `kalshi_book_market_tickers` from settings (operator override).
+      2. The most actively-trading markets, ranked by `volume_fp` (lifetime
+         cumulative volume) from each market's most recent snapshot. We use
+         lifetime rather than 24h volume because the Kalshi WS ticker
+         payload does not include `volume_24h_fp` -- only `volume_fp` -- so
+         a 24h ranker would silently drop every market we have only seen
+         via WS, which is exactly the actively-trading set.
+      3. Cold-start fallback: most-recently-updated markets, used only when
+         no snapshots with positive volume exist yet (e.g. brand-new DB).
+
+    Smoke-test war story: the previous implementation was just (1) -> (3).
+    On a fresh bootstrap of 50k markets, Kalshi's alphabetical pagination
+    front-loaded ~50k dead exotic combinatorial markets, so step (3) picked
+    50 of those and we got zero `orderbook_snapshot` events for a full
+    minute against live Kalshi. Volume-ranking fixes that even when the
+    bootstrap is biased.
+
+    The DISTINCT ON (market_pk) ... ORDER BY market_pk, ts DESC pattern is
+    Postgres-native and yields one (latest) snapshot per market in a single
+    index pass. We treat 'active', 'open', and 'unknown' as tradeable since
+    'unknown' is the sentinel set by the lazy-upsert path for markets we've
+    only seen via the WS feed.
     """
     if settings.kalshi_book_market_tickers:
         return list(settings.kalshi_book_market_tickers)
 
     db = SessionLocal()
     try:
+        latest_per_market = (
+            select(
+                MarketSnapshot.market_pk.label("market_pk"),
+                MarketSnapshot.volume_fp.label("vol"),
+            )
+            .order_by(MarketSnapshot.market_pk, MarketSnapshot.ts.desc())
+            .distinct(MarketSnapshot.market_pk)
+            .subquery()
+        )
+
+        ranked = db.execute(
+            select(Market.market_id)
+            .join(latest_per_market, latest_per_market.c.market_pk == Market.id)
+            .where(Market.status.in_(["active", "open", "unknown"]))
+            .where(latest_per_market.c.vol.is_not(None))
+            .where(latest_per_market.c.vol > 0)
+            .order_by(latest_per_market.c.vol.desc())
+            .limit(settings.kalshi_book_market_limit)
+        ).all()
+
+        if ranked:
+            return [r[0] for r in ranked]
+
         rows = (
             db.query(Market.market_id)
             .filter(Market.status.in_(["active", "open"]))

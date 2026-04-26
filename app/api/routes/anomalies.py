@@ -48,6 +48,11 @@ def list_stored_anomalies(
                 "id": anomaly.id,
                 "market_id": market.market_id,
                 "title": market.title,
+                # Multiple Kalshi markets share an event-level `title`
+                # (e.g. each side / strike of an NBA spread); `subtitle`
+                # is the leg-level differentiator that lets the dashboard
+                # tell them apart.
+                "subtitle": market.subtitle,
                 "score": float(anomaly.score),
                 "severity": anomaly.severity,
                 "reasons": anomaly.reasons,

@@ -128,6 +128,148 @@ def test_trade_unique_constraint_blocks_duplicates(engine):
         db.rollback()
 
 
+def test_lazy_upsert_creates_stub_market(engine):
+    """A trade for a never-before-seen ticker auto-creates a stub Market row
+    with `status='unknown'`, and the trade itself is then inserted normally.
+
+    This covers the lazy-upsert path that the unit tests can only stub out:
+    the round-trip INSERT ... ON CONFLICT DO NOTHING -> SELECT must actually
+    materialise the new row in Postgres for the handler to keep going.
+    """
+    from app.db.models import Trade
+    from app.services.kalshi_ws import handle_trade_message
+
+    unique_ticker = f"KXLAZY-{uuid.uuid4().hex[:8]}"
+    payload = {
+        "type": "trade",
+        "msg": {
+            "market_ticker": unique_ticker,
+            "trade_id": f"t-{uuid.uuid4().hex}",
+            "ts_ms": 1_700_000_000_000,
+            "yes_price_dollars": "0.42",
+            "count_fp": "100.00",
+            "taker_side": "yes",
+        },
+    }
+
+    handle_trade_message(payload)
+
+    with Session(engine) as db:
+        market = db.query(Market).filter(Market.market_id == unique_ticker).one_or_none()
+        assert market is not None, "lazy upsert did not create a Market row"
+        assert market.status == "unknown"
+        assert market.title == unique_ticker
+
+        n_trades = (
+            db.query(Trade).filter(Trade.market_pk == market.id).count()
+        )
+        assert n_trades == 1
+
+
+def test_lazy_upsert_is_idempotent_under_repeated_calls(engine):
+    """Two trades on the same brand-new ticker must result in exactly one
+    Market row, exercising the ON CONFLICT DO NOTHING branch."""
+    from app.services.kalshi_ws import handle_trade_message
+
+    unique_ticker = f"KXLAZY-{uuid.uuid4().hex[:8]}"
+
+    for i in range(2):
+        handle_trade_message(
+            {
+                "type": "trade",
+                "msg": {
+                    "market_ticker": unique_ticker,
+                    "trade_id": f"t-{uuid.uuid4().hex}",
+                    "ts_ms": 1_700_000_000_000 + i,
+                    "yes_price_dollars": "0.42",
+                    "count_fp": "100.00",
+                    "taker_side": "yes",
+                },
+            }
+        )
+
+    with Session(engine) as db:
+        n_markets = (
+            db.query(Market).filter(Market.market_id == unique_ticker).count()
+        )
+        assert n_markets == 1
+
+
+def test_resolve_book_market_tickers_falls_back_when_no_snapshots(engine):
+    """Cold-start path: when no snapshots have positive volume, the resolver
+    falls back to `updated_at desc` so we still subscribe to *something*.
+
+    NOTE: Module-scoped engine fixture means earlier tests can leak state.
+    We explicitly clear `market_snapshots` here to assert the cold-start
+    branch in isolation. Run order matters: the volume-ranking test below
+    relies on this clear having happened.
+    """
+    from unittest.mock import patch
+
+    from app.services import kalshi_ws
+
+    with Session(engine) as db:
+        db.execute(text("DELETE FROM market_snapshots"))
+        db.commit()
+
+    suffix = uuid.uuid4().hex[:6]
+    only = Market(
+        platform="kalshi",
+        market_id=f"KXCOLD-{suffix}",
+        title="cold",
+        status="active",
+    )
+    with Session(engine) as db:
+        db.add(only)
+        db.commit()
+
+    with patch.object(kalshi_ws.settings, "kalshi_book_market_tickers", []):
+        with patch.object(kalshi_ws.settings, "kalshi_book_market_limit", 50):
+            tickers = kalshi_ws.resolve_book_market_tickers()
+
+    assert f"KXCOLD-{suffix}" in tickers
+
+
+def test_resolve_book_market_tickers_ranks_by_volume(engine):
+    """Volume-ranked path: the resolver picks the markets whose latest
+    snapshot has the highest 24h volume, regardless of `Market.updated_at`.
+    This is the smoke-test war-story scenario in test form."""
+    from unittest.mock import patch
+
+    from app.db.models import MarketSnapshot
+    from app.services import kalshi_ws
+
+    suffix = uuid.uuid4().hex[:6]
+    high = Market(platform="kalshi", market_id=f"KXVOLHI-{suffix}", title="hi", status="active")
+    mid = Market(platform="kalshi", market_id=f"KXVOLMD-{suffix}", title="md", status="active")
+    low = Market(platform="kalshi", market_id=f"KXVOLLO-{suffix}", title="lo", status="unknown")
+    dead = Market(platform="kalshi", market_id=f"KXVOLDEAD-{suffix}", title="x", status="active")
+
+    with Session(engine) as db:
+        db.add_all([high, mid, low, dead])
+        db.flush()
+        db.add_all(
+            [
+                MarketSnapshot(market_pk=high.id, volume_fp=Decimal("9999.00")),
+                MarketSnapshot(market_pk=mid.id, volume_fp=Decimal("500.00")),
+                MarketSnapshot(market_pk=low.id, volume_fp=Decimal("1.00")),
+                MarketSnapshot(market_pk=dead.id, volume_fp=None),
+            ]
+        )
+        db.commit()
+
+    with patch.object(kalshi_ws.settings, "kalshi_book_market_tickers", []):
+        with patch.object(kalshi_ws.settings, "kalshi_book_market_limit", 50):
+            tickers = kalshi_ws.resolve_book_market_tickers()
+
+    test_tickers = [t for t in tickers if t.endswith(suffix)]
+    assert test_tickers == [
+        f"KXVOLHI-{suffix}",
+        f"KXVOLMD-{suffix}",
+        f"KXVOLLO-{suffix}",
+    ]
+
+
 def test_book_event_on_conflict_do_nothing_is_idempotent(engine):
     """Re-applying the same (session_id, seq, side, price) is a no-op."""
     with Session(engine) as db:

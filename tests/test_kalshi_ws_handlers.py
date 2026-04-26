@@ -131,7 +131,15 @@ def test_handle_trade_message_skips_malformed_payloads(msg):
     assert fake.commits == 0
 
 
-def test_handle_trade_message_skips_unknown_market():
+def test_handle_trade_message_lazily_upserts_unknown_market():
+    """An unknown ticker now triggers an idempotent INSERT into `markets`
+    rather than dropping the trade.
+
+    We assert the upsert call shape at the unit level. Whether the post-insert
+    SELECT actually returns the new row is a real-DB concern and is covered
+    by the integration test `test_lazy_upsert_creates_stub_market`.
+    """
+    recorder = _RecordingInsert()
     fake = _FakeSession(market_lookup_result=None)
     payload = {
         "type": "trade",
@@ -141,9 +149,16 @@ def test_handle_trade_message_skips_unknown_market():
             "ts_ms": 1_700_000_000_000,
         },
     }
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake):
+    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
+        kalshi_ws, "pg_insert", recorder
+    ):
         kalshi_ws.handle_trade_message(payload)
-    assert fake.executed_stmts == []
+
+    market_upserts = [r for r in recorder.captured_rows if "market_id" in r]
+    assert len(market_upserts) == 1
+    assert market_upserts[0]["market_id"] == "DOES-NOT-EXIST"
+    assert market_upserts[0]["status"] == "unknown"
+    assert market_upserts[0]["platform"] == "kalshi"
     assert fake.closed is True
 
 
@@ -248,29 +263,6 @@ def test_resolve_book_market_tickers_prefers_explicit_config():
     assert out == explicit
 
 
-def test_resolve_book_market_tickers_falls_back_to_db_when_config_empty():
-    expected = [("KX1",), ("KX2",), ("KX3",)]
-
-    class _RowsSession(_FakeSession):
-        def query(self, *_a, **_k):
-            return self
-
-        def filter(self, *_a, **_k):
-            return self
-
-        def order_by(self, *_a, **_k):
-            return self
-
-        def limit(self, *_a, **_k):
-            return self
-
-        def all(self):
-            return expected
-
-    fake = _RowsSession()
-    with patch.object(kalshi_ws.settings, "kalshi_book_market_tickers", []):
-        with patch.object(kalshi_ws, "SessionLocal", return_value=fake):
-            out = kalshi_ws.resolve_book_market_tickers()
-
-    assert out == ["KX1", "KX2", "KX3"]
-    assert fake.closed is True
+# DB-path coverage for resolve_book_market_tickers (volume ranking + cold-start
+# fallback) lives in the integration suite, where it can run against a real
+# Postgres instead of fighting SQLAlchemy core through a mock.
