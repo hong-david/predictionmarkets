@@ -154,6 +154,104 @@ class Trade(Base):
     __table_args__ = (Index("ix_trades_market_pk_ts", "market_pk", "ts"),)
 
 
+class TradeFlag(Base):
+    __tablename__ = "trade_flags"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    trade_pk: Mapped[int] = mapped_column(
+        ForeignKey("trades.id", ondelete="CASCADE"), index=True
+    )
+    trade_id: Mapped[str] = mapped_column(String(128), index=True)
+    market_pk: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    local_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    context_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    severity: Mapped[str] = mapped_column(
+        String(16), default="low", nullable=False, index=True
+    )
+    reasons: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    components: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    features: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    scorer_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+
+    promoted_storage_tier: Mapped[str | None] = mapped_column(
+        String(24), nullable=True, index=True
+    )
+    case_evidence_id: Mapped[int | None] = mapped_column(
+        ForeignKey("case_evidence.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_pk", "scorer_version", name="uq_trade_flags_trade_version"
+        ),
+        Index("ix_trade_flags_market_score", "market_pk", "score"),
+        Index("ix_trade_flags_score_ts", "score", "ts"),
+    )
+
+
+class TradeBaseline(Base):
+    __tablename__ = "trade_baselines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category: Mapped[str] = mapped_column(String(64), index=True)
+    subcategory: Mapped[str] = mapped_column(String(64), default="*", index=True)
+    liquidity_bucket: Mapped[str] = mapped_column(String(32), default="all", index=True)
+    time_to_close_bucket: Mapped[str] = mapped_column(
+        String(32), default="all", index=True
+    )
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    count_p95: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    count_p99: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    abs_price_delta_p95: Mapped[float] = mapped_column(
+        Float, default=0.0, nullable=False
+    )
+    impact_p95: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    impact_p99: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    scorer_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "category",
+            "subcategory",
+            "liquidity_bucket",
+            "time_to_close_bucket",
+            "window_start",
+            "window_end",
+            "scorer_version",
+            name="uq_trade_baselines_scope_window_version",
+        ),
+        Index(
+            "ix_trade_baselines_scope_latest",
+            "category",
+            "subcategory",
+            "window_end",
+        ),
+    )
+
+
 class BookEvent(Base):
     __tablename__ = "book_events"
 

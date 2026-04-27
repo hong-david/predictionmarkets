@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Callable, TypeVar
 
@@ -47,7 +47,15 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
 from app.core.config import settings
-from app.db.models import Anomaly, Market, MarketSnapshot, Trade
+from app.db.models import (
+    Anomaly,
+    Market,
+    MarketSnapshot,
+    NewsArticle,
+    NewsEvent,
+    Trade,
+    TradeFlag,
+)
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
 from app.services.surveillance_scores import (
     aggregate_reason_codes,
@@ -58,6 +66,11 @@ from app.services.surveillance_scores import (
     urgency_score_0_100,
 )
 from app.services.trade_burst import analyze_tape_bursts
+from app.services.trade_context import (
+    MarketContext,
+    build_peer_baselines,
+    explain_trades_with_context,
+)
 from app.services.trade_suspicion import explain_trades_against_window
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -186,6 +199,134 @@ def _serialize_market_row(
         "reasons": list(reason_codes or []),
         "event_market_count": event_market_count,
     }
+
+
+def _market_context(market: Market) -> MarketContext:
+    return MarketContext(
+        market_pk=market.id,
+        market_id=market.market_id,
+        category=market.category,
+        subcategory=market.subcategory,
+        manipulability_prior=market.manipulability_prior,
+        event_id=market.event_id,
+        close_time=market.close_time,
+    )
+
+
+def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
+    return {
+        "ts": snapshot.ts.isoformat() if snapshot.ts else None,
+        "market_pk": snapshot.market_pk,
+        "yes_bid": float(snapshot.yes_bid_dollars)
+        if snapshot.yes_bid_dollars is not None
+        else None,
+        "yes_ask": float(snapshot.yes_ask_dollars)
+        if snapshot.yes_ask_dollars is not None
+        else None,
+        "last_price": float(snapshot.last_price_dollars)
+        if snapshot.last_price_dollars is not None
+        else None,
+        "volume_24h": float(snapshot.volume_24h_fp)
+        if snapshot.volume_24h_fp is not None
+        else None,
+        "open_interest": float(snapshot.open_interest_fp)
+        if snapshot.open_interest_fp is not None
+        else None,
+    }
+
+
+def _peer_baseline_rows_for_market(
+    db: Session,
+    market: Market,
+    *,
+    limit: int = 5000,
+) -> list[dict]:
+    if not market.category:
+        return []
+    q = (
+        db.query(Trade, Market)
+        .join(Market, Market.id == Trade.market_pk)
+        .filter(Market.category == market.category)
+    )
+    if market.subcategory:
+        q = q.filter(Market.subcategory == market.subcategory)
+    rows = q.order_by(Trade.ts.desc(), Trade.id.desc()).limit(limit).all()
+    out = [
+        {
+            "market_pk": t.market_pk,
+            "category": m.category,
+            "subcategory": m.subcategory,
+            "ts": t.ts.isoformat() if t.ts else None,
+            "yes_price": float(t.yes_price_dollars)
+            if t.yes_price_dollars is not None
+            else None,
+            "count": float(t.count_fp) if t.count_fp is not None else None,
+        }
+        for t, m in reversed(rows)
+    ]
+    return out
+
+
+def _news_context_for_market(db: Session, market: Market) -> list[dict]:
+    rows = (
+        db.query(NewsEvent, NewsArticle)
+        .join(NewsArticle, NewsArticle.id == NewsEvent.article_id)
+        .filter(NewsEvent.market_pk == market.id)
+        .filter(NewsEvent.relevance_score >= 0.35)
+        .order_by(NewsArticle.first_seen_at.desc())
+        .limit(25)
+        .all()
+    )
+    return [
+        {
+            "article_id": article.id,
+            "first_seen_at": article.first_seen_at.isoformat()
+            if article.first_seen_at
+            else None,
+            "published_at": article.published_at.isoformat()
+            if article.published_at
+            else None,
+            "title": article.title,
+            "domain": article.domain,
+            "relevance_score": float(event.relevance_score or 0.0),
+            "pre_news_trade_score": float(event.pre_news_trade_score or 0.0),
+        }
+        for event, article in rows
+    ]
+
+
+def _sibling_snapshot_context(
+    db: Session,
+    market: Market,
+    *,
+    start: datetime | None,
+    end: datetime | None,
+    limit: int = 3000,
+) -> list[dict]:
+    if not market.event_id or start is None or end is None:
+        return []
+    sibling_pks = [
+        int(pk)
+        for (pk,) in (
+            db.query(Market.id)
+            .filter(Market.event_id == market.event_id)
+            .filter(Market.id != market.id)
+            .limit(25)
+            .all()
+        )
+    ]
+    if not sibling_pks:
+        return []
+    rows = (
+        db.query(MarketSnapshot)
+        .filter(MarketSnapshot.market_pk.in_(sibling_pks))
+        .filter(MarketSnapshot.ts >= start - timedelta(minutes=15))
+        .filter(MarketSnapshot.ts <= end + timedelta(minutes=45))
+        .order_by(MarketSnapshot.ts.asc(), MarketSnapshot.id.asc())
+        .limit(limit)
+        .all()
+    )
+    return [_snapshot_payload(row) for row in rows]
 
 
 # --- /stats and /breakdown --------------------------------------------------
@@ -390,6 +531,55 @@ def _suspicious_trades_payload(
     limit: int,
     sample: int = _SUSPICIOUS_TRADE_SAMPLE,
 ) -> dict:
+    persisted = (
+        db.query(TradeFlag, Trade, Market)
+        .join(Trade, Trade.id == TradeFlag.trade_pk)
+        .join(Market, Market.id == TradeFlag.market_pk)
+        .filter(*_hydrated_market_filters())
+        .order_by(TradeFlag.score.desc(), TradeFlag.ts.desc())
+        .limit(limit)
+        .all()
+    )
+    if persisted:
+        return {
+            "count": len(persisted),
+            "trades": [
+                {
+                    "market_id": market.market_id,
+                    "event_id": market.event_id,
+                    "title": market.title,
+                    "subtitle": market.subtitle,
+                    "category": market.category,
+                    "manipulability_prior": market.manipulability_prior,
+                    "trade_id": trade.trade_id,
+                    "ts": trade.ts.isoformat() if trade.ts else None,
+                    "yes_price": float(trade.yes_price_dollars)
+                    if trade.yes_price_dollars is not None
+                    else None,
+                    "no_price": float(trade.no_price_dollars)
+                    if trade.no_price_dollars is not None
+                    else None,
+                    "count": float(trade.count_fp)
+                    if trade.count_fp is not None
+                    else None,
+                    "taker_side": trade.taker_side,
+                    "suspicion": float(flag.score),
+                    "local_suspicion": float(flag.local_score),
+                    "context_score": float(flag.context_score),
+                    "reasons": flag.reasons or [],
+                    "features": {
+                        "context": flag.features or {},
+                        "components": flag.components or {},
+                    },
+                    "severity": flag.severity,
+                    "promoted_storage_tier": flag.promoted_storage_tier,
+                }
+                for flag, trade, market in persisted
+            ],
+            "sample": sample,
+            "source": "trade_flags",
+        }
+
     rows = (
         db.query(Trade, Market)
         .join(Market, Market.id == Trade.market_pk)
@@ -400,12 +590,27 @@ def _suspicious_trades_payload(
     )
 
     by_market: dict[int, list[tuple[Trade, Market]]] = defaultdict(list)
+    peer_rows: list[dict] = []
     for trade, market in rows:
         by_market[market.id].append((trade, market))
+        peer_rows.append(
+            {
+                "market_pk": trade.market_pk,
+                "category": market.category,
+                "subcategory": market.subcategory,
+                "ts": trade.ts.isoformat() if trade.ts else None,
+                "yes_price": float(trade.yes_price_dollars)
+                if trade.yes_price_dollars is not None
+                else None,
+                "count": float(trade.count_fp) if trade.count_fp is not None else None,
+            }
+        )
+    peer_baselines = build_peer_baselines(list(reversed(peer_rows)), min_points=12)
 
     candidates: list[dict] = []
     for market_rows in by_market.values():
         market_rows = sorted(market_rows, key=lambda x: (x[0].ts, x[0].id))
+        market = market_rows[0][1]
         payloads = [
             {
                 "ts": t.ts.isoformat() if t.ts else None,
@@ -421,12 +626,23 @@ def _suspicious_trades_payload(
             for t, _m in market_rows
         ]
         explanations = explain_trades_against_window(payloads, window=50)
-        for (trade, market), payload, explanation in zip(
-            market_rows, payloads, explanations
+        contextual = explain_trades_with_context(
+            payloads,
+            market=_market_context(market),
+            local_explanations=explanations,
+            peer_baseline=peer_baselines.get(
+                (str(market.category or "unclassified"), str(market.subcategory or "*"))
+            )
+            or peer_baselines.get((str(market.category or "unclassified"), "*")),
+        )
+        for (trade, market), payload, explanation, context in zip(
+            market_rows, payloads, explanations, contextual
         ):
-            if explanation is None:
+            if explanation is None and context is None:
                 continue
-            score = float(explanation["score"])
+            local_score = float(explanation["score"]) if explanation else 0.0
+            context_score = float(context["score"]) if context else 0.0
+            score = max(local_score, context_score)
             if score <= 0:
                 continue
             candidates.append(
@@ -440,8 +656,19 @@ def _suspicious_trades_payload(
                     "trade_id": trade.trade_id,
                     **payload,
                     "suspicion": score,
-                    "reasons": explanation["reasons"],
-                    "features": explanation["features"],
+                    "local_suspicion": local_score,
+                    "context_score": context_score,
+                    "reasons": sorted(
+                        set(
+                            (explanation or {}).get("reasons", [])
+                            + (context or {}).get("reasons", [])
+                        )
+                    ),
+                    "features": {
+                        **((explanation or {}).get("features", {})),
+                        "context": (context or {}).get("features", {}),
+                        "components": (context or {}).get("components", {}),
+                    },
                 }
             )
 
@@ -946,12 +1173,56 @@ def get_market_series(
         }
         for t in trade_rows
     ]
+    snapshot_payloads = [_snapshot_payload(s) for s in snap_rows]
     explanations = explain_trades_against_window(trade_payloads, window=50)
+    peer_rows = _peer_baseline_rows_for_market(db, market)
+    peer_baselines = build_peer_baselines(peer_rows, min_points=12)
+    peer_key = (
+        str(market.category or "unclassified"),
+        str(market.subcategory or "*"),
+    )
+    first_trade_ts = trade_rows[0].ts if trade_rows else None
+    last_trade_ts = trade_rows[-1].ts if trade_rows else None
+    contextual = explain_trades_with_context(
+        trade_payloads,
+        market=_market_context(market),
+        snapshots=snapshot_payloads,
+        local_explanations=explanations,
+        peer_baseline=peer_baselines.get(peer_key)
+        or peer_baselines.get((peer_key[0], "*")),
+        news_events=_news_context_for_market(db, market),
+        sibling_snapshots=_sibling_snapshot_context(
+            db,
+            market,
+            start=first_trade_ts,
+            end=last_trade_ts,
+        ),
+    )
     for i, explanation in enumerate(explanations):
+        context = contextual[i] if i < len(contextual) else None
+        local_score = float(explanation["score"]) if explanation is not None else 0.0
+        context_score = float(context["score"]) if context is not None else 0.0
+        combined_score = max(local_score, context_score)
         if explanation is not None:
-            trade_payloads[i]["suspicion"] = explanation["score"]
-            trade_payloads[i]["suspicion_reasons"] = explanation["reasons"]
-            trade_payloads[i]["suspicion_features"] = explanation["features"]
+            trade_payloads[i]["local_suspicion"] = explanation["score"]
+        if context is not None:
+            trade_payloads[i]["context_score"] = context["score"]
+            trade_payloads[i]["context_reasons"] = context["reasons"]
+            trade_payloads[i]["context_components"] = context["components"]
+            trade_payloads[i]["context_features"] = context["features"]
+        if explanation is not None or context is not None:
+            trade_payloads[i]["suspicion"] = combined_score
+            trade_payloads[i]["suspicion_reasons"] = sorted(
+                set(
+                    (explanation or {}).get("reasons", [])
+                    + (context or {}).get("reasons", [])
+                )
+            )
+            trade_payloads[i]["suspicion_features"] = {
+                **((explanation or {}).get("features", {})),
+                "context": (context or {}).get("features", {}),
+                "components": (context or {}).get("components", {}),
+            }
 
     burst = analyze_tape_bursts(trade_payloads, window_sec=30.0)
     for i, c in enumerate(burst["per_trade_cluster_0_10"]):
@@ -966,27 +1237,7 @@ def get_market_series(
             "dominant_side": burst["dominant_side"],
         },
         "trades": trade_payloads,
-        "snapshots": [
-            {
-                "ts": s.ts.isoformat() if s.ts else None,
-                "yes_bid": float(s.yes_bid_dollars)
-                if s.yes_bid_dollars is not None
-                else None,
-                "yes_ask": float(s.yes_ask_dollars)
-                if s.yes_ask_dollars is not None
-                else None,
-                "last_price": float(s.last_price_dollars)
-                if s.last_price_dollars is not None
-                else None,
-                "volume_24h": float(s.volume_24h_fp)
-                if s.volume_24h_fp is not None
-                else None,
-                "open_interest": float(s.open_interest_fp)
-                if s.open_interest_fp is not None
-                else None,
-            }
-            for s in snap_rows
-        ],
+        "snapshots": snapshot_payloads,
     }
 
 

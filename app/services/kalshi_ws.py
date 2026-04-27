@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
-from app.db.models import Anomaly, BookEvent, Market, MarketSnapshot, Trade
+from app.db.models import Anomaly, BookEvent, Market, MarketSnapshot, Trade, TradeFlag
 from app.db.session import SessionLocal
 from app.services.anomaly_materializer import materialize_market_anomaly
 from app.services.classifier import CLASSIFIER_VERSION
@@ -20,6 +20,7 @@ from app.services.kalshi_auth import create_ws_headers
 from app.services.clickhouse_writer import clickhouse_batcher
 from app.services.market_metrics import bump_trade_metrics, upsert_quote_metrics
 from app.services.retention import (
+    RetentionSignals,
     StorageDecision,
     is_ticker_in_scope,
     should_sample_event,
@@ -156,7 +157,22 @@ def _raw_tape_decision(db, market: Market) -> StorageDecision:
         is not None
     )
     if not has_anomaly:
-        return decision
+        has_trade_flag = (
+            db.query(TradeFlag.id)
+            .filter(TradeFlag.market_pk == market.id)
+            .filter(TradeFlag.severity.in_(("high", "critical")))
+            .limit(1)
+            .first()
+            is not None
+        )
+        if not has_trade_flag:
+            return decision
+        return storage_decision_for_event(
+            market,
+            volume_24h_fp=v24,
+            open_interest_fp=oi,
+            signals=RetentionSignals(trade_burst_score=3.0),
+        )
     return storage_decision_for_event(
         market,
         volume_24h_fp=v24,
