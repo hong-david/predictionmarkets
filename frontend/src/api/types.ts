@@ -213,12 +213,25 @@ export interface RecentAnomaliesList {
 }
 
 export interface NewsArticle {
+  event_id?: number;
+  article_id?: number;
   title: string | null;
   url: string | null;
   source: string | null;
   language: string | null;
   published_at: string | null;
+  first_seen_at?: string | null;
   tone: number | string | null;
+  relevance_score?: number;
+  pre_news_trade_score?: number;
+  status?: string;
+  leakage_window_seconds?: number | null;
+  direction_label?: string | null;
+  direction_confidence?: number | null;
+  reasons?: string[];
+  best_trade?: Record<string, unknown> | null;
+  market_direction?: Record<string, unknown>;
+  news_trade_correlation?: Record<string, unknown>;
 }
 
 /** Correlates GDELT window with the tape; see `app/services/news_gdelt.py`. */
@@ -235,10 +248,40 @@ export interface MarketNews {
   query: string;
   since: string;
   until: string;
-  provider: "gdelt" | "unavailable" | string;
+  provider: "stored" | "gdelt" | "unavailable" | string;
   articles: NewsArticle[];
   anchors?: NewsAnchors;
+  stored_event_count?: number;
   error?: string;
+}
+
+export interface NewsSignal {
+  event_id: number;
+  market_id: string;
+  event_market_id: string | null;
+  title: string;
+  subtitle: string | null;
+  category: string | null;
+  manipulability_prior: Prior | null;
+  article: NewsArticle;
+  article_title: string | null;
+  article_url: string | null;
+  article_source: string | null;
+  first_seen_at: string | null;
+  relevance_score: number;
+  pre_news_trade_score: number;
+  status: string;
+  leakage_window_seconds: number | null;
+  direction_label: string | null;
+  direction_confidence: number | null;
+  reasons: string[];
+  best_trade: Record<string, unknown> | null;
+}
+
+export interface NewsSignalsList {
+  count: number;
+  min_score: number;
+  signals: NewsSignal[];
 }
 
 export interface DashboardOverview {
@@ -247,6 +290,7 @@ export interface DashboardOverview {
   top_markets: TopMarketsList;
   recent_anomalies: RecentAnomaliesList;
   suspicious_trades: SuspiciousTradesList;
+  news_signals?: NewsSignalsList;
 }
 
 export interface TopMarketsList {
