@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_host: str = "127.0.0.1"
     app_port: int = 8000
-    
+
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
     kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     # the most recently updated active markets in the DB, capped by the limit.
     kalshi_book_market_tickers: list[str] = []
     kalshi_book_market_limit: int = 50
+    kalshi_ws_queue_size: int = 10000
+    kalshi_ws_worker_count: int = 4
 
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
@@ -25,6 +27,22 @@ class Settings(BaseSettings):
 
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
+
+    clickhouse_url: str = "http://127.0.0.1:8123"
+    clickhouse_user: str = "default"
+    clickhouse_password: str = ""
+    clickhouse_database: str = "surveillance"
+    clickhouse_batch_max_rows: int = 5000
+    clickhouse_batch_flush_interval_sec: float = 1.0
+    clickhouse_batch_queue_size: int = 100000
+    kalshi_raw_backend: str = "postgres"  # postgres | clickhouse | dual
+
+    # Hot raw retention defaults. These are intentionally short because the
+    # durable artifact is a promoted evidence bundle, not every Kalshi tick.
+    kalshi_raw_observe_ttl_hours: int = 1
+    kalshi_raw_sampled_ttl_hours: int = 24
+    kalshi_raw_hot_ttl_hours: int = 168
+    kalshi_raw_triggered_ttl_hours: int = 720
 
     model_config = SettingsConfigDict(
         env_file=".env",

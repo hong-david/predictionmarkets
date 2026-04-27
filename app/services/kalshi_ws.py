@@ -17,7 +17,14 @@ from app.services.anomaly_materializer import materialize_market_anomaly
 from app.services.classifier import CLASSIFIER_VERSION
 from app.services.decimal_utils import parse_decimal
 from app.services.kalshi_auth import create_ws_headers
-from app.services.retention import is_ticker_in_scope, should_persist_raw_tape
+from app.services.clickhouse_writer import clickhouse_batcher
+from app.services.market_metrics import bump_trade_metrics, upsert_quote_metrics
+from app.services.retention import (
+    StorageDecision,
+    is_ticker_in_scope,
+    should_sample_event,
+    storage_decision_for_event,
+)
 from app.services.snapshot_dedup import should_skip_duplicate_snapshot
 
 logger = logging.getLogger(__name__)
@@ -26,6 +33,86 @@ logger = logging.getLogger(__name__)
 # Used to gate which markets persist raw trades and book_event rows.
 _TAPE_HINT_TTL_SEC = 120.0
 _tape_volume_cache: dict[int, tuple[Decimal | None, Decimal | None, float]] = {}
+_CH_TRADES_TABLE = "kalshi_trades_raw"
+_CH_QUOTES_TABLE = "kalshi_quote_changes_raw"
+_CH_L2_TABLE = "kalshi_l2_events_raw"
+
+
+def _raw_backend() -> str:
+    backend = settings.kalshi_raw_backend.lower().strip()
+    if backend not in {"postgres", "clickhouse", "dual"}:
+        logger.warning(
+            "Unknown kalshi_raw_backend=%s; falling back to postgres", backend
+        )
+        return "postgres"
+    return backend
+
+
+def _write_raw_postgres() -> bool:
+    return _raw_backend() in {"postgres", "dual"}
+
+
+def _write_raw_clickhouse() -> bool:
+    return _raw_backend() in {"clickhouse", "dual"}
+
+
+def _cents(value: Decimal | None) -> int:
+    if value is None:
+        return 0
+    return max(0, min(255, int((value * Decimal("100")).to_integral_value())))
+
+
+def _contracts(value: Decimal | None) -> int:
+    if value is None:
+        return 0
+    return max(0, int(value.to_integral_value()))
+
+
+def _signed_contracts(value: Decimal | None) -> int:
+    if value is None:
+        return 0
+    return int(value.to_integral_value())
+
+
+def _side_enum(value: object) -> str:
+    side = str(value or "").lower()
+    return side if side in {"yes", "no"} else "unknown"
+
+
+def _clickhouse_ts(value: datetime | None = None) -> datetime:
+    return value or datetime.now(timezone.utc)
+
+
+async def _dispatch_ws_message(data: dict, session_id: str) -> None:
+    msg_type = data.get("type")
+    if msg_type == "ticker":
+        await asyncio.to_thread(handle_ticker_message, data)
+    elif msg_type == "trade":
+        await asyncio.to_thread(handle_trade_message, data)
+    elif msg_type == "orderbook_snapshot":
+        await asyncio.to_thread(handle_orderbook_snapshot_message, data, session_id)
+    elif msg_type == "orderbook_delta":
+        await asyncio.to_thread(handle_orderbook_delta_message, data, session_id)
+    elif msg_type == "error":
+        logger.warning("WebSocket error payload: %s", data)
+    else:
+        logger.debug("Ignoring message type=%s", msg_type)
+
+
+async def _ws_writer_worker(
+    queue: asyncio.Queue[dict | None],
+    session_id: str,
+) -> None:
+    while True:
+        data = await queue.get()
+        try:
+            if data is None:
+                return
+            await _dispatch_ws_message(data, session_id)
+        except Exception:
+            logger.exception("WebSocket writer worker failed for payload=%s", data)
+        finally:
+            queue.task_done()
 
 
 def _update_tape_hints_from_ticker(
@@ -53,23 +140,34 @@ def _tape_hints_for_market(db, market: Market) -> tuple[Decimal | None, Decimal 
     return v24, oi
 
 
-def _raw_tape_allowed(db, market: Market) -> bool:
-    """True if this market may append trades / book_event rows in this process."""
+def _raw_tape_decision(db, market: Market) -> StorageDecision:
+    """Tiered decision for trades / book_event rows in this process."""
     v24, oi = _tape_hints_for_market(db, market)
-    if should_persist_raw_tape(
+    decision = storage_decision_for_event(
         market,
         volume_24h_fp=v24,
         open_interest_fp=oi,
         has_materialized_anomaly=False,
-    ):
-        return True
-    return (
-        db.query(Anomaly.id)
-        .filter(Anomaly.market_pk == market.id)
-        .limit(1)
-        .first()
+    )
+    if decision.persist_raw_tape:
+        return decision
+    has_anomaly = (
+        db.query(Anomaly.id).filter(Anomaly.market_pk == market.id).limit(1).first()
         is not None
     )
+    if not has_anomaly:
+        return decision
+    return storage_decision_for_event(
+        market,
+        volume_24h_fp=v24,
+        open_interest_fp=oi,
+        has_materialized_anomaly=True,
+    )
+
+
+def _raw_tape_allowed(db, market: Market) -> bool:
+    """Backward-compatible boolean raw-tape gate used by tests and callers."""
+    return _raw_tape_decision(db, market).persist_raw_tape
 
 
 def _get_or_create_market(db, market_ticker: str) -> Market | None:
@@ -153,6 +251,11 @@ def handle_ticker_message(data: dict) -> None:
         oi = parse_decimal(msg.get("open_interest_fp"))
         liq = parse_decimal(msg.get("liquidity_dollars"))
         _update_tape_hints_from_ticker(market.id, v24, oi)
+        decision = storage_decision_for_event(
+            market,
+            volume_24h_fp=v24,
+            open_interest_fp=oi,
+        )
         if should_skip_duplicate_snapshot(
             db,
             market.id,
@@ -166,6 +269,47 @@ def handle_ticker_message(data: dict) -> None:
             open_interest_fp=oi,
             liquidity_dollars=liq,
         ):
+            upsert_quote_metrics(
+                db,
+                market_pk=market.id,
+                prior=market.manipulability_prior,
+                latest_snapshot_id=None,
+                latest_snapshot_ts=None,
+                last_price_dollars=lp,
+                yes_bid_dollars=yb,
+                yes_ask_dollars=ya,
+                no_bid_dollars=nb,
+                no_ask_dollars=na,
+                volume_24h_fp=v24,
+                open_interest_fp=oi,
+                liquidity_dollars=liq,
+                decision=decision,
+            )
+            db.commit()
+            return
+
+        should_store_snapshot = decision.persist_raw_tape or should_sample_event(
+            f"ticker:{market.market_id}:{lp}:{yb}:{ya}:{vol}:{v24}:{oi}",
+            decision.sample_rate,
+        )
+        if not should_store_snapshot:
+            upsert_quote_metrics(
+                db,
+                market_pk=market.id,
+                prior=market.manipulability_prior,
+                latest_snapshot_id=None,
+                latest_snapshot_ts=None,
+                last_price_dollars=lp,
+                yes_bid_dollars=yb,
+                yes_ask_dollars=ya,
+                no_bid_dollars=nb,
+                no_ask_dollars=na,
+                volume_24h_fp=v24,
+                open_interest_fp=oi,
+                liquidity_dollars=liq,
+                decision=decision,
+            )
+            db.commit()
             return
 
         snapshot = MarketSnapshot(
@@ -182,6 +326,38 @@ def handle_ticker_message(data: dict) -> None:
         )
         db.add(snapshot)
         db.flush()
+        upsert_quote_metrics(
+            db,
+            market_pk=market.id,
+            prior=market.manipulability_prior,
+            latest_snapshot_id=snapshot.id,
+            latest_snapshot_ts=snapshot.ts,
+            last_price_dollars=lp,
+            yes_bid_dollars=yb,
+            yes_ask_dollars=ya,
+            no_bid_dollars=nb,
+            no_ask_dollars=na,
+            volume_24h_fp=v24,
+            open_interest_fp=oi,
+            liquidity_dollars=liq,
+            decision=decision,
+        )
+        if _write_raw_clickhouse():
+            clickhouse_batcher.enqueue(
+                _CH_QUOTES_TABLE,
+                {
+                    "ts": _clickhouse_ts(snapshot.ts),
+                    "market_pk": market.id,
+                    "last_price_cents": _cents(lp),
+                    "yes_bid_cents": _cents(yb),
+                    "yes_ask_cents": _cents(ya),
+                    "no_bid_cents": _cents(nb),
+                    "no_ask_cents": _cents(na),
+                    "volume_24h_contracts": _contracts(v24),
+                    "open_interest_contracts": _contracts(oi),
+                    "storage_tier": decision.tier,
+                },
+            )
 
         materialize_market_anomaly(
             db,
@@ -222,36 +398,70 @@ def handle_trade_message(data: dict) -> None:
             logger.info("Skipping out-of-scope trade message for %s", market_ticker)
             return
 
-        if not _raw_tape_allowed(db, market):
+        decision = _raw_tape_decision(db, market)
+        if not decision.persist_raw_tape:
             # Lazy-upsert may have just inserted a stub `Market`; commit so it
             # survives even when we drop the trade on the floor (raw-tape gate).
+            db.commit()
+            return
+        if not should_sample_event(
+            f"trade:{market.market_id}:{trade_id}", decision.sample_rate
+        ):
             db.commit()
             return
 
         ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
 
-        # ON CONFLICT DO NOTHING keeps reconnect-replays cheap and avoids
-        # poisoning the transaction with IntegrityErrors per duplicate.
-        stmt = (
-            pg_insert(Trade)
-            .values(
-                market_pk=market.id,
-                trade_id=trade_id,
-                ts=ts,
-                yes_price_dollars=parse_decimal(msg.get("yes_price_dollars")),
-                no_price_dollars=parse_decimal(msg.get("no_price_dollars")),
-                count_fp=parse_decimal(msg.get("count_fp")),
-                taker_side=msg.get("taker_side"),
+        yes_price = parse_decimal(msg.get("yes_price_dollars"))
+        no_price = parse_decimal(msg.get("no_price_dollars"))
+        count = parse_decimal(msg.get("count_fp"))
+        wrote_trade = False
+        if _write_raw_postgres():
+            # ON CONFLICT DO NOTHING keeps reconnect-replays cheap and avoids
+            # poisoning the transaction with IntegrityErrors per duplicate.
+            stmt = (
+                pg_insert(Trade)
+                .values(
+                    market_pk=market.id,
+                    trade_id=trade_id,
+                    ts=ts,
+                    yes_price_dollars=yes_price,
+                    no_price_dollars=no_price,
+                    count_fp=count,
+                    taker_side=msg.get("taker_side"),
+                )
+                .on_conflict_do_nothing(index_elements=["trade_id"])
             )
-            .on_conflict_do_nothing(index_elements=["trade_id"])
-        )
-        # SQLAlchemy 2's static return type is `Result[Any]`, but a DML
-        # statement executes as a `CursorResult` at runtime, which is what
-        # exposes `rowcount`. Suppress the false-positive attribute error.
-        result = db.execute(stmt)
+            # SQLAlchemy 2's static return type is `Result[Any]`, but a DML
+            # statement executes as a `CursorResult` at runtime, which is what
+            # exposes `rowcount`. Suppress the false-positive attribute error.
+            result = db.execute(stmt)
+            wrote_trade = bool(result.rowcount)  # type: ignore[attr-defined]
+
+        if _write_raw_clickhouse() and (wrote_trade or not _write_raw_postgres()):
+            wrote_trade = (
+                clickhouse_batcher.enqueue(
+                    _CH_TRADES_TABLE,
+                    {
+                        "ts": ts,
+                        "market_pk": market.id,
+                        "trade_id": trade_id,
+                        "yes_price_cents": _cents(yes_price),
+                        "no_price_cents": _cents(no_price),
+                        "count_contracts": _contracts(count),
+                        "taker_side": _side_enum(msg.get("taker_side")),
+                        "storage_tier": decision.tier,
+                        "anomaly_context": 1 if decision.store_case_evidence else 0,
+                    },
+                )
+                or wrote_trade
+            )
+
+        if wrote_trade:
+            bump_trade_metrics(db, market_pk=market.id, trade_ts=ts)
         db.commit()
 
-        if result.rowcount:  # type: ignore[attr-defined]
+        if wrote_trade:
             logger.info(
                 "trade market=%s trade_id=%s yes=%s count_fp=%s side=%s",
                 market.market_id,
@@ -284,7 +494,9 @@ def handle_orderbook_snapshot_message(data: dict, session_id: str) -> None:
 
     db = SessionLocal()
     try:
-        market = db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        market = (
+            db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        )
         if market is None:
             logger.warning(
                 "Skipping orderbook_snapshot for unknown market_ticker=%s",
@@ -293,6 +505,20 @@ def handle_orderbook_snapshot_message(data: dict, session_id: str) -> None:
             return
 
         if not _raw_tape_allowed(db, market):
+            return
+        decision: StorageDecision | None = None
+        sample_rate = 1.0
+        try:
+            decision = _raw_tape_decision(db, market)
+            sample_rate = decision.sample_rate
+        except AttributeError:
+            # Unit-test fakes patch the boolean gate and intentionally omit
+            # enough query methods for the richer decision lookup.
+            pass
+        if not should_sample_event(
+            f"book_snapshot:{market.market_id}:{session_id}:{seq}",
+            sample_rate,
+        ):
             return
 
         ts = _ts_from_ms(msg.get("ts_ms"))
@@ -320,17 +546,36 @@ def handle_orderbook_snapshot_message(data: dict, session_id: str) -> None:
         if not rows:
             return
 
-        # Bulk insert: one statement, ON CONFLICT DO NOTHING keeps re-applying
-        # the same snapshot idempotent across reconnect-replays.
-        stmt = (
-            pg_insert(BookEvent)
-            .values(rows)
-            .on_conflict_do_nothing(
-                index_elements=["session_id", "seq", "side", "price_dollars"]
+        if _write_raw_clickhouse():
+            for row in rows:
+                clickhouse_batcher.enqueue(
+                    _CH_L2_TABLE,
+                    {
+                        "ts": _clickhouse_ts(row["ts"]),
+                        "market_pk": row["market_pk"],
+                        "session_id": row["session_id"],
+                        "seq": row["seq"],
+                        "side": row["side"],
+                        "price_cents": _cents(row["price_dollars"]),
+                        "size_contracts": _contracts(row["size_fp"]),
+                        "delta_contracts": None,
+                        "is_snapshot": 1,
+                        "storage_tier": decision.tier if decision else "hot",
+                    },
+                )
+
+        if _write_raw_postgres():
+            # Bulk insert: one statement, ON CONFLICT DO NOTHING keeps re-applying
+            # the same snapshot idempotent across reconnect-replays.
+            stmt = (
+                pg_insert(BookEvent)
+                .values(rows)
+                .on_conflict_do_nothing(
+                    index_elements=["session_id", "seq", "side", "price_dollars"]
+                )
             )
-        )
-        db.execute(stmt)
-        db.commit()
+            db.execute(stmt)
+            db.commit()
 
         logger.info(
             "orderbook_snapshot market=%s seq=%s levels=%s session=%s",
@@ -363,10 +608,15 @@ def handle_orderbook_delta_message(data: dict, session_id: str) -> None:
     ):
         logger.warning("Skipping malformed orderbook_delta: %s", data)
         return
+    if side not in {"yes", "no"}:
+        logger.warning("Skipping orderbook_delta with unknown side: %s", data)
+        return
 
     db = SessionLocal()
     try:
-        market = db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        market = (
+            db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
+        )
         if market is None:
             logger.warning(
                 "Skipping orderbook_delta for unknown market_ticker=%s",
@@ -376,8 +626,42 @@ def handle_orderbook_delta_message(data: dict, session_id: str) -> None:
 
         if not _raw_tape_allowed(db, market):
             return
+        decision: StorageDecision | None = None
+        sample_rate = 1.0
+        try:
+            decision = _raw_tape_decision(db, market)
+            sample_rate = decision.sample_rate
+        except AttributeError:
+            pass
+        if not should_sample_event(
+            f"book_delta:{market.market_id}:{session_id}:{seq}:{side}:{price_str}",
+            sample_rate,
+        ):
+            return
 
         ts = _ts_from_ms(msg.get("ts_ms"))
+        price = parse_decimal(price_str)
+        delta = parse_decimal(delta_str)
+
+        if _write_raw_clickhouse():
+            clickhouse_batcher.enqueue(
+                _CH_L2_TABLE,
+                {
+                    "ts": _clickhouse_ts(ts),
+                    "market_pk": market.id,
+                    "session_id": session_id,
+                    "seq": seq,
+                    "side": side,
+                    "price_cents": _cents(price),
+                    "size_contracts": None,
+                    "delta_contracts": _signed_contracts(delta),
+                    "is_snapshot": 0,
+                    "storage_tier": decision.tier if decision else "hot",
+                },
+            )
+
+        if not _write_raw_postgres():
+            return
 
         stmt = (
             pg_insert(BookEvent)
@@ -387,9 +671,9 @@ def handle_orderbook_delta_message(data: dict, session_id: str) -> None:
                 seq=seq,
                 ts=ts,
                 side=side,
-                price_dollars=parse_decimal(price_str),
+                price_dollars=price,
                 size_fp=None,
-                delta_fp=parse_decimal(delta_str),
+                delta_fp=delta,
                 is_snapshot=False,
             )
             .on_conflict_do_nothing(
@@ -527,23 +811,23 @@ async def consume_market_data_forever() -> None:
                     )
 
                 backoff_seconds = 1
+                queue: asyncio.Queue[dict | None] = asyncio.Queue(
+                    maxsize=settings.kalshi_ws_queue_size
+                )
+                workers = [
+                    asyncio.create_task(_ws_writer_worker(queue, session_id))
+                    for _ in range(max(1, settings.kalshi_ws_worker_count))
+                ]
 
-                async for raw_message in websocket:
-                    data = json.loads(raw_message)
-                    msg_type = data.get("type")
-
-                    if msg_type == "ticker":
-                        handle_ticker_message(data)
-                    elif msg_type == "trade":
-                        handle_trade_message(data)
-                    elif msg_type == "orderbook_snapshot":
-                        handle_orderbook_snapshot_message(data, session_id)
-                    elif msg_type == "orderbook_delta":
-                        handle_orderbook_delta_message(data, session_id)
-                    elif msg_type == "error":
-                        logger.warning("WebSocket error payload: %s", data)
-                    else:
-                        logger.debug("Ignoring message type=%s", msg_type)
+                try:
+                    async for raw_message in websocket:
+                        data = json.loads(raw_message)
+                        await queue.put(data)
+                finally:
+                    for _ in workers:
+                        await queue.put(None)
+                    await queue.join()
+                    await asyncio.gather(*workers, return_exceptions=True)
 
         except Exception as exc:
             logger.warning(

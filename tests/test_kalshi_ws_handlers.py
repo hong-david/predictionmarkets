@@ -157,8 +157,9 @@ def test_handle_trade_message_lazily_upserts_unknown_market():
             "ts_ms": 1_700_000_000_000,
         },
     }
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
-        kalshi_ws, "pg_insert", recorder
+    with (
+        patch.object(kalshi_ws, "SessionLocal", return_value=fake),
+        patch.object(kalshi_ws, "pg_insert", recorder),
     ):
         kalshi_ws.handle_trade_message(payload)
 
@@ -170,17 +171,83 @@ def test_handle_trade_message_lazily_upserts_unknown_market():
     assert fake.closed is True
 
 
+def test_handle_trade_message_dual_writes_clickhouse_batch():
+    market = _FakeMarket(pk=42, market_id="KXTEST-25")
+    fake = _FakeSession(market_lookup_result=market)
+    decision = kalshi_ws.StorageDecision(
+        tier="hot",
+        score=50,
+        process_realtime=True,
+        store_raw_hot=True,
+        raw_ttl_hours=168,
+        store_features=True,
+        store_case_evidence=False,
+        sample_rate=1.0,
+        reasons=("high_prior",),
+    )
+    payload = {
+        "type": "trade",
+        "msg": {
+            "market_ticker": "KXTEST-25",
+            "trade_id": "t1",
+            "ts_ms": 1_700_000_000_000,
+            "yes_price_dollars": "0.4200",
+            "no_price_dollars": "0.5800",
+            "count_fp": "12.00",
+            "taker_side": "yes",
+        },
+    }
+
+    with (
+        patch.object(kalshi_ws, "SessionLocal", return_value=fake),
+        patch.object(kalshi_ws, "_raw_tape_decision", return_value=decision),
+        patch.object(kalshi_ws.settings, "kalshi_raw_backend", "dual"),
+        patch.object(kalshi_ws.clickhouse_batcher, "enqueue", return_value=True) as enq,
+    ):
+        kalshi_ws.handle_trade_message(payload)
+
+    enq.assert_called_once()
+    table, row = enq.call_args.args
+    assert table == "kalshi_trades_raw"
+    assert row["market_pk"] == 42
+    assert row["trade_id"] == "t1"
+    assert row["yes_price_cents"] == 42
+    assert row["count_contracts"] == 12
+    assert row["storage_tier"] == "hot"
+    assert fake.commits == 1
+
+
 # ---------- orderbook_delta handler ----------------------------------------
 
 
 @pytest.mark.parametrize(
     "msg",
     [
-        {"seq": 1, "side": "yes", "price_dollars": "0.5", "delta_fp": "1"},  # no market_ticker
-        {"market_ticker": "K", "side": "yes", "price_dollars": "0.5", "delta_fp": "1"},  # no seq
-        {"market_ticker": "K", "seq": 1, "price_dollars": "0.5", "delta_fp": "1"},  # no side
+        {
+            "seq": 1,
+            "side": "yes",
+            "price_dollars": "0.5",
+            "delta_fp": "1",
+        },  # no market_ticker
+        {
+            "market_ticker": "K",
+            "side": "yes",
+            "price_dollars": "0.5",
+            "delta_fp": "1",
+        },  # no seq
+        {
+            "market_ticker": "K",
+            "seq": 1,
+            "price_dollars": "0.5",
+            "delta_fp": "1",
+        },  # no side
         {"market_ticker": "K", "seq": 1, "side": "yes", "delta_fp": "1"},  # no price
-        {"market_ticker": "K", "seq": 1, "side": "yes", "price_dollars": "0.5"},  # no delta
+        {
+            "market_ticker": "K",
+            "seq": 1,
+            "side": "yes",
+            "price_dollars": "0.5",
+        },  # no delta
     ],
 )
 def test_handle_orderbook_delta_skips_malformed_payloads(msg):
@@ -212,9 +279,11 @@ def test_handle_orderbook_snapshot_expands_one_row_per_level():
         },
     }
 
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
-        kalshi_ws, "pg_insert", recorder
-    ), patch.object(kalshi_ws, "_raw_tape_allowed", return_value=True):
+    with (
+        patch.object(kalshi_ws, "SessionLocal", return_value=fake),
+        patch.object(kalshi_ws, "pg_insert", recorder),
+        patch.object(kalshi_ws, "_raw_tape_allowed", return_value=True),
+    ):
         kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
 
     rows = recorder.captured_rows
@@ -253,8 +322,9 @@ def test_handle_orderbook_snapshot_skips_when_tape_gated_out():
             "no_dollars_fp": [],
         },
     }
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
-        kalshi_ws, "_raw_tape_allowed", return_value=False
+    with (
+        patch.object(kalshi_ws, "SessionLocal", return_value=fake),
+        patch.object(kalshi_ws, "_raw_tape_allowed", return_value=False),
     ):
         kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
     assert fake.executed_stmts == []
@@ -270,8 +340,9 @@ def test_handle_orderbook_snapshot_with_empty_book_is_a_noop():
         "msg": {"market_ticker": "KXTEST-25", "market_id": "uuid-here"},
     }
 
-    with patch.object(kalshi_ws, "SessionLocal", return_value=fake), patch.object(
-        kalshi_ws, "_raw_tape_allowed", return_value=True
+    with (
+        patch.object(kalshi_ws, "SessionLocal", return_value=fake),
+        patch.object(kalshi_ws, "_raw_tape_allowed", return_value=True),
     ):
         kalshi_ws.handle_orderbook_snapshot_message(payload, "session-uuid")
 
@@ -286,7 +357,9 @@ def test_resolve_book_market_tickers_prefers_explicit_config():
     with patch.object(kalshi_ws.settings, "kalshi_book_market_tickers", explicit):
         # SessionLocal must NOT be touched when an explicit list is configured.
         with patch.object(
-            kalshi_ws, "SessionLocal", side_effect=AssertionError("DB should not be queried")
+            kalshi_ws,
+            "SessionLocal",
+            side_effect=AssertionError("DB should not be queried"),
         ):
             out = kalshi_ws.resolve_book_market_tickers()
     assert out == explicit

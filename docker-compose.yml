@@ -17,5 +17,17 @@ services:
     ports:
       - "6379:6379"
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    container_name: predictionmarkets-clickhouse
+    environment:
+      CLICKHOUSE_DB: surveillance
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
 volumes:
   postgres_data:
+  clickhouse_data:

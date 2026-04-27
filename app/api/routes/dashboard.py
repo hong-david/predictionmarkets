@@ -39,11 +39,14 @@ from threading import Lock
 from typing import Callable, TypeVar
 
 import httpx
+import orjson
+import redis
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, case, desc, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
+from app.core.config import settings
 from app.db.models import Anomaly, Market, MarketSnapshot, Trade
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
 from app.services.surveillance_scores import (
@@ -66,19 +69,47 @@ _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
+_redis_client: redis.Redis | None = None
 
 
 def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
     now = time.monotonic()
+    r = _dashboard_redis()
+    redis_key = f"dashboard:{key}"
+    if r is not None:
+        try:
+            raw = r.get(redis_key)
+            if raw:
+                return orjson.loads(raw)  # type: ignore[return-value]
+        except Exception as exc:
+            logger.debug("dashboard redis cache read failed: %s", exc)
+
     with _dashboard_cache_lock:
         cached = _dashboard_cache.get(key)
         if cached and now - cached[0] < _DASHBOARD_CACHE_TTL_SEC:
             return cached[1]  # type: ignore[return-value]
 
     payload = build()
+    if r is not None:
+        try:
+            r.setex(redis_key, int(_DASHBOARD_CACHE_TTL_SEC), orjson.dumps(payload))
+        except Exception as exc:
+            logger.debug("dashboard redis cache write failed: %s", exc)
     with _dashboard_cache_lock:
         _dashboard_cache[key] = (time.monotonic(), payload)
     return payload
+
+
+def _dashboard_redis() -> redis.Redis | None:
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    try:
+        _redis_client = redis.Redis.from_url(settings.redis_url, socket_timeout=0.15)
+        return _redis_client
+    except Exception as exc:
+        logger.debug("dashboard redis unavailable: %s", exc)
+        return None
 
 
 # --- helpers ----------------------------------------------------------------
@@ -101,7 +132,9 @@ def _prior_rank() -> case:
     return case(_PRIOR_RANK, value=Market.manipulability_prior, else_=-1)
 
 
-def _reason_codes_for_market_pks(db: Session, market_pks: list[int]) -> dict[int, list[str]]:
+def _reason_codes_for_market_pks(
+    db: Session, market_pks: list[int]
+) -> dict[int, list[str]]:
     """Snake_case reason codes (deduped) from all `anomalies.reasons` JSON for a market."""
     if not market_pks:
         return {}
@@ -167,7 +200,9 @@ def _estimated_table_count(db: Session, table_name: str) -> int:
     live dashboard counter.
     """
     estimate = db.execute(
-        text("select reltuples::bigint from pg_class where oid = to_regclass(:table_name)"),
+        text(
+            "select reltuples::bigint from pg_class where oid = to_regclass(:table_name)"
+        ),
         {"table_name": table_name},
     ).scalar()
     return max(0, int(estimate or 0))
@@ -199,7 +234,8 @@ def _stats_payload(db: Session) -> dict:
     book_events = _estimated_table_count(db, "book_events")
     anomalies = _estimated_table_count(db, "anomalies")
     anomalies_high = (
-        db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar() or 0
+        db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar()
+        or 0
     )
     markets_with_flags = min(markets, anomalies)
 
@@ -223,7 +259,9 @@ def _breakdown_payload(db: Session) -> dict:
 
     def _group_count(col):
         rows = (
-            db.query(func.coalesce(col, "unclassified").label("k"), func.count(Market.id))
+            db.query(
+                func.coalesce(col, "unclassified").label("k"), func.count(Market.id)
+            )
             .filter(*hydrated)
             .group_by("k")
             .order_by(func.count(Market.id).desc())
@@ -303,9 +341,7 @@ def _top_markets_payload(db: Session, limit: int) -> dict:
         return {"count": 0, "markets": []}
 
     trade_counts = {int(r.market_pk): int(r.trade_count or 0) for r in trade_rows}
-    markets_by_pk = {
-        m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()
-    }
+    markets_by_pk = {m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()}
 
     rows = [markets_by_pk[pk] for pk in pks if pk in markets_by_pk]
     return {
@@ -325,7 +361,9 @@ def _recent_anomalies_payload(db: Session, limit: int, severity: str | None) -> 
     base = base.filter(*_hydrated_market_filters())
     if severity:
         base = base.filter(Anomaly.severity == severity)
-    rows = base.order_by(Anomaly.created_at.desc(), Anomaly.id.desc()).limit(limit).all()
+    rows = (
+        base.order_by(Anomaly.created_at.desc(), Anomaly.id.desc()).limit(limit).all()
+    )
     return {
         "count": len(rows),
         "anomalies": [
@@ -461,7 +499,9 @@ _SORT_OPTIONS = {
 
 @router.get("/markets")
 def list_markets(
-    q: str | None = Query(default=None, description="Search title / subtitle / market_id"),
+    q: str | None = Query(
+        default=None, description="Search title / subtitle / market_id"
+    ),
     category: str | None = Query(default=None),
     prior: str | None = Query(default=None),
     confidence: str | None = Query(default=None),
@@ -590,9 +630,7 @@ def _list_markets_uncached(
         .outerjoin(anomaly_count_sq, anomaly_count_sq.c.market_pk == Market.id)
     )
 
-    sort_key, sort_dir = _SORT_OPTIONS.get(
-        sort, _SORT_OPTIONS["surveillance_urgency"]
-    )
+    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["surveillance_urgency"])
     if sort_key == "trade_count":
         # NULLs (markets with no trades yet) become 0 so they sort last
         # in DESC and first in ASC. The COALESCE must wrap the column
@@ -796,7 +834,8 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
     )
 
     anomaly_count = (
-        db.query(func.count(Anomaly.id)).filter(Anomaly.market_pk == market.id).scalar() or 0
+        db.query(func.count(Anomaly.id)).filter(Anomaly.market_pk == market.id).scalar()
+        or 0
     )
     rmap = _reason_codes_for_market_pks(db, [market.id])
     reason_codes = rmap.get(market.id, [])
@@ -817,11 +856,21 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
         "classifier_tags": market.classifier_tags or [],
         "stats": {
             "trade_count": int(trade_stats.c or 0),
-            "first_trade_ts": trade_stats.first_ts.isoformat() if trade_stats.first_ts else None,
-            "last_trade_ts": trade_stats.last_ts.isoformat() if trade_stats.last_ts else None,
-            "min_yes_price": float(trade_stats.min_yes) if trade_stats.min_yes is not None else None,
-            "max_yes_price": float(trade_stats.max_yes) if trade_stats.max_yes is not None else None,
-            "total_traded_size": float(trade_stats.total_count) if trade_stats.total_count is not None else None,
+            "first_trade_ts": trade_stats.first_ts.isoformat()
+            if trade_stats.first_ts
+            else None,
+            "last_trade_ts": trade_stats.last_ts.isoformat()
+            if trade_stats.last_ts
+            else None,
+            "min_yes_price": float(trade_stats.min_yes)
+            if trade_stats.min_yes is not None
+            else None,
+            "max_yes_price": float(trade_stats.max_yes)
+            if trade_stats.max_yes is not None
+            else None,
+            "total_traded_size": float(trade_stats.total_count)
+            if trade_stats.total_count is not None
+            else None,
         },
         "latest_snapshot": (
             {
@@ -886,8 +935,12 @@ def get_market_series(
     trade_payloads = [
         {
             "ts": t.ts.isoformat() if t.ts else None,
-            "yes_price": float(t.yes_price_dollars) if t.yes_price_dollars is not None else None,
-            "no_price": float(t.no_price_dollars) if t.no_price_dollars is not None else None,
+            "yes_price": float(t.yes_price_dollars)
+            if t.yes_price_dollars is not None
+            else None,
+            "no_price": float(t.no_price_dollars)
+            if t.no_price_dollars is not None
+            else None,
             "count": float(t.count_fp) if t.count_fp is not None else None,
             "taker_side": t.taker_side,
         }
@@ -916,11 +969,21 @@ def get_market_series(
         "snapshots": [
             {
                 "ts": s.ts.isoformat() if s.ts else None,
-                "yes_bid": float(s.yes_bid_dollars) if s.yes_bid_dollars is not None else None,
-                "yes_ask": float(s.yes_ask_dollars) if s.yes_ask_dollars is not None else None,
-                "last_price": float(s.last_price_dollars) if s.last_price_dollars is not None else None,
-                "volume_24h": float(s.volume_24h_fp) if s.volume_24h_fp is not None else None,
-                "open_interest": float(s.open_interest_fp) if s.open_interest_fp is not None else None,
+                "yes_bid": float(s.yes_bid_dollars)
+                if s.yes_bid_dollars is not None
+                else None,
+                "yes_ask": float(s.yes_ask_dollars)
+                if s.yes_ask_dollars is not None
+                else None,
+                "last_price": float(s.last_price_dollars)
+                if s.last_price_dollars is not None
+                else None,
+                "volume_24h": float(s.volume_24h_fp)
+                if s.volume_24h_fp is not None
+                else None,
+                "open_interest": float(s.open_interest_fp)
+                if s.open_interest_fp is not None
+                else None,
             }
             for s in snap_rows
         ],

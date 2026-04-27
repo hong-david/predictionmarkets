@@ -1,6 +1,6 @@
 # Prediction Market Surveillance
 
-**What this is:** A backend (plus a small web UI) that ingests public Kalshi data, stores it in Postgres, and highlights **unusual** quotes, trades, and order-book *activity* — without access to who traded (public data only).
+**What this is:** A backend (plus a small web UI) that ingests public Kalshi data, stores control-plane/projection data in Postgres, can batch retained raw event tape into ClickHouse, and highlights **unusual** quotes, trades, and order-book *activity* — without access to who traded (public data only).
 
 **Glossary (terms used in the UI and code)**
 
@@ -45,12 +45,20 @@ flowchart LR
         WSCONS[scripts/run_ws_ticker_consumer.py\n-> kalshi_ws.consume_market_data_forever]
     end
 
-    subgraph DB[Postgres]
+    subgraph DB[Postgres control plane + projections]
         TMARKETS[(markets)]
         TSNAPS[(market_snapshots)]
         TTRADES[(trades)]
         TBOOK[(book_events)]
         TANOM[(anomalies)]
+        TMETRICS[(market_metrics)]
+        TNEWS[(news_* + case_evidence)]
+    end
+
+    subgraph CH[ClickHouse optional raw hot store]
+        CHTRADES[(kalshi_trades_raw)]
+        CHQUOTES[(kalshi_quote_changes_raw)]
+        CHL2[(kalshi_l2_events_raw)]
     end
 
     subgraph PROC[Processing]
@@ -75,9 +83,13 @@ flowchart LR
     POLLER -->|raw market dict| CLASSIFIER
     CLASSIFIER -->|category, subcategory,\nmanipulability_prior, tags| TMARKETS
     WSCONS -->|lazy-upsert unknown ticker\nstatus='unknown' sentinel| TMARKETS
-    WSCONS -->|new snapshot per ticker| TSNAPS
-    WSCONS -->|new trade per trade msg\nINSERT ON CONFLICT DO NOTHING| TTRADES
-    WSCONS -->|book event rows per snapshot/delta\nINSERT ON CONFLICT DO NOTHING| TBOOK
+    WSCONS -->|bounded queue + worker tasks| TSNAPS
+    WSCONS -->|projection updates| TMETRICS
+    WSCONS -->|raw backend=postgres/dual\nINSERT ON CONFLICT DO NOTHING| TTRADES
+    WSCONS -->|raw backend=postgres/dual\nbook rows| TBOOK
+    WSCONS -->|raw backend=clickhouse/dual\nbatched JSONEachRow| CHTRADES
+    WSCONS -->|retained quote changes| CHQUOTES
+    WSCONS -->|retained L2 events| CHL2
 
     WSCONS -->|after ticker snapshot| MAT
     TBOOK --> BOOKSIG
@@ -96,11 +108,13 @@ flowchart LR
     classDef ext fill:#fef3c7,stroke:#d97706,color:#000
     classDef ing fill:#dbeafe,stroke:#2563eb,color:#000
     classDef db fill:#dcfce7,stroke:#16a34a,color:#000
+    classDef ch fill:#cffafe,stroke:#0891b2,color:#000
     classDef proc fill:#ede9fe,stroke:#7c3aed,color:#000
     classDef api fill:#fee2e2,stroke:#dc2626,color:#000
     class KREST,KWS ext
     class POLLER,WSCONS ing
-    class TMARKETS,TSNAPS,TTRADES,TBOOK,TANOM db
+    class TMARKETS,TSNAPS,TTRADES,TBOOK,TANOM,TMETRICS,TNEWS db
+    class CHTRADES,CHQUOTES,CHL2 ch
     class CLASSIFIER,BOOKSIG,ENGINE,MAT proc
     class API,SPA api
 ```
@@ -149,7 +163,7 @@ flowchart TD
 
 ### How the pieces interact (short)
 
-- **REST poller / bootstrap** — cursor-swept market list; poller also runs the materializer each cycle. **Hydrator** — per-ticker REST for `status=unknown` stubs. **WS consumer** — one connection: `ticker`+`trade` and `orderbook_delta`; writes snapshots, trades, book rows; after each snapshot calls materialization.
+- **REST poller / bootstrap** — cursor-swept market list; poller also runs the materializer each cycle. **Hydrator** — per-ticker REST for `status=unknown` stubs. **WS consumer** — one connection: `ticker`+`trade` and `orderbook_delta`; reads into a bounded queue, worker tasks update Postgres projections, and retained raw events go to Postgres, ClickHouse, or both depending on `KALSHI_RAW_BACKEND`.
 - **Classifier** — four layers + `priorities.py` map; stamps `markets` on ingest. **Anomaly path** — `book_activity_signals` + last N snapshots → `anomaly_engine` (rolling z where possible) → `anomalies` rows. **Dashboard** — Vite/React reads `/api/dashboard/*`; dev uses Vite proxy; prod serves `frontend/dist` from FastAPI. **Kalshi auth** — RSA-PSS signing for REST and WS.
 
 ### Storage model
@@ -159,15 +173,20 @@ flowchart TD
 - **`trades`** — append-only public-trade tape (`trade_id` unique, `taker_side`, `count_fp`, `yes_price_dollars`, `no_price_dollars`, event-time `ts`, ingest-time `received_at`).
 - **`book_events`** — append-only order-book event log. Each row is one price level: snapshot rows (`is_snapshot=true`) carry the absolute level size in `size_fp`; delta rows carry a signed `delta_fp` (positive adds contracts, negative removes, zero removes the level). Stamped with `session_id` (per WS connection) and Kalshi's per-subscription `seq`. Idempotency is enforced by a unique constraint on `(session_id, seq, side, price_dollars)`.
 - **`anomalies`** — materialized output of the anomaly engine per `(market, latest_snapshot_id)` with `score`, `severity`, `reasons`, JSON `signals`.
+- **`market_metrics`** — compact serving projection keyed by `market_pk`: latest quote cents, volume/OI hints, trade/anomaly counters, storage tier, retention score/reasons, and dashboard scores. This is the first step toward serving market lists from tiny read models instead of raw tape scans.
+- **`market_features_1m`** — 1-minute feature row shape for compact trade/quote/L2 summaries. In Postgres for now; ClickHouse has a matching `SummingMergeTree` target in `sql/clickhouse_kalshi.sql`.
+- **`news_articles`, `market_news_profiles`, `news_events`, `case_evidence`** — scaffolding for global-first news ingest, article-to-market candidate links, pre-news trade scoring, and durable evidence bundles.
+- **ClickHouse raw hot tables** — optional, configured by `KALSHI_RAW_BACKEND`. `kalshi_trades_raw`, `kalshi_quote_changes_raw`, and `kalshi_l2_events_raw` keep compact integer/event rows with short TTLs; durable cases should be promoted to `case_evidence` / object storage instead of keeping every raw tick forever.
 
 ### Tooling
 
 - **Postgres** via SQLAlchemy 2 (`psycopg` driver) with **Alembic** migrations.
+- **ClickHouse** is available in `docker-compose.yml` for high-volume raw tape and L2 event storage. Schema lives in `sql/clickhouse_kalshi.sql`; writes are batched with `JSONEachRow`.
 - **FastAPI / Uvicorn** for the API.
 - **websockets** + **cryptography** for Kalshi WS auth and feed.
 - **pytest**, **ruff**, **mypy** for tests and linting.
 - **Vite 2.9 (not 4/5) + React 18 + TypeScript** for the frontend, with **Tailwind**, **TanStack Query**, **TanStack Table**, **TradingView lightweight-charts**, and **Recharts** — Vite 4+ requires **^14.18.0**; Vite 5 targets Node 18+ ESM. **Vite 2.9.18** runs on **Node ≥12.2** so 14.17.x and similar “almost LTS” runtimes do not need a system Node upgrade. See `frontend/package.json`.
-- **Redis** is configured in `app/core/config.py` (`redis_host`, `redis_port`) and a URL helper exists, but it is **not yet wired into any code path**. It is reserved for the queue / worker layer planned later.
+- **Redis** is configured in `app/core/config.py` and is used as a best-effort shared cache for dashboard payloads, with in-process cache fallback if Redis is unavailable.
 
 ### Local dev workflow
 
@@ -224,6 +243,7 @@ This section tracks the architectural decisions actually present in the code, pl
 - **`Numeric`, not `float`, for prices and volumes.** Money- and contract-quantity-like fields are stored at exchange precision (`Numeric(12, 4)` for dollar prices, `Numeric(18, 2)` for `*_fp` quantities) to avoid binary-floating-point error. The SQLAlchemy ORM types those columns as **`Decimal` / `Decimal | None` in `app/db/models.py`**; JSON responses still convert with `float()` at the API boundary.
 - **Idempotent ingest via `INSERT … ON CONFLICT DO NOTHING`.** Reconnects can replay messages. Trade ingest dedupes on `trade_id`; book-event ingest dedupes on `(session_id, seq, side, price_dollars)`. Either way, duplicates are a single cheap statement, not an exception path.
 - **One WebSocket connection, multiple channels, multiple `subscribe` commands.** `consume_market_data_forever` opens one authenticated WS and sends two `subscribe` commands on it — one for `ticker` + `trade` (no market filter), one for `orderbook_delta` with explicit `market_tickers`. Two commands rather than one because the channels need different `params` shapes; one connection rather than two because we want a single auth handshake, single heartbeat, and a single dispatcher in the message loop.
+- **Bounded WS ingest queue.** The socket reader no longer performs DB work inline. It puts decoded messages into an in-process bounded queue (`kalshi_ws_queue_size`, default 10k), and worker tasks (`kalshi_ws_worker_count`, default 4) run the synchronous handlers in threads. That gives explicit backpressure and keeps WebSocket reads from stalling on per-message database latency.
 - **Per-connection `session_id` for the book stream.** Kalshi's `seq` is per-subscription and resets on reconnect, so it is not a globally stable identifier. We generate a UUID per WS connection and stamp it on every `book_events` row. Idempotency, gap detection, and replay all use `(session_id, seq)`; a new `is_snapshot=true` row inside a new `session_id` is the natural marker of a session boundary.
 - **Selective `orderbook_delta` subscription, ranked by lifetime volume.** Unlike `ticker` and `trade`, the book channel requires explicit market tickers. The consumer takes either a configured `kalshi_book_market_tickers` list, or — when none is configured — picks the top `kalshi_book_market_limit` (default 50) markets by `volume_fp` (lifetime cumulative volume) from each market's most recent snapshot, with a `Market.updated_at desc` cold-start fallback when no snapshot has positive volume yet. Lifetime, not 24h, because the Kalshi WS ticker payload does **not** include `volume_24h_fp`, so a 24h ranker would silently exclude every market we've seen via WS — exactly the actively-trading set we care about. The set is resolved once per connection; updating it mid-session via `update_subscription` is deferred.
 - **Lazy upsert of unknown tickers from the WS feed.** The `ticker` and `trade` channels are unfiltered, so the WS feed will emit messages for markets that are not yet in `markets` (Kalshi creates new BTC / sports markets continuously, and a one-shot REST bootstrap can be biased by Kalshi's alphabetical pagination). Rather than dropping those messages, `_get_or_create_market` does an idempotent `INSERT ... ON CONFLICT DO NOTHING` keyed on `markets.market_id` and re-selects, so every unknown ticker is auto-promoted to a stub `Market` row carrying `status='unknown'` as a sentinel. The REST poller is the single writer that hydrates the rest of the metadata (title, event_ticker, open/close times) on a later sweep. Orderbook handlers stay strict — by construction, anything we receive on `orderbook_delta` was a market we explicitly asked for, so an unknown ticker there would be a real bug rather than a discovery.
@@ -231,26 +251,40 @@ This section tracks the architectural decisions actually present in the code, pl
 - **Per-table replay-ordering indexes.** Each event table has a per-market access path tuned to its data, rather than one uniform composite. The dominant detector query is *"give me events for market M in order between t1 and t2"*; the right key for that query depends on whether the table's event-time column is reliable.
   - `trades` indexes `(market_pk, ts)`. `ts` (Kalshi's `ts_ms`) is non-null on every row and is what every detector joins on.
   - `book_events` indexes `(market_pk, id)` instead. Snapshot rows do not carry `ts_ms`, so `ts` is nullable; the autoincrement `id` is monotonic per insert and never null, which is what replays actually need.
-  - `market_snapshots` currently has separate single-column `market_pk` and `ts` indexes (pre-existing); tightening to a composite `(market_pk, ts)` is an obvious follow-up but has not been done yet.
+  - The latest migration adds newest-first composite indexes for hot read paths: snapshots by `(market_pk, ts desc, id desc)`, trades by `(market_pk, ts desc, id desc)`, recent book events by `(market_pk, received_at desc)`, and anomalies by market/severity plus created time.
 - **Unique external IDs as constraints.** `markets.market_id` and `trades.trade_id` are both indexed `UNIQUE`. Dedup is enforced by the database, not application logic.
 - **Anomaly engine + book hints + persistence gate.** `analyze_market` uses **rolling z-scores** (stricter `z` in code than a naive 2.0) on spread, ref-price change, and volume delta when enough history exists (default 40 snapshots in the materializer); otherwise static fallbacks. `book_activity_signals` adds points from **high order-book event rate** and **sustained cancel/pull** in a 3-minute window. **`materialize_market_anomaly` only creates/keeps a row** when the computed score is **≥ 3.0**; weaker snapshots delete a row for the same `latest_snapshot_id` so the DB and chart are not full of one-rule “low” noise. **No full L2 reconstruction in RAM yet** — churn heuristics only; a real spoofing detector would rebuild the book from `book_events`.
 - **Per-trade outlier (API).** `trade_suspicion.py` scores each print vs a local window and returns **0..10** for the series response only; it does not write `anomalies`. The market-detail table labels this **Outlier** (not “suspicious trade”).
 - **Burst / cluster (API, tape-only).** `trade_burst.py` measures dense same-side windows (default 30s) on the same ascending tape as the chart; the series response adds per-trade `cluster_0_10` and a `tape_cluster` summary. It is a behavioral cluster *hypothesis* — Kalshi’s public API does not expose account ids, so the UI phrasing does not assert identity.
 - **Explicit priority vs evidence in JSON.** `app/services/surveillance_scores.py` defines **0..100** `evidence_score` and `urgency_score`, plus a string `market_priority` (classifier `manipulability_prior` or `unclassified`) and `reasons[]` (deduped **snake_case** slugs from materialized `anomalies.reasons` for that market). The dashboard list/detail/series endpoints in `app/api/routes/dashboard.py` expose these in addition to the legacy `manipulability_prior` / `anomaly_count` fields the UI already had.
 - **Legacy JSON routes (compat only).** `app/api/routes/markets.py`, `app/api/routes/features.py`, and `app/api/routes/anomalies.py` remain registered under `/api/...` for old scripts, but the routers and operations are **marked deprecated** in the OpenAPI schema; the product contract is `/api/dashboard/*` used by the React app.
-- **Per-message DB lookup for `market_pk`, with lazy upsert on miss.** Each handler resolves `market_ticker → market_pk` via a fresh DB query rather than caching the mapping. On a miss for `ticker` / `trade`, the handler falls through to the lazy-upsert path described above instead of dropping the message. This is intentionally naive in v1; if profiling under real book volume shows it as the bottleneck, an in-process LRU populated lazily (and invalidated when the REST poller updates a market) is the obvious next step.
-- **Redis is declared but not used.** It is reserved for the planned queue / worker layer that will sit between WS ingest and the anomaly path. Wiring it in too early would be premature.
+- **Per-message DB lookup for `market_pk`, with lazy upsert on miss.** Each handler resolves `market_ticker → market_pk` via a fresh DB query rather than caching the mapping. On a miss for `ticker` / `trade`, the handler falls through to the lazy-upsert path described above instead of dropping the message. This is still intentionally simple; the bounded queue and ClickHouse batcher address write pressure first.
+- **Dashboard cache uses Redis when available.** `_cached_dashboard_payload` checks Redis first, then the in-process TTL cache. Redis failure is non-fatal; the process logs at debug and falls back to local memory.
 - **Backoff / reconnect on WS failures.** `consume_market_data_forever` reconnects with exponential backoff capped at 30s, so a transient Kalshi or network blip doesn't kill the consumer.
 - **Periodic universe sweep, not single-page polling.** Both `scripts/bootstrap_markets.py` (one-shot) and `scripts/poll_markets.py` (interval-driven) walk Kalshi's `cursor`-based pagination via `iter_markets(status="open")` and ingest in fixed-size batches. The pre-fix poller called `get_markets(limit=25)` once per cycle, which meant the alphabetical front-load (~50k dead `KXMVECROSSCATEGORY...` markets) was the only thing it ever touched, and the lazy-upsert backlog from the WS feed was never hydrated. Sweeping the full open set is the only design that keeps the WS feed and REST metadata in sync without a per-ticker hydration endpoint. Defaults: `interval=300s`, `batch=500`. Both scripts share a `chunked()` helper in `app/services/market_ingestor.py` so the iteration shape stays in one place.
 - **Targeted hydration of the lazy-upsert backlog (per-ticker REST).** The bulk `/markets` sweep is filtered by `status=open`, but Kalshi's high-trade-count markets right now (live NBA / MLB / UFC games, BTC 15-minute strikes that just expired) are `'active'` or `'finalized'`, not `'open'`. So the bulk sweep would never hydrate them and the dashboard would show them as `KXNBAGAME-...` ticker strings forever. `scripts/hydrate_unknown_markets.py` solves this by hitting Kalshi's per-ticker `/markets/{ticker}` endpoint for each row with `status='unknown'`. With `--top-by-trades` it orders the queue by descending `count(*)` from `trades`, so dashboard-visible markets get hydrated first. ~20 req/s with the default sleep is comfortably under any sane rate limit and drains 50 markets in ~25 seconds. This script is a backlog drainer, not a long-running daemon — it exits when the queue is empty.
 - **Frontend split: SPA in `frontend/`, JSON API in FastAPI.** The previous "embedded HTML in a Python module" dashboard was demoable but capped what surveillance UI we could build — no real charting, no per-market drill-down, no virtualised tables for the 24k-market universe. The current design separates the two halves on a clean JSON contract: FastAPI exposes everything the dashboard needs under `/api/dashboard/*` (typed responses, paginated, filterable), and a Vite + React + TypeScript frontend in `frontend/` consumes that surface. Pinned trade-offs: (1) **No SSR / Next.js.** Dashboard is read-only and authenticated-server-side eventually; client-side fetching with TanStack Query is enough and keeps the build trivial. (2) **No global state library.** All shared state (filters, search, sort, pagination) lives in URL search params via `react-router-dom`'s `useSearchParams` so a copy-pasted link reproduces the exact same filtered view, and TanStack Query handles server-state caching. (3) **TanStack Table over a custom grid.** 24k markets is well within its virtualised-row capacity; rolling our own would be busywork. (4) **TradingView `lightweight-charts` over Recharts for the price chart.** Same library Polymarket / Kalshi use; built-in crosshair, time-axis zoom, anomaly-marker overlay (`setMarkers`). Recharts is reserved for the small breakdown bar charts where its declarative React API wins. (5) **Single-process production deploy.** No nginx, no separate static host: FastAPI's catch-all route serves `frontend/dist/index.html` plus `assets/` directly. Mounting `StaticFiles(html=True)` at `/` was tried first and rejected because Starlette's mount-at-root absorbs sibling routes including `/api/*`; a path-based catch-all that explicitly skips reserved prefixes (`api/`, `docs`, `redoc`, `openapi.json`) routes correctly without trickery. (6) **Public-API namespace moved under `/api/*`.** `/health`, `/markets`, `/anomalies`, `/features` all gained the `/api` prefix so the SPA can own URL paths like `/markets/:id` without colliding. The router files themselves don't carry an `/api` prefix; it's added in `app/main.py` via `include_router(prefix="/api")` so each router stays composable in isolation. (7) **GDELT for correlated news, with explicit graceful degradation.** The detail page's news panel hits GDELT 2.0's free DOC API with a 5-second timeout. Any failure (network, parse, GDELT down) returns `provider="unavailable"` with an empty article list; the frontend renders an empty state rather than an error toast. Meaningful: the project is graded on its surveillance backend, not its news vendor — this fails open instead of breaking the page.
-- **Raw tape / L2 (second disk tier).** In-scope markets still get `market_snapshots` and `anomaly_materializer`. **`trades` and `book_events` are further gated** in `app/services/retention.py` via `should_persist_raw_tape`: we append raw tape and order-book rows only if `manipulability_prior` is `high` or `medium_high`, or 24h volume / OI are above code constants, or the market’s `close_time` is within the next 14 days, or a materialized `anomalies` row exists. `app/services/kalshi_ws.py` enforces that at ingest (ticker message updates an in-process volume cache; cold markets that later earn an `anomalies` row then persist tape). The market-detail chart is empty for markets that are cold on all dimensions — the UI can still use REST snapshot fields. **One-off space reclaim (optional):** `scripts/prune_old_book_events.py` (dry-run by default) mass-deletes old `book_events` by `received_at`.
+- **Tiered raw retention instead of a boolean gate.** In-scope markets still update projections and anomaly state, but raw event storage now flows through `storage_decision_for_event`: `observe_only`, `sampled`, `hot`, `triggered`, or `case`. The score combines prior, close-time, 24h volume, OI, materialized anomalies, news-match/pre-news signals, trade bursts, and L2 pull signals. `should_persist_raw_tape` remains as a compatibility wrapper, but new code can inspect the full tier, score, TTL, sample rate, and reason list. Quiet markets can update `market_metrics` without writing raw tape; sampled/hot/triggered/case markets retain compact raw rows.
+- **ClickHouse raw backend rollout.** `KALSHI_RAW_BACKEND=postgres` is the default and preserves the old Postgres raw tables. `dual` writes Postgres plus batched ClickHouse rows; trade rows are only enqueued after Postgres accepts the `trade_id`, so reconnect replays are not forwarded during rollout. `clickhouse` keeps raw trade/quote/L2 in ClickHouse only while Postgres projections still update. The batcher flushes on `CLICKHOUSE_BATCH_MAX_ROWS` or `CLICKHOUSE_BATCH_FLUSH_INTERVAL_SEC`, and logs/drops rows if the bounded batch queue is full.
+- **Projection-first serving direction.** `market_metrics` stores latest quote cents, volume/OI hints, counters, retention tier, and score reasons. Today the dashboard still has legacy raw-table queries in places; the intended direction is to move list/overview reads onto `market_metrics` and compact feature tables while raw ClickHouse data expires quickly unless promoted as evidence.
+- **Global-first news correlation scaffolding.** The detail page still has GDELT-on-demand, but the storage model now includes `news_articles`, `market_news_profiles`, `news_events`, and `case_evidence` so a scraper can ingest news globally, candidate-link articles to markets, score pre-news activity, and promote durable evidence bundles.
 - **Retention / scope policy in one place.** Whether a market deserves to be in the surveillance universe at all is a single decision encoded in `app/services/retention.py`: `EXCLUDED_CATEGORIES = {"exotic_combo", "crypto_strike"}` and `EXCLUDED_PRIORS = {"very_low"}`. Both the REST ingestor (`ingest_markets_payload`) and the WS lazy-upsert path (`_get_or_create_market`) call into the same predicate, so out-of-scope markets are dropped at the door — the classifier runs once per ingest, and the same `Classification` powers both the scope decision and the row stamping. The policy is a frozenset module constant rather than env config because "what does our system pay attention to" is the kind of decision a regulator wants to see in code review, not in a `.env`. Retroactive cleanup (`scripts/prune_markets.py`) reads the same predicate and uses the DB-level `ON DELETE CASCADE` (added in migration `f1a2c3d4b5e6`) so a single `DELETE FROM markets WHERE ...` cleans up every dependent row in `market_snapshots` / `trades` / `book_events` / `anomalies` — no slow ORM iteration, no orphaned children. Today's exclusions: Kalshi's `KXMVECROSSCATEGORY-*` parlay catalog (~285k rows of derived combinations whose manipulability-prior really should come from the constituent legs, which is a v2 problem) and `weather` (public physical underlying, no insider-leakable signal). Specifically *not* excluded: `low` priors like crypto strikes, because the trade tape itself can still surface spoofing / momentum-ignition signals that don't depend on the underlying being insider-leakable.
 - **Layered classifier with explicit confidence.** Markets are classified into a category / subcategory / manipulability-prior tuple by a four-layer pipeline (`app/services/classifier/`): Kalshi taxonomy adapter → ticker / regex prefix rules → k-NN over a small char-n-gram TF-IDF seed corpus → optional LLM zero-shot fallback. The first layer that returns `confidence != "low"` wins; lower-confidence verdicts are kept only as fallback when every later layer also abstains. The priority map (`priorities.py`) is the *only* place a human value judgment lives in the codebase — the classifiers themselves are mechanical. Trade-offs the design pins down: (1) **Off-the-shelf, not a trained model.** No labels, no class-imbalance fixes, no retraining cadence, and the explanation `"matched_rule=sports.ufc"` is regulator-defensible in a way that a model output isn't. (2) **No torch / sentence-transformers dep.** The k-NN layer is pure-stdlib char-n-gram TF-IDF — slightly less accurate than a sentence transformer but ~5MB instead of ~700MB, and the public API of the layer is the same so we can swap implementations if accuracy ever becomes the bottleneck. (3) **Layer 4 (LLM) defaults to a no-op.** Setting `default_llm_classifier()` to return `NullLLMClassifier()` means the orchestrator has a 4-layer architecture but the default deployment runs only 3 — opting in to Ollama / a cloud LLM is one config change. (4) **Low-confidence safety clamp.** When the orchestrator's final verdict is `confidence="low"`, `manipulability_prior` is clamped down from `high`/`medium_high` to `medium` so a misclassified market can't escalate onto the high-prior watchlist. (5) **Versioning.** A `CLASSIFIER_VERSION` int travels with every classification; a backfill script reclassifies on bump. Cosmetic refactors don't touch it; rule / seed / map changes do.
 
 ### Recent changes
 
 Most recent first.
+
+#### 2026-04-26 — Optimization pass: tiered retention, projections, ClickHouse raw batching
+
+- **Tiered retention:** `app/services/retention.py` now returns a `StorageDecision` (`observe_only`, `sampled`, `hot`, `triggered`, `case`) with score, TTL, sample rate, and reasons. The old `should_persist_raw_tape` remains as a compatibility wrapper.
+- **Postgres projections / news / cases:** migration `9c0d4e5f6a71` adds `market_metrics`, `market_features_1m`, `news_articles`, `market_news_profiles`, `news_events`, and `case_evidence`, plus composite indexes for newest-first snapshot/trade/book/anomaly reads.
+- **WebSocket hot path:** `kalshi_ws.consume_market_data_forever` now feeds a bounded queue and worker tasks instead of running DB work directly in the socket read loop.
+- **ClickHouse batching:** `app/services/clickhouse_writer.py` provides a background `ClickHouseBatcher`; retained trades, quote changes, and L2 events enqueue compact integer rows to `kalshi_trades_raw`, `kalshi_quote_changes_raw`, and `kalshi_l2_events_raw` when `KALSHI_RAW_BACKEND` is `dual` or `clickhouse`.
+- **Rollout modes:** `KALSHI_RAW_BACKEND=postgres` keeps existing behavior, `dual` writes Postgres + ClickHouse, and `clickhouse` stores raw tape in ClickHouse while Postgres projections continue to update.
+- **Dashboard cache:** `/api/dashboard/*` cache reads/writes Redis when available and falls back to the existing in-process TTL cache.
+- **Local infra:** `docker-compose.yml` now includes ClickHouse; `sql/clickhouse_kalshi.sql` creates the raw hot tables and 1m feature table.
+- **Tests:** `pytest` passes (`130 passed, 21 skipped` after the batching change); focused WS tests cover dual-write ClickHouse enqueue behavior.
 
 #### 2026-04-26 — Frontend: blank page diagnostics (error boundary + boot HTML)
 
@@ -548,14 +582,24 @@ Top book-receiving markets after the third fix were exactly the ones surveillanc
 
 ## Running locally
 
-Prerequisites: Python 3.11+, a Postgres instance, and Kalshi API credentials (`KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`).
+Prerequisites: Python 3.11+, Postgres, and Kalshi API credentials (`KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`). Docker Compose includes Postgres, Redis, and ClickHouse for the local stack.
 
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt   # Windows; use .venv/bin/pip on *nix
 
-# Configure .env (postgres_*, redis_*, kalshi_* — see app/core/config.py)
+# Configure .env (postgres_*, redis_*, kalshi_*, clickhouse_* — see app/core/config.py)
+docker compose up -d postgres redis clickhouse
 .venv/Scripts/python -m alembic upgrade head
+
+# Optional raw ClickHouse store. Run once after ClickHouse starts.
+# PowerShell:
+Get-Content sql/clickhouse_kalshi.sql | docker compose exec -T clickhouse clickhouse-client --multiquery
+
+# Raw backend rollout modes:
+#   KALSHI_RAW_BACKEND=postgres    # default: existing Postgres raw tables
+#   KALSHI_RAW_BACKEND=dual        # Postgres + batched ClickHouse
+#   KALSHI_RAW_BACKEND=clickhouse  # ClickHouse raw tape only, Postgres projections still update
 
 # One-shot universe bootstrap (paginated cursor sweep over open markets)
 PYTHONPATH=. .venv/Scripts/python -m scripts.bootstrap_markets --status open

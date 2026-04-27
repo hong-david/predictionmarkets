@@ -64,9 +64,11 @@ How operators can override:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Protocol
+from hashlib import blake2b
+from typing import Literal, Protocol
 
 from app.services.classifier import Classification, classify
 
@@ -99,12 +101,51 @@ RAW_TAPE_MIN_VOLUME_24H = Decimal("250")  # contracts; from ticker 24h field
 RAW_TAPE_MIN_OPEN_INTEREST = Decimal("200")
 RAW_TAPE_CLOSING_SOON_DAYS = 14
 
+StorageTier = Literal["ignored", "observe_only", "sampled", "hot", "triggered", "case"]
+
+
+@dataclass(frozen=True)
+class StorageDecision:
+    """Auditable retention result for one market/event.
+
+    `process_realtime` means the event should still feed stateful detectors.
+    `store_raw_hot` is the current Postgres/ClickHouse raw-write gate.
+    `store_case_evidence` means the surrounding window should be promoted to
+    durable evidence storage instead of expiring with normal hot TTL.
+    """
+
+    tier: StorageTier
+    score: int
+    process_realtime: bool
+    store_raw_hot: bool
+    raw_ttl_hours: int | None
+    store_features: bool
+    store_case_evidence: bool
+    sample_rate: float
+    reasons: tuple[str, ...]
+
+    @property
+    def persist_raw_tape(self) -> bool:
+        return self.store_raw_hot
+
 
 class _MarketForTape(Protocol):
     """Duck-typed `Market` row field access for `should_persist_raw_tape`."""
 
     manipulability_prior: str | None
     close_time: datetime | None
+
+
+@dataclass(frozen=True)
+class RetentionSignals:
+    """Extra streaming signals that can promote an otherwise quiet market."""
+
+    recent_price_zscore: float | None = None
+    trade_burst_score: float | None = None
+    news_match_score: float | None = None
+    pre_news_directional_move: bool = False
+    l2_pull_score: float | None = None
+    severe_anomaly: bool = False
 
 
 def _market_closes_within_days(
@@ -142,18 +183,122 @@ def should_persist_raw_tape(
     pass ``has_materialized_anomaly=True`` to avoid a DB round-trip; otherwise
     the WS path queries once when the cheap predicates fail.
     """
-    if has_materialized_anomaly:
-        return True
+    return storage_decision_for_event(
+        market,
+        volume_24h_fp=volume_24h_fp,
+        open_interest_fp=open_interest_fp,
+        has_materialized_anomaly=has_materialized_anomaly,
+        now=now,
+    ).persist_raw_tape
+
+
+def retention_score(
+    market: _MarketForTape,
+    *,
+    volume_24h_fp: Decimal | None,
+    open_interest_fp: Decimal | None,
+    has_materialized_anomaly: bool = False,
+    signals: RetentionSignals | None = None,
+    now: datetime | None = None,
+) -> tuple[int, tuple[str, ...]]:
+    """Score how much raw evidence this market/event deserves to retain."""
     tnow = now or datetime.now(timezone.utc)
+    sig = signals or RetentionSignals()
+    score = 0
+    reasons: list[str] = []
+
     if market.manipulability_prior in RAW_TAPE_HIGH_PRIORS:
-        return True
+        score += 30
+        reasons.append("high_prior")
+    elif market.manipulability_prior == "medium":
+        score += 10
+        reasons.append("medium_prior")
+
     if _market_closes_within_days(market, tnow, days=RAW_TAPE_CLOSING_SOON_DAYS):
-        return True
+        score += 20
+        reasons.append("closing_soon")
     if volume_24h_fp is not None and volume_24h_fp >= RAW_TAPE_MIN_VOLUME_24H:
-        return True
+        score += 15
+        reasons.append("volume_24h_floor")
     if open_interest_fp is not None and open_interest_fp >= RAW_TAPE_MIN_OPEN_INTEREST:
+        score += 10
+        reasons.append("open_interest_floor")
+    if has_materialized_anomaly:
+        score += 35
+        reasons.append("materialized_anomaly")
+    if sig.severe_anomaly:
+        score += 40
+        reasons.append("severe_anomaly")
+    if sig.recent_price_zscore is not None and sig.recent_price_zscore >= 3:
+        score += 25
+        reasons.append("price_zscore")
+    if sig.trade_burst_score is not None and sig.trade_burst_score >= 3:
+        score += 25
+        reasons.append("trade_burst")
+    if sig.news_match_score is not None and sig.news_match_score >= 0.75:
+        score += 30
+        reasons.append("news_match")
+    if sig.pre_news_directional_move:
+        score += 40
+        reasons.append("pre_news_directional_move")
+    if sig.l2_pull_score is not None and sig.l2_pull_score >= 3:
+        score += 20
+        reasons.append("l2_pull")
+
+    return score, tuple(reasons)
+
+
+def storage_decision_for_event(
+    market: _MarketForTape,
+    *,
+    volume_24h_fp: Decimal | None,
+    open_interest_fp: Decimal | None,
+    has_materialized_anomaly: bool = False,
+    signals: RetentionSignals | None = None,
+    now: datetime | None = None,
+) -> StorageDecision:
+    """Tiered retention policy for raw Kalshi events and derived features."""
+    score, reasons = retention_score(
+        market,
+        volume_24h_fp=volume_24h_fp,
+        open_interest_fp=open_interest_fp,
+        has_materialized_anomaly=has_materialized_anomaly,
+        signals=signals,
+        now=now,
+    )
+
+    if score >= 110:
+        return StorageDecision(
+            "case", score, True, True, None, True, True, 1.0, reasons
+        )
+    if score >= 80:
+        return StorageDecision(
+            "triggered", score, True, True, 720, True, True, 1.0, reasons
+        )
+    if score >= 50:
+        return StorageDecision("hot", score, True, True, 168, True, False, 1.0, reasons)
+    if score >= 20:
+        return StorageDecision(
+            "sampled", score, True, True, 24, True, False, 0.1, reasons
+        )
+    if score >= 0:
+        return StorageDecision(
+            "observe_only", score, True, False, 1, True, False, 0.0, reasons
+        )
+    return StorageDecision(
+        "ignored", score, False, False, None, False, False, 0.0, reasons
+    )
+
+
+def should_sample_event(key: str, sample_rate: float) -> bool:
+    """Deterministic sampler so reconnect replays make the same retain/drop choice."""
+    if sample_rate >= 1:
         return True
-    return False
+    if sample_rate <= 0:
+        return False
+    digest = blake2b(key.encode("utf-8"), digest_size=8).digest()
+    bucket = int.from_bytes(digest, "big") / float(2**64 - 1)
+    return bucket < sample_rate
 
 
 def is_in_scope(c: Classification) -> bool:
