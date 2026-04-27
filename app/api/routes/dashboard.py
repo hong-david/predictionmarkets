@@ -525,6 +525,149 @@ def _recent_anomalies_payload(db: Session, limit: int, severity: str | None) -> 
     }
 
 
+def _components_dict(event: NewsEvent) -> dict:
+    return event.score_components if isinstance(event.score_components, dict) else {}
+
+
+def _is_weak_factor_only_news_event(event: NewsEvent) -> bool:
+    components = _components_dict(event)
+    direction = components.get("market_direction")
+    candidate = components.get("candidate_generation")
+    if not isinstance(direction, dict) or not isinstance(candidate, dict):
+        return False
+    if direction.get("label") != "ambiguous":
+        return False
+    direct_scores = (
+        "lexical_relevance",
+        "entity_relevance",
+        "alias_relevance",
+    )
+    if any(float(components.get(key) or 0.0) > 0 for key in direct_scores):
+        return False
+    reasons = candidate.get("candidate_reasons")
+    if not isinstance(reasons, list) or reasons != ["category_factor"]:
+        return False
+    return float(components.get("factor_relevance") or 0.0) > 0
+
+
+def _linked_news_article_payload(
+    event: NewsEvent,
+    article: NewsArticle,
+    *,
+    include_components: bool = True,
+) -> dict:
+    components = _components_dict(event)
+    direction = components.get("market_direction")
+    if not isinstance(direction, dict):
+        direction = {}
+    correlation = components.get("news_trade_correlation")
+    if not isinstance(correlation, dict):
+        correlation = {}
+    payload = {
+        "event_id": event.id,
+        "article_id": article.id,
+        "title": article.title,
+        "url": article.canonical_url,
+        "source": article.domain,
+        "language": article.language,
+        "published_at": article.published_at.isoformat()
+        if article.published_at
+        else None,
+        "first_seen_at": article.first_seen_at.isoformat()
+        if article.first_seen_at
+        else None,
+        "tone": None,
+        "relevance_score": float(event.relevance_score or 0.0),
+        "pre_news_trade_score": float(event.pre_news_trade_score or 0.0),
+        "status": event.status,
+        "leakage_window_seconds": event.leakage_window_seconds,
+        "market_direction": direction,
+        "direction_label": direction.get("label"),
+        "direction_confidence": direction.get("confidence"),
+        "reasons": correlation.get("reasons") or [],
+        "best_trade": correlation.get("best_trade"),
+    }
+    if include_components:
+        payload["news_trade_correlation"] = correlation
+    return payload
+
+
+def _news_signal_payload(
+    event: NewsEvent,
+    article: NewsArticle,
+    market: Market,
+) -> dict:
+    article_payload = _linked_news_article_payload(event, article)
+    return {
+        "event_id": event.id,
+        "market_id": market.market_id,
+        "event_market_id": market.event_id,
+        "title": market.title,
+        "subtitle": market.subtitle,
+        "category": market.category,
+        "manipulability_prior": market.manipulability_prior,
+        "article": article_payload,
+        "article_title": article.title,
+        "article_url": article.canonical_url,
+        "article_source": article.domain,
+        "first_seen_at": article_payload["first_seen_at"],
+        "relevance_score": article_payload["relevance_score"],
+        "pre_news_trade_score": article_payload["pre_news_trade_score"],
+        "status": event.status,
+        "leakage_window_seconds": event.leakage_window_seconds,
+        "direction_label": article_payload["direction_label"],
+        "direction_confidence": article_payload["direction_confidence"],
+        "reasons": article_payload["reasons"],
+        "best_trade": article_payload["best_trade"],
+    }
+
+
+def _news_signals_payload(
+    db: Session,
+    *,
+    limit: int,
+    min_score: float,
+    status: str | None = None,
+    include_ambiguous: bool = False,
+) -> dict:
+    q = (
+        db.query(NewsEvent, NewsArticle, Market)
+        .join(NewsArticle, NewsArticle.id == NewsEvent.article_id)
+        .join(Market, Market.id == NewsEvent.market_pk)
+        .filter(*_hydrated_market_filters())
+        .filter(NewsEvent.pre_news_trade_score >= min_score)
+    )
+    if status:
+        q = q.filter(NewsEvent.status == status)
+    rows = (
+        q.order_by(
+            NewsEvent.pre_news_trade_score.desc(),
+            NewsArticle.first_seen_at.desc(),
+            NewsEvent.id.desc(),
+        )
+        .limit(limit if include_ambiguous else limit * 5)
+        .all()
+    )
+    signals: list[dict] = []
+    for event, article, market in rows:
+        if _is_weak_factor_only_news_event(event):
+            continue
+        payload = _news_signal_payload(event, article, market)
+        if (
+            not include_ambiguous
+            and payload["direction_label"] not in {"supports_yes", "supports_no"}
+        ):
+            continue
+        signals.append(payload)
+        if len(signals) >= limit:
+            break
+    return {
+        "count": len(signals),
+        "min_score": min_score,
+        "signals": signals,
+    }
+
+
 def _suspicious_trades_payload(
     db: Session,
     *,
@@ -703,6 +846,11 @@ def get_dashboard_overview(
             "top_markets": _top_markets_payload(db, top),
             "recent_anomalies": _recent_anomalies_payload(db, anomalies, severity),
             "suspicious_trades": _suspicious_trades_payload(db, limit=12),
+            "news_signals": _news_signals_payload(
+                db,
+                limit=8,
+                min_score=4.0,
+            ),
         },
     )
 
@@ -1316,10 +1464,62 @@ def get_suspicious_trades(
     )
 
 
+@router.get("/news-signals")
+def get_news_signals(
+    limit: int = Query(default=25, ge=1, le=100),
+    min_score: float = Query(default=4.0, ge=0.0, le=10.0),
+    status: str | None = Query(default=None),
+    include_ambiguous: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _cached_dashboard_payload(
+        f"news_signals:{limit}:{min_score}:{status or ''}:{int(include_ambiguous)}",
+        lambda: _news_signals_payload(
+            db,
+            limit=limit,
+            min_score=min_score,
+            status=status,
+            include_ambiguous=include_ambiguous,
+        ),
+    )
+
+
 # --- /news (GDELT 2.0 DOC API with graceful degradation) --------------------
 
 
 _GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+
+def _stored_news_for_market(
+    db: Session,
+    market: Market,
+    *,
+    limit: int,
+    align: str,
+) -> list[dict]:
+    q = (
+        db.query(NewsEvent, NewsArticle)
+        .join(NewsArticle, NewsArticle.id == NewsEvent.article_id)
+        .filter(NewsEvent.market_pk == market.id)
+        .filter(NewsEvent.relevance_score >= 0.35)
+    )
+    if align == "activity":
+        q = q.order_by(
+            NewsEvent.pre_news_trade_score.desc(),
+            NewsArticle.first_seen_at.desc(),
+            NewsEvent.id.desc(),
+        )
+    else:
+        q = q.order_by(NewsArticle.first_seen_at.desc(), NewsEvent.id.desc())
+    rows = q.limit(limit * 3).all()
+    out: list[dict] = []
+    for event, article in rows:
+        if _is_weak_factor_only_news_event(event):
+            continue
+        out.append(_linked_news_article_payload(event, article))
+        if len(out) >= limit:
+            break
+    return out
 
 
 @router.get("/markets/{market_id}/news")
@@ -1372,6 +1572,20 @@ async def get_market_news(
 
     if not query.strip():
         return {**payload, "provider": "unavailable", "error": "empty query"}
+
+    stored_articles = _stored_news_for_market(
+        db,
+        market,
+        limit=limit,
+        align=align,
+    )
+    if stored_articles:
+        return {
+            **payload,
+            "provider": "stored",
+            "articles": stored_articles,
+            "stored_event_count": len(stored_articles),
+        }
 
     params = {
         "query": query,

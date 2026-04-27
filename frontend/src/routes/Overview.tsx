@@ -12,7 +12,7 @@ import {
 import { Link, useNavigate } from "react-router-dom";
 
 import { api } from "@/api/client";
-import type { BreakdownEntry, SuspiciousTrade } from "@/api/types";
+import type { BreakdownEntry, NewsSignal, SuspiciousTrade } from "@/api/types";
 import { Badge, severityVariant } from "@/components/Badge";
 import { Card, CardBody, CardHeader } from "@/components/Card";
 import { MarketCell } from "@/components/MarketCell";
@@ -97,6 +97,7 @@ export default function OverviewPage() {
   const topM = overview.data?.top_markets;
   const recentFlags = overview.data?.recent_anomalies;
   const suspiciousTrades = overview.data?.suspicious_trades;
+  const newsSignals = overview.data?.news_signals;
 
   const updated = overview.dataUpdatedAt
     ? `updated ${fmtAgo(new Date(overview.dataUpdatedAt).toISOString())}`
@@ -397,6 +398,44 @@ export default function OverviewPage() {
 
       <Card>
         <CardHeader
+          title="News-linked signals"
+          subtitle="Linked articles ranked by pre-news trade alignment. These scores combine relevance, YES/NO direction, timing, and market tape behavior."
+          right={
+            newsSignals
+              ? `${fmtInt(newsSignals.count)} at score ${newsSignals.min_score.toFixed(1)}+`
+              : undefined
+          }
+        />
+        <div className="overflow-x-auto">
+          {overview.isPending ? (
+            <div className="p-4">
+              <Skeleton className="h-32" />
+            </div>
+          ) : !newsSignals?.signals.length ? (
+            <EmptyState>No news-linked trade signals materialized yet.</EmptyState>
+          ) : (
+            <table className="w-full">
+              <thead>
+                <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-card/40">
+                  <th className="text-left px-4 py-2.5 font-medium">Market</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Article</th>
+                  <th className="text-right px-3 py-2.5 font-medium">Score</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Direction</th>
+                  <th className="text-left px-3 py-2.5 font-medium">Why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {newsSignals.signals.map((signal) => (
+                  <NewsSignalRow key={signal.event_id} signal={signal} />
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </Card>
+
+      <Card>
+        <CardHeader
           title="Most unusual prints"
           subtitle="Local outlier score from public tape only: size vs this market's recent prints, price jump, and same-side clustering. This is triage, not an insider-trading verdict."
           right={
@@ -434,6 +473,66 @@ export default function OverviewPage() {
         </div>
       </Card>
     </div>
+  );
+}
+
+function NewsSignalRow({ signal }: { signal: NewsSignal }) {
+  const href = `/markets/${encodeURIComponent(signal.market_id)}`;
+  const leakageMinutes =
+    signal.leakage_window_seconds != null
+      ? Math.round(signal.leakage_window_seconds / 60)
+      : null;
+  return (
+    <tr className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors">
+      <td className="px-4 py-2.5">
+        <Link to={href}>
+          <MarketCell market={signal} showPrior link={false} />
+        </Link>
+      </td>
+      <td className="px-3 py-2.5 max-w-[420px]">
+        <a
+          href={signal.article_url ?? "#"}
+          target="_blank"
+          rel="noreferrer"
+          className="block text-sm font-medium leading-tight hover:text-primary line-clamp-2"
+        >
+          {signal.article_title}
+        </a>
+        <div className="mt-1 text-xs text-muted-foreground">
+          {signal.article_source ?? "unknown source"}
+          {signal.first_seen_at ? (
+            <>
+              <span> · </span>
+              <span>{fmtAgo(signal.first_seen_at)}</span>
+            </>
+          ) : null}
+          {leakageMinutes != null ? (
+            <>
+              <span> · </span>
+              <span>{fmtInt(leakageMinutes)}m lead</span>
+            </>
+          ) : null}
+        </div>
+      </td>
+      <td className="px-3 py-2.5 text-right num font-semibold text-[hsl(var(--severity-high))]">
+        {signal.pre_news_trade_score.toFixed(2)}
+      </td>
+      <td className="px-3 py-2.5 text-xs text-muted-foreground">
+        {signal.direction_label ?? "ambiguous"}
+      </td>
+      <td className="px-3 py-2.5">
+        <div className="flex flex-wrap gap-1">
+          {(signal.reasons.length ? signal.reasons : [signal.status]).slice(0, 4).map((r) => (
+            <code
+              key={r}
+              className="text-[10px] rounded bg-secondary px-1.5 py-0.5 font-mono text-muted-foreground"
+            >
+              {r}
+            </code>
+          ))}
+        </div>
+      </td>
+    </tr>
   );
 }
 

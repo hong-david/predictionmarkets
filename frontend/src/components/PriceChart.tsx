@@ -108,7 +108,7 @@ export function PriceChart({
 
     const price = chart.addLineSeries({
       lineType: LineType.WithSteps,
-      lineColor: "rgba(120, 185, 255, 0.95)",
+      color: "rgba(120, 185, 255, 0.95)",
       lineWidth: 2,
       lineStyle: LineStyle.Solid,
       priceLineVisible: false,

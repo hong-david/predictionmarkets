@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_trades_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts, trade_id)
-TTL ts + INTERVAL 7 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 7 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.kalshi_quote_changes_raw
 (
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_quote_changes_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts)
-TTL ts + INTERVAL 3 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 3 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.kalshi_l2_events_raw
 (
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_l2_events_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts, session_id, seq)
-TTL ts + INTERVAL 1 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 1 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.market_features_1m
 (

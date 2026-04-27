@@ -6,6 +6,7 @@ import type {
   MarketNews,
   MarketSeries,
   MarketsList,
+  NewsSignalsList,
   DashboardOverview,
   RecentAnomaliesList,
   SuspiciousTradesList,
@@ -17,7 +18,10 @@ import type {
  * Tiny fetch wrapper. Throws on non-2xx so TanStack Query treats them
  * as errors and renders error states instead of pretending we got data.
  */
-async function get<T>(path: string, params?: Record<string, string | number | undefined | null>): Promise<T> {
+async function get<T>(
+  path: string,
+  params?: Record<string, string | number | boolean | undefined | null>,
+): Promise<T> {
   const url = new URL(path, window.location.origin);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
@@ -96,4 +100,9 @@ export const api = {
     get<RecentAnomaliesList>("/api/dashboard/anomalies", { limit, severity }),
   suspiciousTrades: (limit = 25) =>
     get<SuspiciousTradesList>("/api/dashboard/suspicious-trades", { limit }),
+  newsSignals: (limit = 25, minScore = 4) =>
+    get<NewsSignalsList>("/api/dashboard/news-signals", {
+      limit,
+      min_score: minScore,
+    }),
 };

@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.models import Market, MarketNewsProfile, NewsArticle, NewsEvent
+from app.services.news_direction import orientation_keywords_for_market_text
 from app.services.news_gdelt import tokenize_for_gdelt
 
 
@@ -72,6 +73,7 @@ def upsert_article(db: Session, article: NormalizedArticle) -> int:
 def profile_for_market(market: Market) -> dict:
     text = " ".join(p for p in (market.title, market.subtitle, market.market_id) if p)
     tokens = tokenize_for_gdelt(text, max_tokens=16).split()
+    tokens.extend(orientation_keywords_for_market_text(text))
     aliases = [market.market_id]
     if market.event_id:
         aliases.append(market.event_id)
@@ -101,19 +103,6 @@ def upsert_market_news_profile(db: Session, market: Market) -> None:
         },
     )
     db.execute(stmt)
-
-
-def lexical_relevance(article: NewsArticle, profile: MarketNewsProfile) -> float:
-    haystack = {
-        str(x).lower()
-        for x in ((article.keywords or []) + (article.entities or []))
-        if str(x).strip()
-    }
-    haystack.update((article.title or "").lower().split())
-    needles = {str(x).lower() for x in (profile.normalized_keywords or [])}
-    if not needles:
-        return 0.0
-    return min(1.0, len(haystack & needles) / max(3, len(needles)))
 
 
 def record_news_market_candidate(

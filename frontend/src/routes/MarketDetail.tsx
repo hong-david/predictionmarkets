@@ -340,7 +340,7 @@ export default function MarketDetailPage() {
 
         <Card>
           <CardHeader
-            title="Public news (GDELT)"
+            title="Linked news signals"
             right={
               <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[11px]">
                 <button
@@ -400,7 +400,13 @@ export default function MarketDetailPage() {
               <EmptyState>No matching articles in the past 30 days.</EmptyState>
             ) : (
               <ul className="divide-y divide-border max-h-[480px] overflow-auto">
-                {news.data.articles.map((article, i) => (
+                {news.data.articles.map((article, i) => {
+                  const score = article.pre_news_trade_score ?? 0;
+                  const leakageMinutes =
+                    article.leakage_window_seconds != null
+                      ? Math.round(article.leakage_window_seconds / 60)
+                      : null;
+                  return (
                   <li key={i} className="px-4 py-3 hover:bg-secondary/30 transition-colors">
                     <a
                       href={article.url ?? "#"}
@@ -424,9 +430,35 @@ export default function MarketDetailPage() {
                           </>
                         ) : null}
                       </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px]">
+                        {score > 0 ? (
+                          <span className="rounded bg-secondary px-1.5 py-0.5 font-mono text-foreground">
+                            news/trade {score.toFixed(1)}
+                          </span>
+                        ) : null}
+                        {article.direction_label ? (
+                          <span className="rounded border border-border px-1.5 py-0.5 text-muted-foreground">
+                            {article.direction_label}
+                          </span>
+                        ) : null}
+                        {leakageMinutes != null ? (
+                          <span className="rounded border border-border px-1.5 py-0.5 text-muted-foreground">
+                            {fmtInt(leakageMinutes)}m before news
+                          </span>
+                        ) : null}
+                        {(article.reasons ?? []).slice(0, 3).map((reason) => (
+                          <code
+                            key={reason}
+                            className="rounded bg-secondary/70 px-1.5 py-0.5 font-mono text-muted-foreground"
+                          >
+                            {reason}
+                          </code>
+                        ))}
+                      </div>
                     </a>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             )}
           </div>
