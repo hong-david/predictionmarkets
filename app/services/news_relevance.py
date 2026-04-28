@@ -20,6 +20,86 @@ from app.db.models import MarketNewsProfile, NewsArticle
 
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+_ORIENTATION_MARKERS = {"above_threshold", "below_threshold"}
+_GENERIC_PROFILE_TERMS = {
+    "a",
+    "above",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "before",
+    "below",
+    "billion",
+    "by",
+    "company",
+    "companies",
+    "corp",
+    "corporation",
+    "daily",
+    "during",
+    "earnings",
+    "end",
+    "event",
+    "for",
+    "from",
+    "greater",
+    "guidance",
+    "how",
+    "in",
+    "inc",
+    "international",
+    "is",
+    "its",
+    "least",
+    "less",
+    "llc",
+    "ltd",
+    "market",
+    "many",
+    "merger",
+    "million",
+    "most",
+    "new",
+    "not",
+    "of",
+    "on",
+    "or",
+    "over",
+    "plc",
+    "price",
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "qualify",
+    "quarter",
+    "report",
+    "reported",
+    "reports",
+    "scheduled_announcement",
+    "short_window",
+    "single_actor_leverage",
+    "thousand",
+    "the",
+    "this",
+    "to",
+    "total",
+    "trade",
+    "trades",
+    "trading",
+    "under",
+    "vs",
+    "what",
+    "when",
+    "which",
+    "who",
+    "will",
+    "with",
+    "year",
+}
 
 
 @dataclass(frozen=True)
@@ -98,6 +178,16 @@ CATEGORY_FACTOR_TERMS: dict[str, dict[str, tuple[str, ...]]] = {
             "gdp",
             "pce",
             "treasury",
+        ),
+        "energy_market": (
+            "oil",
+            "crude",
+            "wti",
+            "brent",
+            "gasoline",
+            "opec",
+            "supply disruption",
+            "sanctions",
         ),
     },
     "corporate": {
@@ -217,7 +307,9 @@ CATEGORY_PROFILE_ANCHORS: dict[str, tuple[str, ...]] = {
         "earnings",
         "guidance",
         "merger",
+        "acquire",
         "acquisition",
+        "takeover",
         "bankruptcy",
         "fda",
         "stock",
@@ -282,6 +374,35 @@ CATEGORY_PROFILE_ANCHORS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+CATEGORY_FACTOR_PROFILE_ANCHORS: dict[str, dict[str, tuple[str, ...]]] = {
+    "macro": {
+        "scheduled_macro": (
+            "fed",
+            "fomc",
+            "federal reserve",
+            "rate",
+            "rates",
+            "cpi",
+            "inflation",
+            "jobs",
+            "payrolls",
+            "unemployment",
+            "gdp",
+            "pce",
+            "treasury",
+        ),
+        "energy_market": (
+            "oil",
+            "crude",
+            "wti",
+            "brent",
+            "gasoline",
+            "gas",
+            "energy",
+        ),
+    }
+}
+
 
 def _norm(value: object) -> str:
     return str(value or "").strip().lower()
@@ -293,6 +414,15 @@ def _tokens(text: str) -> set[str]:
 
 def _as_terms(values: Iterable[object] | None) -> set[str]:
     return {_norm(v) for v in (values or []) if _norm(v)}
+
+
+def _profile_keyword_terms(profile: MarketNewsProfile) -> set[str]:
+    return {
+        term
+        for term in _as_terms(profile.normalized_keywords)
+        if term not in _ORIENTATION_MARKERS and term not in _GENERIC_PROFILE_TERMS
+        and not term.replace(".", "", 1).isdigit()
+    }
 
 
 def _article_text(article: NewsArticle) -> str:
@@ -330,7 +460,7 @@ def lexical_relevance(article: NewsArticle, profile: MarketNewsProfile) -> float
 
     text = _article_text(article)
     haystack = _tokens(text)
-    needles = _as_terms(profile.normalized_keywords)
+    needles = _profile_keyword_terms(profile)
     if not needles:
         return 0.0
 
@@ -368,6 +498,8 @@ def article_factor_hits(
     text = _article_text(article)
     out: dict[str, list[str]] = {}
     for factor, terms in factors.items():
+        if not profile_supports_factor(profile, factor):
+            continue
         hits = sorted(_phrase_hits(text, terms))
         if hits:
             out[factor] = hits
@@ -395,10 +527,24 @@ def profile_supports_category_factor(profile: MarketNewsProfile) -> bool:
     return bool(_phrase_hits(text, anchors))
 
 
-def _factor_relevance(article: NewsArticle, profile: MarketNewsProfile) -> float:
-    if not profile_supports_category_factor(profile):
-        return 0.0
+def profile_supports_factor(profile: MarketNewsProfile, factor: str) -> bool:
+    """True when profile text has anchors for this specific factor family."""
 
+    category = _norm(profile.category)
+    factor_anchors = CATEGORY_FACTOR_PROFILE_ANCHORS.get(category, {}).get(factor)
+    if not factor_anchors:
+        return profile_supports_category_factor(profile)
+    text = " ".join(
+        [
+            " ".join(_as_terms(profile.normalized_keywords)),
+            " ".join(_as_terms(profile.entities)),
+            " ".join(_as_terms(profile.aliases)),
+        ]
+    )
+    return bool(_phrase_hits(text, factor_anchors))
+
+
+def _factor_relevance(article: NewsArticle, profile: MarketNewsProfile) -> float:
     hits = article_factor_hits(article, profile)
     if not hits:
         return 0.0
@@ -422,6 +568,13 @@ def infer_direction_hint(article: NewsArticle, profile: MarketNewsProfile) -> st
     """
 
     text = _article_text(article)
+    profile_text = " ".join(
+        [
+            " ".join(_as_terms(profile.normalized_keywords)),
+            " ".join(_as_terms(profile.entities)),
+            " ".join(_as_terms(profile.aliases)),
+        ]
+    )
     category = _norm(profile.category)
 
     if category == "crypto_strike":
@@ -451,6 +604,61 @@ def infer_direction_hint(article: NewsArticle, profile: MarketNewsProfile) -> st
         if _phrase_hits(text, bearish):
             return "bearish_underlier"
 
+    if category == "macro":
+        if _phrase_hits(profile_text, ("fed", "fomc", "rate", "rates", "interest rate")):
+            if _phrase_hits(text, ("rate hike", "rate hikes", "higher rates", "hawkish")):
+                return "bullish_underlier"
+            if _phrase_hits(text, ("rate cut", "rate cuts", "lower rates", "dovish")):
+                return "bearish_underlier"
+
+        if _phrase_hits(profile_text, ("cpi", "inflation", "consumer prices", "prices")):
+            if _phrase_hits(
+                text,
+                ("hot inflation", "inflation rises", "prices rise", "accelerates", "higher inflation"),
+            ):
+                return "bullish_underlier"
+            if _phrase_hits(
+                text,
+                ("cooling inflation", "inflation falls", "prices fall", "decelerates", "lower inflation"),
+            ):
+                return "bearish_underlier"
+
+        if _phrase_hits(profile_text, ("oil", "crude", "wti", "brent", "gasoline", "gas")):
+            if _phrase_hits(
+                text,
+                ("oil prices rise", "prices rise", "rally", "supply disruption", "sanctions", "talks stall"),
+            ):
+                return "bullish_underlier"
+            if _phrase_hits(
+                text,
+                ("oil prices fall", "prices fall", "selloff", "ceasefire", "demand weakens"),
+            ):
+                return "bearish_underlier"
+
+        if _phrase_hits(profile_text, ("gold", "silver", "bullion", "precious metal")):
+            if _phrase_hits(text, ("gold rises", "silver rises", "safe haven", "rally")):
+                return "bullish_underlier"
+            if _phrase_hits(text, ("gold falls", "silver falls", "selloff")):
+                return "bearish_underlier"
+
+    if category == "weather":
+        if _phrase_hits(profile_text, ("temperature", "heat", "hot", "high temp")):
+            if _phrase_hits(text, ("heat wave", "warmer", "temperatures rise", "record heat")):
+                return "bullish_underlier"
+            if _phrase_hits(text, ("cold front", "cooler", "temperatures fall", "record cold")):
+                return "bearish_underlier"
+        if _phrase_hits(profile_text, ("rain", "snow", "precipitation")):
+            if _phrase_hits(text, ("heavy rain", "storm", "snow", "precipitation")):
+                return "bullish_underlier"
+            if _phrase_hits(text, ("dry", "drought", "little rain", "less snow")):
+                return "bearish_underlier"
+
+    if category == "corporate":
+        if _phrase_hits(text, ("earnings beat", "raises guidance", "approval", "approved")):
+            return "bullish_underlier"
+        if _phrase_hits(text, ("earnings miss", "cuts guidance", "bankruptcy", "rejected")):
+            return "bearish_underlier"
+
     return "unknown"
 
 
@@ -465,6 +673,12 @@ def hybrid_news_relevance(
     factor = _factor_relevance(article, profile)
     factor_hits = article_factor_hits(article, profile)
 
+    if _norm(profile.category) == "corporate" and factor > 0:
+        has_direct_anchor = lexical > 0 or entity > 0 or alias > 0
+        if not has_direct_anchor:
+            factor = 0.0
+            factor_hits = {}
+
     score = min(
         1.0,
         0.35 * lexical
@@ -472,6 +686,12 @@ def hybrid_news_relevance(
         + 0.05 * alias
         + 0.45 * factor,
     )
+    if alias > 0:
+        score = max(score, 0.75)
+    elif entity >= 0.5:
+        score = max(score, 0.65)
+    elif lexical >= 0.5:
+        score = max(score, 0.45)
 
     return RelevanceResult(
         score=score,
@@ -482,6 +702,6 @@ def hybrid_news_relevance(
             "factor_relevance": factor,
             "factor_hits": factor_hits,
             "direction_hint": infer_direction_hint(article, profile),
-            "scorer": "hybrid_news_relevance_v1",
+            "scorer": "hybrid_news_relevance_v2",
         },
     )

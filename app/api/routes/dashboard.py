@@ -43,6 +43,7 @@ import orjson
 import redis
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, case, desc, func, or_, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
@@ -50,13 +51,21 @@ from app.core.config import settings
 from app.db.models import (
     Anomaly,
     Market,
+    MarketMetric,
+    MarketNewsProfile,
     MarketSnapshot,
     NewsArticle,
     NewsEvent,
+    PipelineHeartbeat,
     Trade,
     TradeFlag,
 )
+from app.services.news_correlation import market_news_search_query, profile_for_market
+from app.services.news_direction import components_with_market_direction
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
+from app.services.news_relevance import hybrid_news_relevance
+from app.services.search_index import dashboard_search
+from app.services.storage_health import storage_health_detail, storage_health_snapshot
 from app.services.surveillance_scores import (
     aggregate_reason_codes,
     collect_reason_strings_from_anomaly_json,
@@ -80,9 +89,20 @@ T = TypeVar("T")
 _DASHBOARD_CACHE_TTL_SEC = 30.0
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
+_ACTIVE_MARKET_STATUSES = frozenset({"open", "active"})
+_PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
+_PIPELINE_MARKET_POLLER_STALE_AFTER = timedelta(hours=6)
+_PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
+
+
+def _normalize_market_scope(market_scope: str | None) -> str:
+    scope = (market_scope or "active").lower()
+    if scope not in {"active", "historical", "all"}:
+        return "active"
+    return scope
 
 
 def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
@@ -145,6 +165,28 @@ def _prior_rank() -> case:
     return case(_PRIOR_RANK, value=Market.manipulability_prior, else_=-1)
 
 
+def _trade_notional_dollars(
+    *,
+    yes_price: object,
+    no_price: object,
+    count: object,
+    taker_side: str | None,
+) -> float | None:
+    """Estimated dollars paid for the contracts in one public trade print."""
+    if count is None:
+        return None
+    side = (taker_side or "").lower()
+    price = no_price if side == "no" and no_price is not None else yes_price
+    if price is None:
+        price = no_price
+    if price is None:
+        return None
+    try:
+        return float(count) * float(price)
+    except (TypeError, ValueError):
+        return None
+
+
 def _reason_codes_for_market_pks(
     db: Session, market_pks: list[int]
 ) -> dict[int, list[str]]:
@@ -170,11 +212,18 @@ def _serialize_market_row(
     anomaly_count: int = 0,
     last_price: float | None = None,
     volume_24h: float | None = None,
+    trade_dollar_volume: float | None = None,
     reason_codes: list[str] | None = None,
     event_market_count: int | None = None,
+    evidence_score: float | None = None,
+    urgency_score: float | None = None,
+    top_trade_flag_score: float | None = None,
+    storage_tier: str | None = None,
+    retention_score: int | None = None,
 ) -> dict:
     prk = prior_rank(market.manipulability_prior)
     ac = int(anomaly_count or 0)
+    lifecycle = _market_lifecycle(market)
     return {
         "market_id": market.market_id,
         "event_id": market.event_id,
@@ -189,15 +238,29 @@ def _serialize_market_row(
         "classifier_rule": market.classifier_rule,
         "open_time": market.open_time.isoformat() if market.open_time else None,
         "close_time": market.close_time.isoformat() if market.close_time else None,
+        "market_lifecycle": lifecycle,
+        "is_active": lifecycle == "active",
         "trade_count": int(trade_count or 0),
         "anomaly_count": ac,
         "last_price": float(last_price) if last_price is not None else None,
         "volume_24h": float(volume_24h) if volume_24h is not None else None,
+        "trade_dollar_volume": float(trade_dollar_volume)
+        if trade_dollar_volume is not None
+        else None,
         "market_priority": market_priority_value(market.manipulability_prior),
-        "evidence_score": evidence_score_0_100(anomaly_count=ac),
-        "urgency_score": urgency_score_0_100(prior_rank=prk, anomaly_count=ac),
+        "evidence_score": float(evidence_score)
+        if evidence_score is not None
+        else evidence_score_0_100(anomaly_count=ac),
+        "urgency_score": float(urgency_score)
+        if urgency_score is not None
+        else urgency_score_0_100(prior_rank=prk, anomaly_count=ac),
+        "top_trade_flag_score": float(top_trade_flag_score)
+        if top_trade_flag_score is not None
+        else None,
         "reasons": list(reason_codes or []),
         "event_market_count": event_market_count,
+        "storage_tier": storage_tier,
+        "retention_score": retention_score,
     }
 
 
@@ -211,6 +274,119 @@ def _market_context(market: Market) -> MarketContext:
         event_id=market.event_id,
         close_time=market.close_time,
     )
+
+
+def _latest_snapshot_values_for_market_pks(
+    db: Session, market_pks: list[int]
+) -> dict[int, dict[str, float | None]]:
+    if not market_pks:
+        return {}
+    ranked = (
+        select(
+            MarketSnapshot.market_pk.label("market_pk"),
+            MarketSnapshot.last_price_dollars.label("last_price"),
+            MarketSnapshot.yes_bid_dollars.label("yes_bid"),
+            MarketSnapshot.yes_ask_dollars.label("yes_ask"),
+            MarketSnapshot.volume_24h_fp.label("volume_24h"),
+            func.row_number()
+            .over(
+                partition_by=MarketSnapshot.market_pk,
+                order_by=(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(MarketSnapshot.market_pk.in_(market_pks))
+        .subquery()
+    )
+    rows = db.execute(
+        select(
+            ranked.c.market_pk,
+            ranked.c.last_price,
+            ranked.c.yes_bid,
+            ranked.c.yes_ask,
+            ranked.c.volume_24h,
+        ).where(ranked.c.rn == 1)
+    ).all()
+
+    def _display_price(row) -> float | None:
+        if row.last_price is not None:
+            return float(row.last_price)
+        if row.yes_bid is not None and row.yes_ask is not None:
+            return (float(row.yes_bid) + float(row.yes_ask)) / 2.0
+        if row.yes_bid is not None:
+            return float(row.yes_bid)
+        if row.yes_ask is not None:
+            return float(row.yes_ask)
+        return None
+
+    values = {
+        int(row.market_pk): {
+            "last_price": _display_price(row),
+            "volume_24h": float(row.volume_24h)
+            if row.volume_24h is not None
+            else None,
+        }
+        for row in rows
+    }
+    missing_or_blank = [
+        pk
+        for pk in market_pks
+        if pk not in values
+        or (
+            values[pk].get("last_price") is None
+            and values[pk].get("volume_24h") is None
+        )
+    ]
+    if missing_or_blank:
+        metric_rows = (
+            db.query(
+                MarketMetric.market_pk,
+                MarketMetric.last_price_cents,
+                MarketMetric.volume_24h_contracts,
+            )
+            .filter(MarketMetric.market_pk.in_(missing_or_blank))
+            .all()
+        )
+        for row in metric_rows:
+            current = values.setdefault(
+                int(row.market_pk), {"last_price": None, "volume_24h": None}
+            )
+            if current["last_price"] is None and row.last_price_cents is not None:
+                current["last_price"] = float(row.last_price_cents) / 100.0
+            if current["volume_24h"] is None and row.volume_24h_contracts is not None:
+                current["volume_24h"] = float(row.volume_24h_contracts)
+    price_missing = [
+        pk for pk in market_pks if values.get(pk, {}).get("last_price") is None
+    ]
+    if price_missing:
+        ranked_trades = (
+            select(
+                Trade.market_pk.label("market_pk"),
+                Trade.yes_price_dollars.label("yes_price"),
+                func.row_number()
+                .over(
+                    partition_by=Trade.market_pk,
+                    order_by=(Trade.ts.desc(), Trade.id.desc()),
+                )
+                .label("rn"),
+            )
+            .where(Trade.market_pk.in_(price_missing))
+            .subquery()
+        )
+        trade_rows = db.execute(
+            select(ranked_trades.c.market_pk, ranked_trades.c.yes_price).where(
+                ranked_trades.c.rn == 1
+            )
+        ).all()
+        for row in trade_rows:
+            if row.yes_price is None:
+                continue
+            current = values.setdefault(
+                int(row.market_pk), {"last_price": None, "volume_24h": None}
+            )
+            if current["last_price"] is None:
+                current["last_price"] = float(row.yes_price)
+    return values
 
 
 def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
@@ -329,6 +505,514 @@ def _sibling_snapshot_context(
     return [_snapshot_payload(row) for row in rows]
 
 
+# --- /pipeline-health -------------------------------------------------------
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _latest_datetime(*values: datetime | None) -> datetime | None:
+    known = [_as_utc(v) for v in values if v is not None]
+    if not known:
+        return None
+    return max(known)
+
+
+def _age_seconds(latest_at: datetime | None, *, now: datetime) -> int | None:
+    latest = _as_utc(latest_at)
+    if latest is None:
+        return None
+    return max(0, int((now - latest).total_seconds()))
+
+
+def _pipeline_component(
+    *,
+    key: str,
+    label: str,
+    status: str,
+    latest_at: datetime | None,
+    age_seconds: int | None,
+    count: int | None,
+    description: str,
+    detail: str,
+    heartbeat_at: datetime | None = None,
+    last_success_at: datetime | None = None,
+    last_error_at: datetime | None = None,
+    last_error: str | None = None,
+    component_type: str | None = None,
+    source: str = "db",
+    run_id: str | None = None,
+) -> dict:
+    latest = _as_utc(latest_at)
+    return {
+        "key": key,
+        "label": label,
+        "status": status,
+        "latest_at": latest.isoformat() if latest else None,
+        "age_seconds": age_seconds,
+        "count": count,
+        "description": description,
+        "detail": detail,
+        "heartbeat_at": _as_utc(heartbeat_at).isoformat() if heartbeat_at else None,
+        "last_success_at": _as_utc(last_success_at).isoformat()
+        if last_success_at
+        else None,
+        "last_error_at": _as_utc(last_error_at).isoformat()
+        if last_error_at
+        else None,
+        "last_error": last_error,
+        "component_type": component_type,
+        "source": source,
+        "run_id": run_id,
+    }
+
+
+def _freshness_status(
+    *,
+    latest_at: datetime | None,
+    count: int | None,
+    stale_after: timedelta,
+    now: datetime,
+) -> str:
+    if count is not None and count <= 0:
+        return "empty"
+    if latest_at is None:
+        return "empty"
+    age = _age_seconds(latest_at, now=now)
+    if age is not None and age > int(stale_after.total_seconds()):
+        return "stale"
+    return "healthy"
+
+
+def _safe_pipeline_component(
+    db: Session,
+    *,
+    key: str,
+    label: str,
+    description: str,
+    build: Callable[[], dict],
+) -> dict:
+    try:
+        return build()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.info("pipeline health component %s failed: %s", key, exc)
+        return _pipeline_component(
+            key=key,
+            label=label,
+            status="error",
+            latest_at=None,
+            age_seconds=None,
+            count=None,
+            description=description,
+            detail=f"Health check failed: {exc.__class__.__name__}",
+        )
+    except Exception as exc:
+        db.rollback()
+        logger.exception("pipeline health component %s failed unexpectedly", key)
+        return _pipeline_component(
+            key=key,
+            label=label,
+            status="error",
+            latest_at=None,
+            age_seconds=None,
+            count=None,
+            description=description,
+            detail=f"Health check failed: {exc.__class__.__name__}",
+        )
+
+
+def _pipeline_summary(components: list[dict]) -> dict:
+    counts = {
+        "healthy": sum(1 for c in components if c.get("status") == "healthy"),
+        "stale": sum(1 for c in components if c.get("status") == "stale"),
+        "empty": sum(1 for c in components if c.get("status") == "empty"),
+        "error": sum(1 for c in components if c.get("status") == "error"),
+    }
+    total = len(components)
+    data_components = [c for c in components if c.get("key") != "api"]
+    if counts["error"] == total and total > 0:
+        status = "error"
+    elif counts["error"] or counts["stale"]:
+        status = "degraded"
+    elif data_components and all(c.get("status") == "empty" for c in data_components):
+        status = "empty"
+    elif counts["empty"]:
+        status = "degraded"
+    else:
+        status = "healthy"
+    return {**counts, "total": total, "status": status}
+
+
+def _pipeline_heartbeat_map(db: Session) -> dict[str, PipelineHeartbeat]:
+    try:
+        return {row.key: row for row in db.query(PipelineHeartbeat).all()}
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.debug("pipeline heartbeat rows unavailable: %s", exc)
+        return {}
+
+
+def _component_from_heartbeat(
+    heartbeat: PipelineHeartbeat | None,
+    *,
+    key: str,
+    label: str,
+    description: str,
+    db_latest_at: datetime | None,
+    db_count: int | None,
+    db_detail: str,
+    stale_after: timedelta,
+    now: datetime,
+) -> dict:
+    hb_latest = (
+        _latest_datetime(heartbeat.last_heartbeat_at, heartbeat.last_success_at)
+        if heartbeat is not None
+        else None
+    )
+    latest_at = _latest_datetime(hb_latest, db_latest_at)
+    count = heartbeat.count if heartbeat is not None and heartbeat.count is not None else db_count
+    if heartbeat is not None and heartbeat.status == "error":
+        status = "error"
+    elif hb_latest is not None:
+        status = _freshness_status(
+            latest_at=hb_latest,
+            count=count,
+            stale_after=stale_after,
+            now=now,
+        )
+    else:
+        status = _freshness_status(
+            latest_at=db_latest_at,
+            count=db_count,
+            stale_after=stale_after,
+            now=now,
+        )
+    detail = heartbeat.detail if heartbeat is not None and heartbeat.detail else db_detail
+    if heartbeat is not None and heartbeat.status == "error" and heartbeat.last_error:
+        detail = f"{detail} Last error: {heartbeat.last_error}"
+    return _pipeline_component(
+        key=key,
+        label=label,
+        status=status,
+        latest_at=latest_at,
+        age_seconds=_age_seconds(latest_at, now=now),
+        count=count,
+        description=description,
+        detail=detail,
+        heartbeat_at=heartbeat.last_heartbeat_at if heartbeat is not None else None,
+        last_success_at=heartbeat.last_success_at if heartbeat is not None else None,
+        last_error_at=heartbeat.last_error_at if heartbeat is not None else None,
+        last_error=heartbeat.last_error if heartbeat is not None else None,
+        component_type=heartbeat.component_type if heartbeat is not None else None,
+        source="heartbeat" if hb_latest is not None else "db",
+        run_id=heartbeat.run_id if heartbeat is not None else None,
+    )
+
+
+def _pipeline_health_payload(db: Session) -> dict:
+    now = _utc_now()
+    heartbeats = _pipeline_heartbeat_map(db)
+
+    def api_component() -> dict:
+        db.execute(text("select 1")).scalar()
+        return _pipeline_component(
+            key="api",
+            label="API",
+            status="healthy",
+            latest_at=now,
+            age_seconds=0,
+            count=None,
+            description="FastAPI dashboard endpoint and Postgres session.",
+            detail="Endpoint responded and the DB session accepted SELECT 1.",
+            component_type="process",
+            source="request",
+        )
+
+    def market_poller_component() -> dict:
+        hydrated = db.query(func.count(Market.id)).filter(*_hydrated_market_filters()).scalar() or 0
+        unknown = db.query(func.count(Market.id)).filter(Market.status == "unknown").scalar() or 0
+        latest_updated, latest_created = db.query(
+            func.max(Market.updated_at),
+            func.max(Market.created_at),
+        ).one()
+        latest_at = _latest_datetime(latest_updated, latest_created)
+        return _component_from_heartbeat(
+            heartbeats.get("market_poller"),
+            key="market_poller",
+            label="Market poller / hydration",
+            description="REST market poller and targeted hydration keeping market metadata filled in.",
+            db_latest_at=latest_at,
+            db_count=int(hydrated),
+            db_detail=f"{int(hydrated):,} hydrated markets; {int(unknown):,} unknown/pending rows.",
+            stale_after=_PIPELINE_MARKET_POLLER_STALE_AFTER,
+            now=now,
+        )
+
+    def ws_trade_component() -> dict:
+        count, latest_at = db.query(func.count(Trade.id), func.max(Trade.ts)).one()
+        latest_at = _as_utc(latest_at)
+        return _component_from_heartbeat(
+            heartbeats.get("ws_trade_feed"),
+            key="ws_trade_feed",
+            label="WebSocket trade feed",
+            description="Kalshi WebSocket trade channel writing public executions.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} stored trades; latest trade timestamp drives freshness.",
+            stale_after=_PIPELINE_WS_STALE_AFTER,
+            now=now,
+        )
+
+    def news_ingest_component() -> dict:
+        count, latest_seen, latest_published = db.query(
+            func.count(NewsArticle.id),
+            func.max(NewsArticle.first_seen_at),
+            func.max(NewsArticle.published_at),
+        ).one()
+        latest_at = _latest_datetime(latest_seen, latest_published)
+        return _component_from_heartbeat(
+            heartbeats.get("news_ingest"),
+            key="news_ingest",
+            label="News ingest",
+            description="Global news/RSS/GDELT ingest storing normalized article metadata.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} normalized articles stored.",
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def news_links_component() -> dict:
+        count, latest_event = db.query(
+            func.count(NewsEvent.id),
+            func.max(NewsEvent.created_at),
+        ).one()
+        latest_article = db.query(func.max(NewsArticle.first_seen_at)).scalar()
+        latest_at = _latest_datetime(latest_event, latest_article)
+        return _component_from_heartbeat(
+            heartbeats.get("news_links"),
+            key="news_links",
+            label="News links",
+            description="Candidate article-to-market links from relevance scoring.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} linked news events.",
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def news_trade_correlations_component() -> dict:
+        count, latest_at = (
+            db.query(func.count(NewsEvent.id), func.max(NewsEvent.created_at))
+            .filter(NewsEvent.pre_news_trade_score > 0)
+            .one()
+        )
+        return _component_from_heartbeat(
+            heartbeats.get("news_trade_correlations"),
+            key="news_trade_correlations",
+            label="News/trade correlations",
+            description="Materialized pre-news trade alignment on linked news events.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} links have a positive pre-news trade score.",
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def trade_flags_component() -> dict:
+        count, latest_ts, latest_created = db.query(
+            func.count(TradeFlag.id),
+            func.max(TradeFlag.ts),
+            func.max(TradeFlag.created_at),
+        ).one()
+        latest_at = _latest_datetime(latest_ts, latest_created)
+        return _component_from_heartbeat(
+            heartbeats.get("trade_flags"),
+            key="trade_flags",
+            label="Trade flags",
+            description="Contextual suspicious-trade flag materializer.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} persisted trade flags.",
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def quote_book_anomalies_component() -> dict:
+        count, latest_at = db.query(func.count(Anomaly.id), func.max(Anomaly.created_at)).one()
+        return _component_from_heartbeat(
+            heartbeats.get("quote_book_anomalies"),
+            key="quote_book_anomalies",
+            label="Quote/book anomalies",
+            description="Quote and order-book anomaly materialization.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=f"{int(count or 0):,} stored quote/book anomaly rows.",
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def retention_projection_component() -> dict:
+        count, latest_at = db.query(
+            func.count(MarketMetric.market_pk),
+            func.max(MarketMetric.updated_at),
+        ).one()
+        promoted_count: int | None = None
+        try:
+            promoted_count = (
+                db.query(func.count(MarketMetric.market_pk))
+                .filter(
+                    or_(
+                        MarketMetric.storage_tier != "observe_only",
+                        MarketMetric.retention_score > 0,
+                    )
+                )
+                .scalar()
+                or 0
+            )
+        except SQLAlchemyError:
+            db.rollback()
+        detail = f"{int(count or 0):,} market metric rows"
+        if promoted_count is not None:
+            detail += f"; {int(promoted_count):,} promoted above observe-only."
+        else:
+            detail += "; retention tier detail unavailable."
+        return _component_from_heartbeat(
+            heartbeats.get("retention_projection"),
+            key="retention_projection",
+            label="Retention/storage-tier projection",
+            description="MarketMetric projection carrying retention tier and compact serving state.",
+            db_latest_at=latest_at,
+            db_count=int(count or 0),
+            db_detail=detail,
+            stale_after=_PIPELINE_DAILY_STALE_AFTER,
+            now=now,
+        )
+
+    def storage_guardrails_component() -> dict:
+        snapshot = storage_health_snapshot(db, table_limit=5)
+        status = snapshot.get("summary", {}).get("status") or "empty"
+        if status not in {"healthy", "stale", "empty", "error"}:
+            status = "stale"
+        heartbeat = heartbeats.get("storage_guardrails")
+        if heartbeat is not None and heartbeat.status == "error":
+            return _component_from_heartbeat(
+                heartbeat,
+                key="storage_guardrails",
+                label="Storage guardrails",
+                description=(
+                    "Postgres, local disk, ClickHouse, and search-index storage pressure."
+                ),
+                db_latest_at=now,
+                db_count=None,
+                db_detail=storage_health_detail(snapshot),
+                stale_after=_PIPELINE_DAILY_STALE_AFTER,
+                now=now,
+            )
+        return _pipeline_component(
+            key="storage_guardrails",
+            label="Storage guardrails",
+            status=status,
+            latest_at=now,
+            age_seconds=0,
+            count=None,
+            description=(
+                "Postgres, local disk, ClickHouse, and search-index storage pressure."
+            ),
+            detail=storage_health_detail(snapshot),
+            component_type="projection",
+            source="db",
+        )
+
+    component_builders = [
+        (
+            "api",
+            "API",
+            "FastAPI dashboard endpoint and Postgres session.",
+            api_component,
+        ),
+        (
+            "market_poller",
+            "Market poller / hydration",
+            "REST market poller and targeted hydration keeping market metadata filled in.",
+            market_poller_component,
+        ),
+        (
+            "ws_trade_feed",
+            "WebSocket trade feed",
+            "Kalshi WebSocket trade channel writing public executions.",
+            ws_trade_component,
+        ),
+        (
+            "news_ingest",
+            "News ingest",
+            "Global news/RSS/GDELT ingest storing normalized article metadata.",
+            news_ingest_component,
+        ),
+        (
+            "news_links",
+            "News links",
+            "Candidate article-to-market links from relevance scoring.",
+            news_links_component,
+        ),
+        (
+            "news_trade_correlations",
+            "News/trade correlations",
+            "Materialized pre-news trade alignment on linked news events.",
+            news_trade_correlations_component,
+        ),
+        (
+            "trade_flags",
+            "Trade flags",
+            "Contextual suspicious-trade flag materializer.",
+            trade_flags_component,
+        ),
+        (
+            "quote_book_anomalies",
+            "Quote/book anomalies",
+            "Quote and order-book anomaly materialization.",
+            quote_book_anomalies_component,
+        ),
+        (
+            "retention_projection",
+            "Retention/storage-tier projection",
+            "MarketMetric projection carrying retention tier and compact serving state.",
+            retention_projection_component,
+        ),
+        (
+            "storage_guardrails",
+            "Storage guardrails",
+            "Postgres, local disk, ClickHouse, and search-index storage pressure.",
+            storage_guardrails_component,
+        ),
+    ]
+    components = [
+        _safe_pipeline_component(
+            db,
+            key=key,
+            label=label,
+            description=description,
+            build=build,
+        )
+        for key, label, description, build in component_builders
+    ]
+    return {
+        "generated_at": now.isoformat(),
+        "summary": _pipeline_summary(components),
+        "components": components,
+    }
+
+
 # --- /stats and /breakdown --------------------------------------------------
 
 
@@ -349,6 +1033,40 @@ def _estimated_table_count(db: Session, table_name: str) -> int:
     return max(0, int(estimate or 0))
 
 
+def _market_metrics_available(db: Session) -> bool:
+    """True when the compact market read model has been populated."""
+    return bool(db.query(MarketMetric.market_pk).limit(1).scalar() is not None)
+
+
+def _metric_latest_values_for_market_pks(
+    db: Session, market_pks: list[int]
+) -> dict[int, dict[str, float | int | str | None]]:
+    if not market_pks:
+        return {}
+    rows = (
+        db.query(MarketMetric)
+        .filter(MarketMetric.market_pk.in_(market_pks))
+        .all()
+    )
+    return {
+        int(row.market_pk): {
+            "last_price": float(row.last_price_cents) / 100.0
+            if row.last_price_cents is not None
+            else None,
+            "volume_24h": float(row.volume_24h_contracts)
+            if row.volume_24h_contracts is not None
+            else None,
+            "trade_count": int(row.trade_count or 0),
+            "anomaly_count": int(row.anomaly_count or 0),
+            "evidence_score": float(row.evidence_score or 0.0),
+            "urgency_score": float(row.urgency_score or 0.0),
+            "storage_tier": row.storage_tier,
+            "retention_score": int(row.retention_score or 0),
+        }
+        for row in rows
+    }
+
+
 def _hydrated_market_filters() -> list:
     return [
         Market.status.notin_(("unknown", "out_of_scope")),
@@ -356,32 +1074,131 @@ def _hydrated_market_filters() -> list:
     ]
 
 
-def _stats_payload(db: Session) -> dict:
+def _market_scope_filters(market_scope: str | None) -> list:
+    scope = _normalize_market_scope(market_scope)
+    status = func.lower(func.coalesce(Market.status, ""))
+    active = and_(
+        status.in_(tuple(_ACTIVE_MARKET_STATUSES)),
+        or_(Market.close_time.is_(None), Market.close_time > func.now()),
+    )
+    if scope == "active":
+        return [active]
+    if scope == "historical":
+        return [or_(status.notin_(tuple(_ACTIVE_MARKET_STATUSES)), Market.close_time <= func.now())]
+    return []
+
+
+def _market_lifecycle(market: Market, *, now: datetime | None = None) -> str:
+    now = now or datetime.now(timezone.utc)
+    status = (market.status or "").lower()
+    close_time = market.close_time
+    if close_time is not None:
+        close_time = (
+            close_time.replace(tzinfo=timezone.utc)
+            if close_time.tzinfo is None
+            else close_time.astimezone(timezone.utc)
+        )
+    if status in _ACTIVE_MARKET_STATUSES and (
+        close_time is None or close_time > now
+    ):
+        return "active"
+    if status in {"unknown", "out_of_scope"}:
+        return status
+    if close_time is not None and close_time <= now:
+        return "historical"
+    if status and status not in _ACTIVE_MARKET_STATUSES:
+        return "historical"
+    return "other"
+
+
+def _news_link_market_filters() -> list:
+    return [
+        Market.status != "unknown",
+        Market.title != Market.market_id,
+        or_(Market.category.is_(None), Market.category != "exotic_combo"),
+    ]
+
+
+def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
     """Coarse system-wide counts. Used by `GET /stats` and `GET /overview`."""
+    market_scope = _normalize_market_scope(market_scope)
     hydrated = _hydrated_market_filters()
-    markets = db.query(func.count(Market.id)).filter(*hydrated).scalar() or 0
+    scoped = hydrated + _market_scope_filters(market_scope)
+    markets = db.query(func.count(Market.id)).filter(*scoped).scalar() or 0
+    markets_all = db.query(func.count(Market.id)).filter(*hydrated).scalar() or 0
+    markets_active = (
+        db.query(func.count(Market.id))
+        .filter(*(hydrated + _market_scope_filters("active")))
+        .scalar()
+        or 0
+    )
+    markets_historical = (
+        db.query(func.count(Market.id))
+        .filter(*(hydrated + _market_scope_filters("historical")))
+        .scalar()
+        or 0
+    )
     markets_unknown = (
         db.query(func.count(Market.id)).filter(Market.status == "unknown").scalar() or 0
     )
     markets_high_prior = (
         db.query(func.count(Market.id))
-        .filter(*hydrated)
+        .filter(*scoped)
         .filter(Market.manipulability_prior.in_(("high", "medium_high")))
         .scalar()
         or 0
     )
-    trades = _estimated_table_count(db, "trades")
+    metric_projection = _market_metrics_available(db)
+    metric_counts = None
+    if metric_projection:
+        metric_counts = (
+            db.query(
+                func.coalesce(func.sum(MarketMetric.trade_count), 0).label("trades"),
+                func.coalesce(func.sum(MarketMetric.anomaly_count), 0).label(
+                    "anomalies"
+                ),
+                func.coalesce(func.sum(MarketMetric.high_anomaly_count), 0).label(
+                    "high_anomalies"
+                ),
+                func.count(
+                    case((MarketMetric.anomaly_count > 0, MarketMetric.market_pk))
+                ).label("markets_with_flags"),
+            )
+            .join(Market, Market.id == MarketMetric.market_pk)
+            .filter(*scoped)
+            .one()
+        )
+    trades = (
+        int(metric_counts.trades)
+        if metric_counts is not None and int(metric_counts.trades or 0) > 0
+        else _estimated_table_count(db, "trades")
+    )
     snapshots = _estimated_table_count(db, "market_snapshots")
     book_events = _estimated_table_count(db, "book_events")
-    anomalies = _estimated_table_count(db, "anomalies")
+    anomalies = (
+        int(metric_counts.anomalies)
+        if metric_counts is not None and int(metric_counts.anomalies or 0) > 0
+        else _estimated_table_count(db, "anomalies")
+    )
+    news_articles = db.query(func.count(NewsArticle.id)).scalar() or 0
     anomalies_high = (
-        db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar()
+        int(metric_counts.high_anomalies)
+        if metric_counts is not None and int(metric_counts.high_anomalies or 0) > 0
+        else db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar()
         or 0
     )
-    markets_with_flags = min(markets, anomalies)
+    markets_with_flags = (
+        int(metric_counts.markets_with_flags)
+        if metric_counts is not None
+        else min(markets, anomalies)
+    )
 
     return {
+        "market_scope": market_scope,
         "markets": markets,
+        "markets_all": markets_all,
+        "markets_active": markets_active,
+        "markets_historical": markets_historical,
         "markets_status_unknown": markets_unknown,
         "markets_high_prior": markets_high_prior,
         "markets_with_flags": markets_with_flags,
@@ -389,14 +1206,16 @@ def _stats_payload(db: Session) -> dict:
         "snapshots": snapshots,
         "book_events": book_events,
         "anomalies": anomalies,
+        "news_articles": int(news_articles),
         "anomalies_high_severity": anomalies_high,
     }
 
 
-def _breakdown_payload(db: Session) -> dict:
+def _breakdown_payload(db: Session, *, market_scope: str = "active") -> dict:
     """Classification pivots for the overview page."""
+    market_scope = _normalize_market_scope(market_scope)
 
-    hydrated = _hydrated_market_filters()
+    hydrated = _hydrated_market_filters() + _market_scope_filters(market_scope)
 
     def _group_count(col):
         rows = (
@@ -424,7 +1243,6 @@ def _breakdown_payload(db: Session) -> dict:
         .filter(*hydrated)
         .group_by("cat", "prior")
         .order_by(desc("c"))
-        .limit(40)
         .all()
     )
     category_x_prior = [
@@ -441,13 +1259,21 @@ def _breakdown_payload(db: Session) -> dict:
 
 
 @router.get("/stats")
-def get_stats(db: Session = Depends(get_db)) -> dict:
+def get_stats(
+    market_scope: str = Query(default="active", description="active | historical | all"),
+    db: Session = Depends(get_db),
+) -> dict:
     """Coarse system-wide counts. Drives the overview header."""
-    return _cached_dashboard_payload("stats", lambda: _stats_payload(db))
+    return _cached_dashboard_payload(
+        f"stats:{market_scope}", lambda: _stats_payload(db, market_scope=market_scope)
+    )
 
 
 @router.get("/breakdown")
-def get_breakdown(db: Session = Depends(get_db)) -> dict:
+def get_breakdown(
+    market_scope: str = Query(default="active", description="active | historical | all"),
+    db: Session = Depends(get_db),
+) -> dict:
     """Classification pivots for the overview page.
 
     Returns counts grouped by each of the four classifier dimensions
@@ -457,20 +1283,149 @@ def get_breakdown(db: Session = Depends(get_db)) -> dict:
     `"unclassified"` so the frontend can render them without special
     casing.
     """
-    return _cached_dashboard_payload("breakdown", lambda: _breakdown_payload(db))
+    return _cached_dashboard_payload(
+        f"breakdown:{market_scope}",
+        lambda: _breakdown_payload(db, market_scope=market_scope),
+    )
 
 
-def _top_markets_payload(db: Session, limit: int) -> dict:
+@router.get("/pipeline-health")
+def get_pipeline_health(db: Session = Depends(get_db)) -> dict:
+    """Freshness and row-count health for dashboard pipeline components.
+
+    These are not all standalone services: some are long-running processes,
+    while others are jobs, materializers, or compact DB projections.
+    """
+    return _pipeline_health_payload(db)
+
+
+@router.get("/storage-health")
+def get_storage_health(
+    table_limit: int = Query(default=8, ge=1, le=25),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Detailed storage pressure and largest-table snapshot."""
+    return storage_health_snapshot(db, table_limit=table_limit)
+
+
+@router.get("/search")
+def search_dashboard(
+    q: str = Query(default="", description="Market/news search text."),
+    scope: str = Query(default="all", description="all | markets | news"),
+    limit: int = Query(default=10, ge=1, le=25),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Search markets and stored news, using OpenSearch with DB fallback."""
+    query = (q or "").strip()
+    if not query:
+        return {
+            "query": "",
+            "scope": scope,
+            "provider": "empty",
+            "took_ms": 0,
+            "markets": [],
+            "news": [],
+            "suggestions": [],
+        }
+    return dashboard_search(db, query, scope=scope, limit=limit)
+
+
+def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active") -> dict:
+    if _market_metrics_available(db):
+        rows = (
+            db.query(Market, MarketMetric)
+            .join(MarketMetric, MarketMetric.market_pk == Market.id)
+            .filter(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
+            .filter(MarketMetric.trade_count > 0)
+            .order_by(MarketMetric.trade_count.desc(), MarketMetric.last_trade_ts.desc())
+            .limit(limit)
+            .all()
+        )
+        pks = [int(market.id) for market, _metric in rows]
+        latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
+        trade_dollars: dict[int, float] = {}
+        if pks:
+            trade_price = case(
+                (
+                    func.lower(func.coalesce(Trade.taker_side, "")) == "no",
+                    Trade.no_price_dollars,
+                ),
+                else_=Trade.yes_price_dollars,
+            )
+            trade_dollars = {
+                int(market_pk): float(dollars or 0.0)
+                for market_pk, dollars in (
+                    db.query(
+                        Trade.market_pk,
+                        func.sum(
+                            func.coalesce(Trade.count_fp, 0)
+                            * func.coalesce(trade_price, 0)
+                        ).label("trade_dollar_volume"),
+                    )
+                    .filter(Trade.market_pk.in_(pks))
+                    .group_by(Trade.market_pk)
+                    .all()
+                )
+            }
+        return {
+            "count": len(rows),
+            "markets": [
+                _serialize_market_row(
+                    market,
+                    trade_count=int(metric.trade_count or 0),
+                    anomaly_count=int(metric.anomaly_count or 0),
+                    last_price=(
+                        float(metric.last_price_cents) / 100.0
+                        if metric.last_price_cents is not None
+                        else latest_by_pk.get(market.id, {}).get("last_price")
+                    ),
+                    volume_24h=(
+                        float(metric.volume_24h_contracts)
+                        if metric.volume_24h_contracts is not None
+                        else latest_by_pk.get(market.id, {}).get("volume_24h")
+                    ),
+                    trade_dollar_volume=trade_dollars.get(market.id),
+                    evidence_score=float(metric.evidence_score or 0.0),
+                    urgency_score=float(metric.urgency_score or 0.0),
+                    storage_tier=metric.storage_tier,
+                    retention_score=int(metric.retention_score or 0),
+                )
+                for market, metric in rows
+            ],
+        }
+
     recent_trades = (
-        select(Trade.market_pk, Trade.ts, Trade.id)
+        select(
+            Trade.market_pk,
+            Trade.ts,
+            Trade.id,
+            Trade.count_fp,
+            Trade.yes_price_dollars,
+            Trade.no_price_dollars,
+            Trade.taker_side,
+        )
         .join(Market, Market.id == Trade.market_pk)
-        .where(*_hydrated_market_filters())
+        .where(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
         .order_by(Trade.ts.desc(), Trade.id.desc())
         .limit(_TOP_MARKETS_RECENT_TRADE_SAMPLE)
         .subquery()
     )
+    trade_price = case(
+        (
+            func.lower(func.coalesce(recent_trades.c.taker_side, "")) == "no",
+            recent_trades.c.no_price_dollars,
+        ),
+        else_=recent_trades.c.yes_price_dollars,
+    )
     trade_rows = (
-        db.query(recent_trades.c.market_pk, func.count().label("trade_count"))
+        db.query(
+            recent_trades.c.market_pk,
+            func.count().label("trade_count"),
+            func.sum(
+                func.coalesce(recent_trades.c.count_fp, 0)
+                * func.coalesce(trade_price, 0)
+            ).label("trade_dollar_volume"),
+        )
         .group_by(recent_trades.c.market_pk)
         .order_by(func.count().desc())
         .limit(limit)
@@ -482,7 +1437,11 @@ def _top_markets_payload(db: Session, limit: int) -> dict:
         return {"count": 0, "markets": []}
 
     trade_counts = {int(r.market_pk): int(r.trade_count or 0) for r in trade_rows}
+    trade_dollars = {
+        int(r.market_pk): float(r.trade_dollar_volume or 0.0) for r in trade_rows
+    }
     markets_by_pk = {m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()}
+    latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
 
     rows = [markets_by_pk[pk] for pk in pks if pk in markets_by_pk]
     return {
@@ -491,15 +1450,24 @@ def _top_markets_payload(db: Session, limit: int) -> dict:
             _serialize_market_row(
                 market,
                 trade_count=trade_counts.get(market.id, 0),
+                last_price=latest_by_pk.get(market.id, {}).get("last_price"),
+                volume_24h=latest_by_pk.get(market.id, {}).get("volume_24h"),
+                trade_dollar_volume=trade_dollars.get(market.id),
             )
             for market in rows
         ],
     }
 
 
-def _recent_anomalies_payload(db: Session, limit: int, severity: str | None) -> dict:
+def _recent_anomalies_payload(
+    db: Session,
+    limit: int,
+    severity: str | None,
+    *,
+    market_scope: str = "active",
+) -> dict:
     base = db.query(Anomaly, Market).join(Market, Market.id == Anomaly.market_pk)
-    base = base.filter(*_hydrated_market_filters())
+    base = base.filter(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
     if severity:
         base = base.filter(Anomaly.severity == severity)
     rows = (
@@ -550,13 +1518,35 @@ def _is_weak_factor_only_news_event(event: NewsEvent) -> bool:
     return float(components.get("factor_relevance") or 0.0) > 0
 
 
+def _news_relevance_component_payload(components: dict) -> dict:
+    keys = (
+        "lexical_relevance",
+        "entity_relevance",
+        "alias_relevance",
+        "factor_relevance",
+        "factor_hits",
+        "direction_hint",
+        "scorer",
+    )
+    return {key: components.get(key) for key in keys if key in components}
+
+
+def _news_candidate_generation_payload(components: dict) -> dict:
+    candidate = components.get("candidate_generation")
+    return candidate if isinstance(candidate, dict) else {}
+
+
 def _linked_news_article_payload(
     event: NewsEvent,
     article: NewsArticle,
     *,
     include_components: bool = True,
+    components_override: dict | None = None,
+    relevance_score_override: float | None = None,
 ) -> dict:
     components = _components_dict(event)
+    if components_override is not None:
+        components = {**components, **components_override}
     direction = components.get("market_direction")
     if not isinstance(direction, dict):
         direction = {}
@@ -577,7 +1567,12 @@ def _linked_news_article_payload(
         if article.first_seen_at
         else None,
         "tone": None,
-        "relevance_score": float(event.relevance_score or 0.0),
+        "relevance_score": float(
+            relevance_score_override
+            if relevance_score_override is not None
+            else event.relevance_score
+            or 0.0
+        ),
         "pre_news_trade_score": float(event.pre_news_trade_score or 0.0),
         "status": event.status,
         "leakage_window_seconds": event.leakage_window_seconds,
@@ -586,18 +1581,61 @@ def _linked_news_article_payload(
         "direction_confidence": direction.get("confidence"),
         "reasons": correlation.get("reasons") or [],
         "best_trade": correlation.get("best_trade"),
+        "relevance_components": _news_relevance_component_payload(components),
+        "candidate_generation": _news_candidate_generation_payload(components),
     }
     if include_components:
         payload["news_trade_correlation"] = correlation
     return payload
 
 
+def _current_news_link_for_market(
+    article: NewsArticle,
+    market: Market,
+    *,
+    min_relevance: float = 0.35,
+) -> tuple[float, dict] | None:
+    """Re-score stored news links against today's profile rules.
+
+    News links are derived materialization.  If profile rules improve, old
+    links can become stale; market-detail pages should not keep surfacing those
+    stale links just because the row still exists.
+    """
+
+    try:
+        profile = MarketNewsProfile(**profile_for_market(market))
+        relevance = hybrid_news_relevance(article, profile)
+        if relevance.score < min_relevance:
+            return None
+        components = components_with_market_direction(
+            article,
+            profile,
+            relevance.components,
+        )
+        return relevance.score, components
+    except Exception as exc:  # pragma: no cover - defensive read-path fallback
+        logger.info(
+            "current news relevance check failed for %s: %s",
+            market.market_id,
+            exc,
+        )
+        return None
+
+
 def _news_signal_payload(
     event: NewsEvent,
     article: NewsArticle,
     market: Market,
+    *,
+    components_override: dict | None = None,
+    relevance_score_override: float | None = None,
 ) -> dict:
-    article_payload = _linked_news_article_payload(event, article)
+    article_payload = _linked_news_article_payload(
+        event,
+        article,
+        components_override=components_override,
+        relevance_score_override=relevance_score_override,
+    )
     return {
         "event_id": event.id,
         "market_id": market.market_id,
@@ -629,35 +1667,53 @@ def _news_signals_payload(
     min_score: float,
     status: str | None = None,
     include_ambiguous: bool = False,
+    market_scope: str = "active",
 ) -> dict:
     q = (
         db.query(NewsEvent, NewsArticle, Market)
         .join(NewsArticle, NewsArticle.id == NewsEvent.article_id)
         .join(Market, Market.id == NewsEvent.market_pk)
-        .filter(*_hydrated_market_filters())
+        .filter(*(_news_link_market_filters() + _market_scope_filters(market_scope)))
         .filter(NewsEvent.pre_news_trade_score >= min_score)
     )
     if status:
         q = q.filter(NewsEvent.status == status)
+    scan_limit = limit if include_ambiguous else max(limit * 100, 500)
     rows = (
         q.order_by(
             NewsEvent.pre_news_trade_score.desc(),
             NewsArticle.first_seen_at.desc(),
             NewsEvent.id.desc(),
         )
-        .limit(limit if include_ambiguous else limit * 5)
+        .limit(scan_limit)
         .all()
     )
     signals: list[dict] = []
+    seen_article_event_groups: set[tuple[int | None, str]] = set()
     for event, article, market in rows:
         if _is_weak_factor_only_news_event(event):
             continue
-        payload = _news_signal_payload(event, article, market)
+        current_link = _current_news_link_for_market(article, market)
+        if current_link is None:
+            continue
+        current_relevance, current_components = current_link
+        payload = _news_signal_payload(
+            event,
+            article,
+            market,
+            components_override=current_components,
+            relevance_score_override=current_relevance,
+        )
         if (
             not include_ambiguous
             and payload["direction_label"] not in {"supports_yes", "supports_no"}
         ):
             continue
+        event_group = market.event_id or market.market_id or str(market.id)
+        dedupe_key = (article.id, event_group)
+        if dedupe_key in seen_article_event_groups:
+            continue
+        seen_article_event_groups.add(dedupe_key)
         signals.append(payload)
         if len(signals) >= limit:
             break
@@ -673,12 +1729,14 @@ def _suspicious_trades_payload(
     *,
     limit: int,
     sample: int = _SUSPICIOUS_TRADE_SAMPLE,
+    market_scope: str = "active",
 ) -> dict:
+    scope_filters = _market_scope_filters(market_scope)
     persisted = (
         db.query(TradeFlag, Trade, Market)
         .join(Trade, Trade.id == TradeFlag.trade_pk)
         .join(Market, Market.id == TradeFlag.market_pk)
-        .filter(*_hydrated_market_filters())
+        .filter(*(_hydrated_market_filters() + scope_filters))
         .order_by(TradeFlag.score.desc(), TradeFlag.ts.desc())
         .limit(limit)
         .all()
@@ -705,6 +1763,12 @@ def _suspicious_trades_payload(
                     "count": float(trade.count_fp)
                     if trade.count_fp is not None
                     else None,
+                    "trade_dollar_amount": _trade_notional_dollars(
+                        yes_price=trade.yes_price_dollars,
+                        no_price=trade.no_price_dollars,
+                        count=trade.count_fp,
+                        taker_side=trade.taker_side,
+                    ),
                     "taker_side": trade.taker_side,
                     "suspicion": float(flag.score),
                     "local_suspicion": float(flag.local_score),
@@ -726,7 +1790,7 @@ def _suspicious_trades_payload(
     rows = (
         db.query(Trade, Market)
         .join(Market, Market.id == Trade.market_pk)
-        .filter(*_hydrated_market_filters())
+        .filter(*(_hydrated_market_filters() + scope_filters))
         .order_by(Trade.ts.desc(), Trade.id.desc())
         .limit(sample)
         .all()
@@ -764,6 +1828,12 @@ def _suspicious_trades_payload(
                 if t.no_price_dollars is not None
                 else None,
                 "count": float(t.count_fp) if t.count_fp is not None else None,
+                "trade_dollar_amount": _trade_notional_dollars(
+                    yes_price=t.yes_price_dollars,
+                    no_price=t.no_price_dollars,
+                    count=t.count_fp,
+                    taker_side=t.taker_side,
+                ),
                 "taker_side": t.taker_side,
             }
             for t, _m in market_rows
@@ -827,6 +1897,7 @@ def _suspicious_trades_payload(
 def get_dashboard_overview(
     top: int = Query(default=15, ge=1, le=50),
     anomalies: int = Query(default=20, ge=1, le=100),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     severity: str | None = Query(
         default=None,
         description="If set, filter recent-anomalies in this bundle the same as `GET /anomalies`.",
@@ -837,19 +1908,24 @@ def get_dashboard_overview(
 
     Cuts TTFB vs four separate fetches; still runs the same SQL as those routes.
     """
-    cache_key = f"overview:{top}:{anomalies}:{severity or ''}"
+    cache_key = f"overview:{top}:{anomalies}:{severity or ''}:{market_scope}"
     return _cached_dashboard_payload(
         cache_key,
         lambda: {
-            "stats": _stats_payload(db),
-            "breakdown": _breakdown_payload(db),
-            "top_markets": _top_markets_payload(db, top),
-            "recent_anomalies": _recent_anomalies_payload(db, anomalies, severity),
-            "suspicious_trades": _suspicious_trades_payload(db, limit=12),
+            "stats": _stats_payload(db, market_scope=market_scope),
+            "breakdown": _breakdown_payload(db, market_scope=market_scope),
+            "top_markets": _top_markets_payload(db, top, market_scope="active"),
+            "recent_anomalies": _recent_anomalies_payload(
+                db, anomalies, severity, market_scope="active"
+            ),
+            "suspicious_trades": _suspicious_trades_payload(
+                db, limit=12, market_scope=market_scope
+            ),
             "news_signals": _news_signals_payload(
                 db,
                 limit=8,
-                min_score=4.0,
+                min_score=0.0,
+                market_scope=market_scope,
             ),
         },
     )
@@ -866,6 +1942,7 @@ _SORT_OPTIONS = {
     # high-prior markets with *no* flags sink with other quiet markets; tie
     # on `updated_at` (not on prior) within that tier.
     "surveillance_urgency": ("surveillance_urgency", "desc"),
+    "top_trade_flag": ("top_trade_flag_score", "desc"),
     "recent": ("created_at", "desc"),
     "title": ("title", "asc"),
     "anomalies": ("anomaly_count", "desc"),
@@ -881,6 +1958,7 @@ def list_markets(
     prior: str | None = Query(default=None),
     confidence: str | None = Query(default=None),
     status: str | None = Query(default=None),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     include_unhydrated: bool = Query(
         default=False,
         description="Include lazy WS-created rows whose exchange metadata/title has not been hydrated yet.",
@@ -889,9 +1967,9 @@ def list_markets(
         default="surveillance_urgency",
         description=(
             "trades_desc | trades_asc | priority | surveillance_urgency | "
-            "recent | title | anomalies — "
+            "top_trade_flag | recent | title | anomalies — "
             "`surveillance_urgency`: zero `anomaly_count` → flat floor; else "
-            "`(8+0.4*(prior_rank+1))*ln(1+count)` so evidence count dominates triage."
+            "`(8+0.4*(prior_rank+1))*ln(1+count)` so evidence count dominates watch priority."
         ),
     ),
     limit: int = Query(default=50, ge=1, le=200),
@@ -910,6 +1988,7 @@ def list_markets(
         "markets:"
         f"q={q or ''}:category={category or ''}:prior={prior or ''}:"
         f"confidence={confidence or ''}:status={status or ''}:"
+        f"market_scope={market_scope}:"
         f"include_unhydrated={int(include_unhydrated)}:sort={sort}:"
         f"limit={limit}:offset={offset}"
     )
@@ -921,6 +2000,7 @@ def list_markets(
             prior=prior,
             confidence=confidence,
             status=status,
+            market_scope=market_scope,
             include_unhydrated=include_unhydrated,
             sort=sort,
             limit=limit,
@@ -937,6 +2017,7 @@ def _list_markets_uncached(
     prior: str | None,
     confidence: str | None,
     status: str | None,
+    market_scope: str,
     include_unhydrated: bool,
     sort: str,
     limit: int,
@@ -946,6 +2027,7 @@ def _list_markets_uncached(
     filters = []
     if not include_unhydrated:
         filters.extend(_hydrated_market_filters())
+    filters.extend(_market_scope_filters(market_scope))
     if q:
         like = f"%{q}%"
         filters.append(
@@ -974,12 +2056,24 @@ def _list_markets_uncached(
         filters.append(Market.status == status)
 
     total_filters = [] if include_unhydrated else _hydrated_market_filters()
+    total_filters.extend(_market_scope_filters(market_scope))
     total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
     filtered = (
         db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
         if filters
         else total
     )
+
+    if _market_metrics_available(db):
+        return _list_markets_from_metric_projection(
+            db=db,
+            filters=filters,
+            total=int(total),
+            filtered=int(filtered),
+            sort=sort,
+            limit=limit,
+            offset=offset,
+        )
 
     candidate_sq = select(Market.id).where(and_(*filters)).subquery()
     trade_count_sq = (
@@ -994,15 +2088,25 @@ def _list_markets_uncached(
         .group_by(Anomaly.market_pk)
         .subquery()
     )
+    top_trade_flag_sq = (
+        select(TradeFlag.market_pk, func.max(TradeFlag.score).label("top_score"))
+        .join(candidate_sq, candidate_sq.c.id == TradeFlag.market_pk)
+        .group_by(TradeFlag.market_pk)
+        .subquery()
+    )
     base = (
         db.query(
             Market,
             func.coalesce(trade_count_sq.c.c, 0).label("trade_count"),
             func.coalesce(anomaly_count_sq.c.c, 0).label("anomaly_count"),
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).label(
+                "top_trade_flag_score"
+            ),
         )
         .join(candidate_sq, candidate_sq.c.id == Market.id)
         .outerjoin(trade_count_sq, trade_count_sq.c.market_pk == Market.id)
         .outerjoin(anomaly_count_sq, anomaly_count_sq.c.market_pk == Market.id)
+        .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
     )
 
     sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["surveillance_urgency"])
@@ -1015,14 +2119,19 @@ def _list_markets_uncached(
         base = base.order_by(coalesced.asc() if sort_dir == "asc" else coalesced.desc())
     elif sort_key == "anomaly_count":
         base = base.order_by(func.coalesce(anomaly_count_sq.c.c, 0).desc())
+    elif sort_key == "top_trade_flag_score":
+        base = base.order_by(
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
+            Market.updated_at.desc(),
+        )
     elif sort_key == "title":
         base = base.order_by(Market.title.asc())
     elif sort_key == "created_at":
         base = base.order_by(Market.created_at.desc())
     elif sort_key == "surveillance_urgency":
         # Evidence first: for ac0>0, ln(1+ac) dominates. Prior only scales a small
-        # bonus so a lower-triage market with many materialized flags can outrank
-        # a high-triage one with a single borderline row.
+        # bonus so a lower-priority market with many materialized alerts can outrank
+        # a high-priority one with a single borderline row.
         ac0 = func.coalesce(anomaly_count_sq.c.c, 0)
         pr0 = func.greatest(_prior_rank(), 0)
         ln1 = func.ln(1.0 * ac0 + 1.0)
@@ -1040,6 +2149,9 @@ def _list_markets_uncached(
         )
 
     rows = base.offset(offset).limit(limit).all()
+    latest_by_pk = _latest_snapshot_values_for_market_pks(
+        db, [int(r[0].id) for r in rows]
+    )
 
     event_ids = [r[0].event_id for r in rows if r[0].event_id]
     event_counts = {}
@@ -1060,6 +2172,9 @@ def _list_markets_uncached(
             r[0],
             trade_count=r.trade_count,
             anomaly_count=r.anomaly_count,
+            last_price=latest_by_pk.get(r[0].id, {}).get("last_price"),
+            volume_24h=latest_by_pk.get(r[0].id, {}).get("volume_24h"),
+            top_trade_flag_score=r.top_trade_flag_score,
             event_market_count=event_counts.get(r[0].event_id)
             if r[0].event_id
             else None,
@@ -1070,6 +2185,140 @@ def _list_markets_uncached(
     return {
         "total": int(total),
         "filtered": int(filtered),
+        "limit": limit,
+        "offset": offset,
+        "markets": items,
+    }
+
+
+def _list_markets_from_metric_projection(
+    *,
+    db: Session,
+    filters: list,
+    total: int,
+    filtered: int,
+    sort: str,
+    limit: int,
+    offset: int,
+) -> dict:
+    """Projection-first market list.
+
+    `market_metrics` is the compact read model maintained during ingest and by
+    maintenance/backfill jobs. Falling back to raw subqueries remains above for
+    fresh databases with no projection rows yet.
+    """
+
+    trade_count_col = func.coalesce(MarketMetric.trade_count, 0)
+    anomaly_count_col = func.coalesce(MarketMetric.anomaly_count, 0)
+    urgency_col = func.coalesce(MarketMetric.urgency_score, 0.0)
+    evidence_col = func.coalesce(MarketMetric.evidence_score, 0.0)
+    candidate_sq = select(Market.id).where(and_(*filters)).subquery()
+    top_trade_flag_sq = (
+        select(TradeFlag.market_pk, func.max(TradeFlag.score).label("top_score"))
+        .join(candidate_sq, candidate_sq.c.id == TradeFlag.market_pk)
+        .group_by(TradeFlag.market_pk)
+        .subquery()
+    )
+    base = (
+        db.query(
+            Market,
+            trade_count_col.label("trade_count"),
+            anomaly_count_col.label("anomaly_count"),
+            urgency_col.label("metric_urgency_score"),
+            evidence_col.label("metric_evidence_score"),
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).label(
+                "top_trade_flag_score"
+            ),
+            MarketMetric.last_price_cents,
+            MarketMetric.volume_24h_contracts,
+            MarketMetric.storage_tier,
+            MarketMetric.retention_score,
+        )
+        .join(candidate_sq, candidate_sq.c.id == Market.id)
+        .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
+        .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
+    )
+
+    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["surveillance_urgency"])
+    if sort_key == "trade_count":
+        base = base.order_by(
+            trade_count_col.asc() if sort_dir == "asc" else trade_count_col.desc()
+        )
+    elif sort_key == "anomaly_count":
+        base = base.order_by(anomaly_count_col.desc())
+    elif sort_key == "top_trade_flag_score":
+        base = base.order_by(
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
+            Market.updated_at.desc(),
+        )
+    elif sort_key == "title":
+        base = base.order_by(Market.title.asc())
+    elif sort_key == "created_at":
+        base = base.order_by(Market.created_at.desc())
+    elif sort_key == "surveillance_urgency":
+        base = base.order_by(urgency_col.desc(), Market.updated_at.desc())
+    else:
+        base = base.order_by(_prior_rank().desc(), trade_count_col.desc())
+
+    rows = base.offset(offset).limit(limit).all()
+    pks = [int(row[0].id) for row in rows]
+    latest_fallback = _latest_snapshot_values_for_market_pks(db, pks)
+
+    event_ids = [row[0].event_id for row in rows if row[0].event_id]
+    event_counts = {}
+    if event_ids:
+        event_counts = {
+            event_id: int(count)
+            for event_id, count in (
+                db.query(Market.event_id, func.count(Market.id))
+                .filter(Market.event_id.in_(event_ids))
+                .filter(*_hydrated_market_filters())
+                .group_by(Market.event_id)
+                .all()
+            )
+        }
+
+    items = []
+    for row in rows:
+        market = row[0]
+        metric_last_price = (
+            float(row.last_price_cents) / 100.0
+            if row.last_price_cents is not None
+            else None
+        )
+        metric_volume = (
+            float(row.volume_24h_contracts)
+            if row.volume_24h_contracts is not None
+            else None
+        )
+        fallback = latest_fallback.get(market.id, {})
+        items.append(
+            _serialize_market_row(
+                market,
+                trade_count=int(row.trade_count or 0),
+                anomaly_count=int(row.anomaly_count or 0),
+                last_price=metric_last_price
+                if metric_last_price is not None
+                else fallback.get("last_price"),
+                volume_24h=metric_volume
+                if metric_volume is not None
+                else fallback.get("volume_24h"),
+                event_market_count=event_counts.get(market.event_id)
+                if market.event_id
+                else None,
+                evidence_score=float(row.metric_evidence_score or 0.0),
+                urgency_score=float(row.metric_urgency_score or 0.0),
+                top_trade_flag_score=float(row.top_trade_flag_score or 0.0),
+                storage_tier=row.storage_tier,
+                retention_score=int(row.retention_score or 0)
+                if row.retention_score is not None
+                else None,
+            )
+        )
+
+    return {
+        "total": total,
+        "filtered": filtered,
         "limit": limit,
         "offset": offset,
         "markets": items,
@@ -1229,6 +2478,7 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
             reason_codes=reason_codes,
         ),
         "classifier_tags": market.classifier_tags or [],
+        "news_search_query": market_news_search_query(market),
         "stats": {
             "trade_count": int(trade_stats.c or 0),
             "first_trade_ts": trade_stats.first_ts.isoformat()
@@ -1317,6 +2567,12 @@ def get_market_series(
             if t.no_price_dollars is not None
             else None,
             "count": float(t.count_fp) if t.count_fp is not None else None,
+            "trade_dollar_amount": _trade_notional_dollars(
+                yes_price=t.yes_price_dollars,
+                no_price=t.no_price_dollars,
+                count=t.count_fp,
+                taker_side=t.taker_side,
+            ),
             "taker_side": t.taker_side,
         }
         for t in trade_rows
@@ -1428,39 +2684,46 @@ def get_market_anomalies(
 def list_recent_anomalies(
     limit: int = Query(default=20, ge=1, le=100),
     severity: str | None = Query(default=None),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Recent anomalies across all markets, with the parent market's
     classifier metadata so the frontend can render a category badge
     without a second round trip.
     """
-    cache_key = f"recent_anomalies:{limit}:{severity or ''}"
+    cache_key = f"recent_anomalies:{limit}:{severity or ''}:{market_scope}"
     return _cached_dashboard_payload(
         cache_key,
-        lambda: _recent_anomalies_payload(db, limit, severity),
+        lambda: _recent_anomalies_payload(
+            db, limit, severity, market_scope=market_scope
+        ),
     )
 
 
 @router.get("/top-markets")
 def get_top_markets(
     limit: int = Query(default=15, ge=1, le=50),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Top markets by trade count, for the overview leaderboard."""
     return _cached_dashboard_payload(
-        f"top_markets:{limit}",
-        lambda: _top_markets_payload(db, limit),
+        f"top_markets:{limit}:{market_scope}",
+        lambda: _top_markets_payload(db, limit, market_scope=market_scope),
     )
 
 
 @router.get("/suspicious-trades")
 def get_suspicious_trades(
     limit: int = Query(default=25, ge=1, le=100),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     db: Session = Depends(get_db),
 ) -> dict:
     return _cached_dashboard_payload(
-        f"suspicious_trades:{limit}",
-        lambda: _suspicious_trades_payload(db, limit=limit),
+        f"suspicious_trades:{limit}:{market_scope}",
+        lambda: _suspicious_trades_payload(
+            db, limit=limit, market_scope=market_scope
+        ),
     )
 
 
@@ -1470,16 +2733,19 @@ def get_news_signals(
     min_score: float = Query(default=4.0, ge=0.0, le=10.0),
     status: str | None = Query(default=None),
     include_ambiguous: bool = Query(default=False),
+    market_scope: str = Query(default="active", description="active | historical | all"),
     db: Session = Depends(get_db),
 ) -> dict:
     return _cached_dashboard_payload(
-        f"news_signals:{limit}:{min_score}:{status or ''}:{int(include_ambiguous)}",
+        f"news_signals:{limit}:{min_score}:{status or ''}:"
+        f"{int(include_ambiguous)}:{market_scope}",
         lambda: _news_signals_payload(
             db,
             limit=limit,
             min_score=min_score,
             status=status,
             include_ambiguous=include_ambiguous,
+            market_scope=market_scope,
         ),
     )
 
@@ -1516,7 +2782,18 @@ def _stored_news_for_market(
     for event, article in rows:
         if _is_weak_factor_only_news_event(event):
             continue
-        out.append(_linked_news_article_payload(event, article))
+        current_link = _current_news_link_for_market(article, market)
+        if current_link is None:
+            continue
+        current_relevance, current_components = current_link
+        out.append(
+            _linked_news_article_payload(
+                event,
+                article,
+                components_override=current_components,
+                relevance_score_override=current_relevance,
+            )
+        )
         if len(out) >= limit:
             break
     return out

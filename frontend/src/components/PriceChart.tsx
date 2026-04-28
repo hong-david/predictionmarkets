@@ -21,6 +21,14 @@ import type {
 } from "@/api/types";
 import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
 
+export interface ChartNewsEvent {
+  ts: string | null;
+  title: string | null;
+  source?: string | null;
+  direction_label?: string | null;
+  score?: number | null;
+}
+
 /**
  * Price + volume chart, with anomaly markers overlaid on the price
  * series.  Uses TradingView's `lightweight-charts` — same library that
@@ -53,15 +61,20 @@ export function PriceChart({
   series,
   anomalies,
   highlightTs,
+  newsEvents,
 }: {
   series: MarketSeries | undefined;
   anomalies: AnomalyRow[] | undefined;
   highlightTs?: string | null;
+  newsEvents?: ChartNewsEvent[];
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const priceRef = useRef<ISeriesApi<"Line"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const lineTimesRef = useRef<Time[]>([]);
+  const newsEventsRef = useRef<ChartNewsEvent[]>([]);
   const yRangeRef = useRef<{ minValue: number; maxValue: number }>({
     minValue: 0,
     maxValue: 1,
@@ -133,7 +146,18 @@ export function PriceChart({
     });
     volumeRef.current = volume;
 
+    const redrawNewsLines = () => {
+      renderNewsLineOverlay(
+        chart,
+        overlayRef.current,
+        lineTimesRef.current,
+        newsEventsRef.current,
+      );
+    };
+    chart.timeScale().subscribeVisibleTimeRangeChange(redrawNewsLines);
+
     return () => {
+      chart.timeScale().unsubscribeVisibleTimeRangeChange(redrawNewsLines);
       chart.remove();
       chartRef.current = null;
       priceRef.current = null;
@@ -147,6 +171,9 @@ export function PriceChart({
     if (!series) {
       priceRef.current.setData([]);
       volumeRef.current.setData([]);
+      lineTimesRef.current = [];
+      newsEventsRef.current = [];
+      clearNewsLineOverlay(overlayRef.current);
       return;
     }
 
@@ -171,6 +198,8 @@ export function PriceChart({
     }
 
     yRangeRef.current = dynamicProbabilityRange(linePoints.map((p) => p.value));
+    lineTimesRef.current = linePoints.map((p) => p.time);
+    newsEventsRef.current = newsEvents ?? [];
     priceRef.current.setData(linePoints);
     volumeRef.current.setData(volumePoints);
 
@@ -229,14 +258,27 @@ export function PriceChart({
     }
 
     chartRef.current?.timeScale().fitContent();
-  }, [series, anomalies, highlightTs]);
+    requestAnimationFrame(() => {
+      if (chartRef.current) {
+        renderNewsLineOverlay(
+          chartRef.current,
+          overlayRef.current,
+          lineTimesRef.current,
+          newsEventsRef.current,
+        );
+      }
+    });
+  }, [series, anomalies, highlightTs, newsEvents]);
 
   return (
-    <div
-      ref={containerRef}
-      className="h-[420px] w-full"
-      aria-label="Price and volume chart"
-    />
+    <div className="relative h-[420px] w-full" aria-label="Price and volume chart">
+      <div ref={containerRef} className="h-full w-full" />
+      <div
+        ref={overlayRef}
+        className="pointer-events-none absolute inset-0 overflow-hidden"
+        aria-hidden="true"
+      />
+    </div>
   );
 }
 
@@ -327,4 +369,62 @@ function nearestTime(
   return target - before <= at - target
     ? (sortedTimes[i - 1] as UTCTimestamp)
     : (sortedTimes[i] as UTCTimestamp);
+}
+
+function clearNewsLineOverlay(overlay: HTMLDivElement | null): void {
+  if (overlay) overlay.replaceChildren();
+}
+
+function renderNewsLineOverlay(
+  chart: IChartApi,
+  overlay: HTMLDivElement | null,
+  sortedTimes: Time[],
+  events: ChartNewsEvent[],
+): void {
+  if (!overlay) return;
+  overlay.replaceChildren();
+  if (!sortedTimes.length || !events.length) return;
+
+  const first = sortedTimes[0] as number;
+  const last = sortedTimes[sortedTimes.length - 1] as number;
+  const seen = new Set<number>();
+  const visibleEvents = events
+    .map((event) => ({ event, unix: event.ts ? parseChartUnix(event.ts) : null }))
+    .filter((row): row is { event: ChartNewsEvent; unix: number } => row.unix != null)
+    .filter((row) => row.unix >= first && row.unix <= last)
+    .sort((a, b) => a.unix - b.unix)
+    .slice(0, 16);
+
+  for (const { event, unix } of visibleEvents) {
+    let x = chart.timeScale().timeToCoordinate(unix as UTCTimestamp);
+    if (x == null) {
+      const snapped = nearestTime(sortedTimes, unix);
+      x = snapped == null ? null : chart.timeScale().timeToCoordinate(snapped);
+    }
+    if (x == null || x < 0 || x > overlay.clientWidth) continue;
+    const key = Math.round(x);
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const line = document.createElement("div");
+    line.className =
+      "absolute top-0 bottom-7 w-px bg-[hsl(var(--severity-medium))]/75";
+    line.style.left = `${x}px`;
+    overlay.append(line);
+
+    const label = document.createElement("div");
+    label.className =
+      "absolute top-2 rounded-sm border border-[hsl(var(--severity-medium))]/50 bg-card/90 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-foreground shadow-sm";
+    label.textContent = event.direction_label
+      ? `news ${event.direction_label.replace("supports_", "")}`
+      : "news";
+    label.style.left = `${Math.min(Math.max(x + 4, 4), Math.max(4, overlay.clientWidth - 86))}px`;
+    overlay.append(label);
+  }
+}
+
+function parseChartUnix(value: string): number | null {
+  const ms = new Date(value).getTime();
+  if (!Number.isFinite(ms)) return null;
+  return Math.floor(ms / 1000);
 }

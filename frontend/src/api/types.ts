@@ -16,17 +16,23 @@ export type Prior =
   | "unclassified"
   | string;
 export type Confidence = "high" | "medium" | "low" | "unclassified" | string;
+export type MarketScope = "active" | "historical" | "all";
 
 export interface SystemStats {
+  market_scope: MarketScope | string;
   markets: number;
+  markets_all: number;
+  markets_active: number;
+  markets_historical: number;
   markets_status_unknown: number;
   markets_high_prior: number;
-  /** Distinct markets with ≥1 `anomalies` row (evidence, not just triage). */
+  /** Distinct markets with at least one market-level alert row. */
   markets_with_flags: number;
   trades: number;
   snapshots: number;
   book_events: number;
   anomalies: number;
+  news_articles: number;
   anomalies_high_severity: number;
 }
 
@@ -64,7 +70,10 @@ export interface MarketRow {
   classifier_rule: string | null;
   open_time: string | null;
   close_time: string | null;
+  market_lifecycle: "active" | "historical" | "other" | "unknown" | "out_of_scope" | string;
+  is_active: boolean;
   trade_count: number;
+  trade_dollar_volume: number | null;
   anomaly_count: number;
   last_price: number | null;
   volume_24h: number | null;
@@ -72,12 +81,18 @@ export interface MarketRow {
   market_priority: string;
   /** 0–100 from stored `anomalies` row mass (not prior). */
   evidence_score: number;
-  /** 0–100 combined urgency aligned with the “Alerts first” sort. */
+  /** 0-100 combined urgency aligned with the activity-alerts-first sort. */
   urgency_score: number;
-  /** Deduped snake_case slugs from materialized `reasons[]` on alert rows. */
+  /** Highest durable per-trade flag score seen for this market, if any. */
+  top_trade_flag_score?: number | null;
+  /** Deduped snake_case slugs from materialized `reasons[]` on alert history rows. */
   reasons: string[];
   /** Number of hydrated contracts sharing the same Kalshi event_ticker. */
   event_market_count: number | null;
+  /** Raw retention tier from MarketMetric when available. */
+  storage_tier?: string | null;
+  /** Auditable raw-retention score from MarketMetric when available. */
+  retention_score?: number | null;
 }
 
 export interface MarketsList {
@@ -98,6 +113,7 @@ export interface EventGroup {
 
 export interface MarketDetail extends MarketRow {
   classifier_tags: string[];
+  news_search_query?: string | null;
   stats: {
     trade_count: number;
     first_trade_ts: string | null;
@@ -123,6 +139,8 @@ export interface TradePoint {
   yes_price: number | null;
   no_price: number | null;
   count: number | null;
+  /** Estimated dollars paid for this print: count times the side price. */
+  trade_dollar_amount?: number | null;
   taker_side: string | null;
   /** Local trade outlier score 0..10 vs this market’s own recent tape (API field name unchanged). */
   suspicion?: number | null;
@@ -144,6 +162,8 @@ export interface SuspiciousTrade {
   yes_price: number | null;
   no_price: number | null;
   count: number | null;
+  /** Estimated dollars paid for this print: count times the side price. */
+  trade_dollar_amount?: number | null;
   taker_side: string | null;
   suspicion: number;
   reasons: string[];
@@ -232,6 +252,8 @@ export interface NewsArticle {
   best_trade?: Record<string, unknown> | null;
   market_direction?: Record<string, unknown>;
   news_trade_correlation?: Record<string, unknown>;
+  relevance_components?: Record<string, unknown>;
+  candidate_generation?: Record<string, unknown>;
 }
 
 /** Correlates GDELT window with the tape; see `app/services/news_gdelt.py`. */
@@ -282,6 +304,97 @@ export interface NewsSignalsList {
   count: number;
   min_score: number;
   signals: NewsSignal[];
+}
+
+export type PipelineComponentStatus = "healthy" | "stale" | "empty" | "error";
+export type PipelineSummaryStatus = "healthy" | "degraded" | "empty" | "error";
+
+export interface PipelineHealthComponent {
+  key: string;
+  label: string;
+  status: PipelineComponentStatus;
+  latest_at: string | null;
+  age_seconds: number | null;
+  count: number | null;
+  description: string;
+  detail: string;
+  heartbeat_at?: string | null;
+  last_success_at?: string | null;
+  last_error_at?: string | null;
+  last_error?: string | null;
+  component_type?: string | null;
+  source?: string | null;
+  run_id?: string | null;
+}
+
+export interface PipelineHealth {
+  generated_at: string;
+  summary: {
+    status: PipelineSummaryStatus;
+    healthy: number;
+    stale: number;
+    empty: number;
+    error: number;
+    total: number;
+  };
+  components: PipelineHealthComponent[];
+}
+
+export interface SearchMarketResult {
+  kind: "market";
+  market_pk: number | null;
+  market_id: string;
+  event_id: string | null;
+  title: string | null;
+  subtitle: string | null;
+  status: string | null;
+  category: string | null;
+  subcategory: string | null;
+  manipulability_prior: Prior | null;
+  classifier_confidence: Confidence | null;
+  trade_count: number;
+  anomaly_count: number;
+  market_priority: string | null;
+  evidence_score: number;
+  urgency_score: number;
+  score: number | null;
+  url: string;
+  match_reason?: string | null;
+}
+
+export interface SearchNewsResult {
+  kind: "news";
+  article_id: number | null;
+  title: string | null;
+  summary: string | null;
+  url: string | null;
+  source: string | null;
+  source_tier: string | null;
+  language: string | null;
+  published_at: string | null;
+  first_seen_at: string | null;
+  score: number | null;
+  linked_market_count: number;
+  linked_markets: SearchMarketResult[];
+  pre_news_trade_score?: number;
+}
+
+export interface SearchSuggestion {
+  kind: "market" | "news";
+  label: string | null;
+  value: string | null;
+  url: string | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  scope: "all" | "markets" | "news" | "empty" | string;
+  provider: "opensearch" | "postgres" | "empty" | string;
+  fallback_reason?: string | null;
+  took_ms: number;
+  markets: SearchMarketResult[];
+  news: SearchNewsResult[];
+  suggestions: SearchSuggestion[];
 }
 
 export interface DashboardOverview {

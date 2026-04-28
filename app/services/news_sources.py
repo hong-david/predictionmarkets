@@ -21,12 +21,58 @@ from app.services.news_gdelt import tokenize_for_gdelt
 
 
 DEFAULT_RSS_FEEDS: tuple[str, ...] = (
+    # Public agencies / official releases.
     "https://www.federalreserve.gov/feeds/press_all.xml",
     "https://www.sec.gov/news/pressreleases.rss",
+    "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
+    "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",
+    "https://www.ftc.gov/feeds/press-release.xml",
+    "https://www.ftc.gov/feeds/press-release-competition.xml",
+    "https://www.bls.gov/feed/empsit.rss",
+    "https://www.bls.gov/feed/cpi.rss",
+    "https://www.bls.gov/feed/bls_latest.rss",
+    "https://www.eia.gov/rss/todayinenergy.xml",
+    # Crypto / markets.
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    # Broad news.
+    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
+    "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
+    "https://www.theguardian.com/world/rss",
+    "https://www.theguardian.com/us-news/rss",
+    "https://www.theguardian.com/business/rss",
     "https://feeds.bbci.co.uk/news/business/rss.xml",
     "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.bbci.co.uk/news/politics/rss.xml",
     "https://www.npr.org/rss/rss.php?id=1001",
+    "https://www.npr.org/rss/rss.php?id=1006",
+    "https://rss.politico.com/politics-news.xml",
+    # Markets / business wires with useful headlines.
+    "https://finance.yahoo.com/news/rssindex",
+    "https://www.marketwatch.com/rss/topstories",
+    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
+    "https://www.cnbc.com/id/10000113/device/rss/rss.html",
+    # Weather / public agencies.
+    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
+    "https://www.noaa.gov/rss.xml",
+    "https://www.nhc.noaa.gov/index-at.xml",
+    "https://www.nhc.noaa.gov/index-ep.xml",
+    # Sports/injury/newswire style feeds. Individual feed failures are isolated.
+    "https://www.espn.com/espn/rss/news",
+    "https://www.espn.com/espn/rss/nfl/news",
+    "https://www.espn.com/espn/rss/nba/news",
+    "https://www.espn.com/espn/rss/mlb/news",
+    "https://www.espn.com/espn/rss/nhl/news",
+    "https://www.espn.com/espn/rss/soccer/news",
+    "https://www.theguardian.com/sport/rss",
+    "https://www.cbssports.com/rss/headlines/",
+    "https://www.mlb.com/feeds/news/rss.xml",
 )
 
 _RSS_NAMESPACES = {

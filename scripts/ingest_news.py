@@ -7,6 +7,12 @@ import json
 
 from app.db.session import SessionLocal
 from app.services.news_ingestor import DEFAULT_GLOBAL_NEWS_QUERY, ingest_global_news
+from app.services.pipeline_heartbeat import (
+    mark_pipeline_error,
+    mark_pipeline_start,
+    mark_pipeline_success,
+    new_run_id,
+)
 
 
 def main() -> None:
@@ -31,6 +37,12 @@ def main() -> None:
     parser.add_argument("--max-candidates-per-article", type=int, default=None)
     parser.add_argument("--min-relevance", type=float, default=0.35)
     args = parser.parse_args()
+    run_id = new_run_id("news-ingest")
+    mark_pipeline_start(
+        "news_ingest",
+        detail="Starting standalone news ingest.",
+        run_id=run_id,
+    )
 
     db = SessionLocal()
     try:
@@ -48,9 +60,32 @@ def main() -> None:
             min_relevance=args.min_relevance,
         )
         db.commit()
+        mark_pipeline_success(
+            "news_ingest",
+            detail=(
+                f"Fetched {result.get('articles_seen', 0)} articles; "
+                f"linked {result.get('news_events_linked', 0)} events."
+            ),
+            run_id=run_id,
+            count=int(result.get("articles_upserted") or 0),
+            metadata=result,
+        )
+        mark_pipeline_success(
+            "news_links",
+            detail=f"Linked {result.get('news_events_linked', 0)} news events.",
+            run_id=run_id,
+            count=int(result.get("news_events_linked") or 0),
+            metadata=result,
+        )
         print(json.dumps(result, indent=2, sort_keys=True))
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        mark_pipeline_error(
+            "news_ingest",
+            exc,
+            detail="Standalone news ingest failed.",
+            run_id=run_id,
+        )
         raise
     finally:
         db.close()

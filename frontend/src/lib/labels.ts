@@ -3,7 +3,7 @@
  * stay in English snake_case; display strings are for first-time readers.
  */
 
-/** Insider-surveillance priority bucket (manipulability_prior). */
+/** Watch-priority bucket (`manipulability_prior`). */
 const PRIOR_LABELS: Record<string, string> = {
   high: "High",
   medium_high: "Elevated",
@@ -23,17 +23,17 @@ export function priorShort(p: string): string {
 
 /** One-line explainer for tooltips / help text. */
 export function priorHelp(): string {
-  return "Classifier *priority* (leak-sensitivity of this market type) — not the same as “alerts” in the right column, which count stored **evidence** rows. Use default sort to rank markets with alerts.";
+  return "Watch priority is the classifier's estimate of how sensitive this market type is to news or manipulation. It is not a suspicious-activity verdict.";
 }
 
-/** Market category / axis key from charts (includes literal “unclassified”). */
+/** Market category / axis key from charts (includes literal `unclassified`). */
 export function categoryDisplay(key: string): string {
   if (key === "unclassified") return "Not categorized yet";
   return key.replace(/_/g, " ");
 }
 
 export function categoryHelp(): string {
-  return "Topic bucket assigned automatically from the exchange’s tags and text (e.g. sports, economics). “Not categorized” means we have not stored a label yet.";
+  return "Topic bucket assigned automatically from the exchange tags and market text. Not categorized means we have not stored a label yet.";
 }
 
 export function layerDisplay(layer: string | null | undefined): string {

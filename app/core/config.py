@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""
+    kalshi_private_key_pem: str = ""
     kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 
     # orderbook_delta requires explicit market tickers. If a non-empty list is
@@ -37,12 +38,26 @@ class Settings(BaseSettings):
     clickhouse_batch_queue_size: int = 100000
     kalshi_raw_backend: str = "postgres"  # postgres | clickhouse | dual
 
+    opensearch_url: str = ""
+    opensearch_index_prefix: str = "predictionmarkets"
+    opensearch_timeout_sec: float = 2.0
+    search_postgres_profile_limit: int = 12000
+
     # Hot raw retention defaults. These are intentionally short because the
     # durable artifact is a promoted evidence bundle, not every Kalshi tick.
     kalshi_raw_observe_ttl_hours: int = 1
     kalshi_raw_sampled_ttl_hours: int = 24
     kalshi_raw_hot_ttl_hours: int = 168
     kalshi_raw_triggered_ttl_hours: int = 720
+
+    # Storage guardrails for dashboard health and maintenance scripts.
+    storage_warning_used_ratio: float = 0.80
+    storage_error_used_ratio: float = 0.90
+    retention_book_events_max_age_days: int = 7
+    retention_snapshot_observe_max_age_days: int = 2
+    retention_snapshot_sampled_max_age_days: int = 7
+    retention_snapshot_hot_max_age_days: int = 30
+    retention_batch_size: int = 5000
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -60,6 +75,18 @@ class Settings(BaseSettings):
     @property
     def redis_url(self) -> str:
         return f"redis://{self.redis_host}:{self.redis_port}/0"
+
+    @property
+    def search_url(self) -> str:
+        return self.opensearch_url or "http://127.0.0.1:9200"
+
+    @property
+    def search_index_prefix(self) -> str:
+        return self.opensearch_index_prefix or "predictionmarkets"
+
+    @property
+    def search_timeout_sec(self) -> float:
+        return float(self.opensearch_timeout_sec or 2.0)
 
 
 settings = Settings()

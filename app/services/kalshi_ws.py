@@ -19,6 +19,12 @@ from app.services.decimal_utils import parse_decimal
 from app.services.kalshi_auth import create_ws_headers
 from app.services.clickhouse_writer import clickhouse_batcher
 from app.services.market_metrics import bump_trade_metrics, upsert_quote_metrics
+from app.services.pipeline_heartbeat import (
+    mark_pipeline_error,
+    mark_pipeline_start,
+    new_run_id,
+    record_pipeline_heartbeat,
+)
 from app.services.retention import (
     RetentionSignals,
     StorageDecision,
@@ -774,6 +780,12 @@ def resolve_book_market_tickers() -> list[str]:
 
 async def consume_market_data_forever() -> None:
     backoff_seconds = 1
+    run_id = new_run_id("ws")
+    mark_pipeline_start(
+        "ws_trade_feed",
+        detail="WebSocket consumer starting.",
+        run_id=run_id,
+    )
 
     while True:
         try:
@@ -781,6 +793,7 @@ async def consume_market_data_forever() -> None:
             headers = create_ws_headers(
                 settings.kalshi_api_key_id,
                 settings.kalshi_private_key_path,
+                settings.kalshi_private_key_pem,
             )
 
             async with websockets.connect(
@@ -799,6 +812,12 @@ async def consume_market_data_forever() -> None:
                     )
                 )
                 logger.info("Subscribed to ticker + trade (session_id=%s).", session_id)
+                record_pipeline_heartbeat(
+                    "ws_trade_feed",
+                    detail="Connected and subscribed to ticker + trade.",
+                    run_id=run_id,
+                    metadata={"session_id": session_id},
+                )
 
                 # Subscribe 2: orderbook_delta for the selected markets only.
                 # Sent as a separate command because it needs a different
@@ -836,9 +855,29 @@ async def consume_market_data_forever() -> None:
                 ]
 
                 try:
+                    last_heartbeat = time.monotonic()
+                    message_count = 0
                     async for raw_message in websocket:
                         data = json.loads(raw_message)
                         await queue.put(data)
+                        message_count += 1
+                        now_m = time.monotonic()
+                        if now_m - last_heartbeat >= 30:
+                            record_pipeline_heartbeat(
+                                "ws_trade_feed",
+                                detail=(
+                                    f"Connected; queued {message_count} messages "
+                                    f"this session."
+                                ),
+                                run_id=run_id,
+                                count=message_count,
+                                metadata={
+                                    "session_id": session_id,
+                                    "queue_size": queue.qsize(),
+                                    "worker_count": len(workers),
+                                },
+                            )
+                            last_heartbeat = now_m
                 finally:
                     for _ in workers:
                         await queue.put(None)
@@ -846,6 +885,12 @@ async def consume_market_data_forever() -> None:
                     await asyncio.gather(*workers, return_exceptions=True)
 
         except Exception as exc:
+            mark_pipeline_error(
+                "ws_trade_feed",
+                exc,
+                detail=f"WebSocket error; reconnecting in {backoff_seconds}s.",
+                run_id=run_id,
+            )
             logger.warning(
                 "WebSocket consumer error: %s. Reconnecting in %ss...",
                 exc,

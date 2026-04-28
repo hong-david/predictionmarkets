@@ -4,15 +4,16 @@ import { ArrowLeft, ExternalLink } from "lucide-react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 
 import { api } from "@/api/client";
-import type { AnomalyRow, TradePoint } from "@/api/types";
+import type { AnomalyRow, NewsArticle, SearchNewsResult, TradePoint } from "@/api/types";
 import { Badge, priorVariant, severityVariant } from "@/components/Badge";
-import { layerDisplay, priorDisplay } from "@/lib/labels";
+import { categoryDisplay, layerDisplay, priorDisplay } from "@/lib/labels";
 import { humanizeAnomalyReason } from "@/lib/reasonPhrases";
 import { Card, CardBody, CardHeader } from "@/components/Card";
-import { PriceChart } from "@/components/PriceChart";
+import { type ChartNewsEvent, PriceChart } from "@/components/PriceChart";
 import { EmptyState, Skeleton } from "@/components/StatusBits";
 import {
   fmtAgo,
+  fmtDollars,
   fmtInt,
   fmtPrice,
   fmtTime,
@@ -49,6 +50,18 @@ export default function MarketDetailPage() {
     enabled: !!marketId,
     staleTime: 5 * 60_000,
   });
+  const relatedNewsSearchText =
+    detail.data?.news_search_query ||
+    [detail.data?.title, detail.data?.subtitle].filter(Boolean).join(" ");
+  const relatedNews = useQuery({
+    queryKey: ["marketRelatedNewsSearch", marketId, relatedNewsSearchText],
+    queryFn: () => api.search(relatedNewsSearchText, "news", 8),
+    enabled:
+      !!relatedNewsSearchText &&
+      !!news.data &&
+      (news.data.provider === "unavailable" || news.data.articles.length === 0),
+    staleTime: 5 * 60_000,
+  });
 
   if (detail.isError) {
     return (
@@ -69,6 +82,27 @@ export default function MarketDetailPage() {
   }
 
   const m = detail.data;
+  const relatedSearchNews = useMemo(
+    () =>
+      (relatedNews.data?.news ?? []).filter((article) =>
+        isRelatedSearchArticle(
+          article,
+          relatedNewsSearchText,
+          detail.data?.market_id,
+          detail.data?.event_id,
+        ),
+      ),
+    [
+      detail.data?.event_id,
+      detail.data?.market_id,
+      relatedNews.data?.news,
+      relatedNewsSearchText,
+    ],
+  );
+  const chartNewsEvents = useMemo(
+    () => buildChartNewsEvents(news.data?.articles ?? [], relatedSearchNews),
+    [news.data?.articles, relatedSearchNews],
+  );
   const { tradeHighlights, topSuspiciousTrades } = useMemo(() => {
     const trades = series.data?.trades;
     if (!trades?.length) {
@@ -143,6 +177,14 @@ export default function MarketDetailPage() {
                     {m.status ? (
                       <Badge variant="outline">{m.status}</Badge>
                     ) : null}
+                    <Badge
+                      variant={m.market_lifecycle === "active" ? "success" : "outline"}
+                      className="normal-case tracking-normal"
+                    >
+                      {m.market_lifecycle === "active"
+                        ? "active/open market"
+                        : "historical market"}
+                    </Badge>
                     {m.category ? (
                       <Badge variant="primary" className="font-mono normal-case tracking-normal">
                         {m.category}
@@ -209,8 +251,8 @@ export default function MarketDetailPage() {
               <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm">
                 <Stat label="Trades" value={fmtInt(m.stats.trade_count)} />
                 <Stat
-                  label="Stored alerts"
-                  title="Rows in the alerts table for this market — mostly one per quote snapshot that met the score floor, not one per trade."
+                  label="Alert history"
+                  title="Saved market-level alert rows for this market. Mostly quote/book snapshots that met the score floor, not individual trades."
                   value={fmtInt(m.anomaly_count)}
                 />
                 <Stat
@@ -228,19 +270,24 @@ export default function MarketDetailPage() {
               </div>
               <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm border-t border-border pt-3">
                 <Stat
-                  label="Evidence (0–100)"
-                  title="From stored alert rows and how many there are, not the manipulability prior alone."
-                  value={String(m.evidence_score ?? "—")}
+                  label="Watch priority"
+                  title="Classifier bucket for how sensitive this market type may be to news or manipulation. It is not a suspicious-activity verdict."
+                  value={priorDisplay(m.market_priority ?? "unclassified")}
                 />
                 <Stat
-                  label="Urgency (0–100)"
-                  title="Combined ‘Alerts first’ score: evidence + category priority, same family as the markets list sort."
-                  value={String(m.urgency_score ?? "—")}
+                  label="Topic"
+                  title="Automatically assigned from exchange tags and market text."
+                  value={m.category ? categoryDisplay(m.category) : "-"}
                 />
                 <Stat
-                  label="Category priority"
-                  title="Classifier `manipulability_prior` bucket (what to watch), separate from whether alerts fired."
-                  value={m.market_priority ?? "—"}
+                  label="Classifier"
+                  title="Confidence and rule source for the stored market labels."
+                  value={[
+                    m.classifier_confidence ?? null,
+                    layerDisplay(m.classifier_layer) || null,
+                  ]
+                    .filter(Boolean)
+                    .join(" / ") || "-"}
                 />
               </div>
               {m.reasons && m.reasons.length > 0 ? (
@@ -260,7 +307,7 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="Each point is a trade’s yes price. Curve: spline through prints (peaks are real prints, not a bid/ask band). Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. If several prints share one second, the x-axis nudges +1s so every print is visible. Bars: contracts in that print. Arrows: materialized rule rows on quotes (volume uses cumulative exchange volume, not bar height). Pan and zoom."
+          subtitle="Each point is a trade’s yes price. Curve: spline through prints (peaks are real prints, not a bid/ask band). Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. If several prints share one second, the x-axis nudges +1s so every print is visible. Bars: contracts in that print. Arrows: saved alert rows on quotes (volume uses cumulative exchange volume, not bar height). Pan and zoom."
           right={
             series.data
               ? [
@@ -291,6 +338,7 @@ export default function MarketDetailPage() {
                 series={series.data}
                 anomalies={anomalies.data?.anomalies}
                 highlightTs={highlightedTradeTs}
+                newsEvents={chartNewsEvents}
               />
             </div>
           )}
@@ -301,8 +349,8 @@ export default function MarketDetailPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader
-            title="Stored alerts"
-            subtitle="Rules on each quote snapshot (spread, volume step, book activity) — not one row per trade."
+            title="Alert history"
+            subtitle="Saved market-level quote, volume, spread, and order-book alerts kept for review after raw data is compacted."
             right={
               anomalies.data ? `${fmtInt(anomalies.data.count)} total` : ""
             }
@@ -313,7 +361,7 @@ export default function MarketDetailPage() {
                 <Skeleton className="h-32" />
               </div>
             ) : !anomalies.data?.anomalies.length ? (
-              <EmptyState>No stored alerts for this market.</EmptyState>
+              <EmptyState>No alert history for this market.</EmptyState>
             ) : (
               <>
                 {alertWhyBullets.length > 0 ? (
@@ -390,14 +438,36 @@ export default function MarketDetailPage() {
                 <Skeleton className="h-32" />
               </div>
             ) : news.data?.provider === "unavailable" ? (
-              <EmptyState>
-                Could not load public headlines from the news service on this run.{" "}
-                <span className="block text-[11px] mt-1">
-                  Often a network, firewall, or rate limit; the rest of the page still works.
-                </span>
-              </EmptyState>
+              relatedNews.isPending ? (
+                <div className="p-4">
+                  <Skeleton className="h-32" />
+                </div>
+              ) : relatedSearchNews.length ? (
+                <RelatedNewsSearchList articles={relatedSearchNews} />
+              ) : (
+                <EmptyState>
+                  No linked news found for this market yet.{" "}
+                  <span className="block text-[11px] mt-1">
+                    The external headline source may be unavailable, but the local
+                    news index also has no relevant stored article for this market.
+                  </span>
+                </EmptyState>
+              )
             ) : !news.data?.articles.length ? (
-              <EmptyState>No matching articles in the past 30 days.</EmptyState>
+              relatedNews.isPending ? (
+                <div className="p-4">
+                  <Skeleton className="h-32" />
+                </div>
+              ) : relatedSearchNews.length ? (
+                <RelatedNewsSearchList articles={relatedSearchNews} />
+              ) : (
+                <EmptyState>
+                  No linked news found for this market yet.{" "}
+                  <span className="block text-[11px] mt-1">
+                    Nothing stored or returned for the current news window.
+                  </span>
+                </EmptyState>
+              )
             ) : (
               <ul className="divide-y divide-border max-h-[480px] overflow-auto">
                 {news.data.articles.map((article, i) => {
@@ -446,6 +516,7 @@ export default function MarketDetailPage() {
                             {fmtInt(leakageMinutes)}m before news
                           </span>
                         ) : null}
+                        <NewsExplainHover article={article} />
                         {(article.reasons ?? []).slice(0, 3).map((reason) => (
                           <code
                             key={reason}
@@ -469,8 +540,8 @@ export default function MarketDetailPage() {
       {series.data?.trades.length ? (
         <Card>
           <CardHeader
-            title="Trades (top 30 by outlier signal)"
-            subtitle="Ranked by local outlier score, then cluster score, then size/move heuristics, then time — not chronology. Same tape as the chart. Amber rows: large or jumpy print, outlier ≥3.5, or cluster ≥3.5 — not a fraud judgment. Clustering is from public tape only, not account identity."
+            title="Local trade outliers"
+            subtitle="Top 30 recent trades in this market ranked by local tape behavior: size, price jump, same-side clustering, then time. This is for chart review and is narrower than the global trade flags."
           />
           <div className="overflow-x-auto">
             <table className="w-full">
@@ -498,6 +569,12 @@ export default function MarketDetailPage() {
                     Cluster
                   </th>
                   <th className="text-right px-4 py-2 font-medium">Contracts</th>
+                  <th
+                    className="text-right px-4 py-2 font-medium"
+                    title="Estimated dollars paid in this print: contracts times the yes/no side price."
+                  >
+                    Est $
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -548,12 +625,9 @@ export default function MarketDetailPage() {
                       </td>
                       <td className="px-4 py-1.5 text-right num">
                         {fmtInt(t.count != null ? Math.round(t.count) : null)}
-                        {h.bigSize ? (
-                          <span className="ml-1.5 text-[10px] uppercase text-[hsl(var(--severity-medium))] font-semibold">large</span>
-                        ) : null}
-                        {h.bigJump && !h.bigSize ? (
-                          <span className="ml-1.5 text-[10px] uppercase text-[hsl(var(--severity-medium))] font-semibold">move</span>
-                        ) : null}
+                      </td>
+                      <td className="px-4 py-1.5 text-right num">
+                        {fmtDollars(t.trade_dollar_amount ?? estimateTradeDollars(t))}
                       </td>
                     </tr>
                   );
@@ -583,6 +657,14 @@ function compareTradesBySuspiciousness(
   const hb = (h.get(b)?.bigSize ? 2 : 0) + (h.get(b)?.bigJump ? 1 : 0);
   if (hb !== ha) return hb - ha;
   return String(b.ts ?? "").localeCompare(String(a.ts ?? ""));
+}
+
+function estimateTradeDollars(t: TradePoint): number | null {
+  if (t.count == null) return null;
+  const side = (t.taker_side ?? "").toLowerCase();
+  const price =
+    side === "no" && t.no_price != null ? t.no_price : t.yes_price ?? t.no_price;
+  return price == null ? null : t.count * price;
 }
 
 function buildTradeHighlights(
@@ -658,5 +740,333 @@ function AnomalyRowItem({ a }: { a: AnomalyRow }) {
         </div>
       </div>
     </li>
+  );
+}
+
+function buildChartNewsEvents(
+  exactArticles: NewsArticle[],
+  searchArticles: SearchNewsResult[],
+): ChartNewsEvent[] {
+  const exact = exactArticles
+    .map((article) => ({
+      ts: article.first_seen_at ?? article.published_at ?? null,
+      title: article.title,
+      source: article.source,
+      direction_label: article.direction_label,
+      score: article.pre_news_trade_score ?? article.relevance_score ?? null,
+    }))
+    .filter((event) => event.ts);
+  if (exact.length) return exact;
+  return searchArticles
+    .map((article) => ({
+      ts: article.first_seen_at ?? article.published_at ?? null,
+      title: article.title,
+      source: article.source,
+      direction_label: null,
+      score: article.pre_news_trade_score ?? article.score ?? null,
+    }))
+    .filter((event) => event.ts);
+}
+
+function NewsExplainHover({
+  article,
+}: {
+  article: NewsArticle | SearchNewsResult;
+}) {
+  const newsArticle = article as NewsArticle;
+  const direction = recordValue(newsArticle.market_direction);
+  const relevance = recordValue(newsArticle.relevance_components);
+  const candidate = recordValue(newsArticle.candidate_generation);
+  const correlation = recordValue(newsArticle.news_trade_correlation);
+  const evidenceTerms = stringList(direction.evidence_terms).slice(0, 5);
+  const candidateReasons = stringList(candidate.candidate_reasons).slice(0, 5);
+  const matchedTerms = stringList(candidate.matched_terms).slice(0, 5);
+  const factorHits = recordValue(relevance.factor_hits);
+  const correlationReasons = stringList(correlation.reasons).slice(0, 5);
+  const directionLabel =
+    textValue(newsArticle.direction_label) ||
+    textValue(direction.label) ||
+    "unknown";
+  const directionConfidence =
+    numberValue(newsArticle.direction_confidence) ?? numberValue(direction.confidence);
+  const relevanceScore =
+    numberValue(newsArticle.relevance_score) ??
+    numberValue((article as SearchNewsResult).score);
+  const newsTradeScore =
+    numberValue(newsArticle.pre_news_trade_score) ??
+    numberValue((article as SearchNewsResult).pre_news_trade_score);
+
+  return (
+    <span className="relative inline-flex group" tabIndex={0}>
+      <span className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground group-hover:text-foreground">
+        Why
+      </span>
+      <span className="pointer-events-none absolute left-0 top-full z-30 mt-1 hidden w-[min(82vw,360px)] rounded-lg border border-border bg-card p-3 text-left text-[11px] leading-snug text-muted-foreground shadow-xl group-hover:block group-focus-within:block">
+        <span className="block text-xs font-semibold text-foreground">
+          Why this news is linked
+        </span>
+        <span className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
+          <ExplainMetric label="Relevance" value={formatExplainScore(relevanceScore)} />
+          <ExplainMetric label="News/trade" value={formatExplainScore(newsTradeScore)} />
+          <ExplainMetric label="Direction" value={directionLabel} />
+          <ExplainMetric
+            label="Confidence"
+            value={formatExplainPercent(directionConfidence)}
+          />
+        </span>
+        <ExplainLine
+          label="Orientation"
+          value={textValue(direction.market_orientation)}
+        />
+        <ExplainLine
+          label="Underlier"
+          value={textValue(direction.underlier_direction)}
+        />
+        <ExplainLine label="Rationale" value={textValue(direction.rationale)} />
+        <ExplainLine
+          label="Evidence terms"
+          value={evidenceTerms.length ? evidenceTerms.join(", ") : null}
+        />
+        <ExplainLine
+          label="Candidate reasons"
+          value={candidateReasons.length ? candidateReasons.join(", ") : null}
+        />
+        <ExplainLine
+          label="Matched terms"
+          value={matchedTerms.length ? matchedTerms.join(", ") : null}
+        />
+        <ExplainLine
+          label="Relevance pieces"
+          value={relevancePieces(relevance, factorHits)}
+        />
+        <ExplainLine
+          label="Trade timing"
+          value={
+            textValue(correlation.status) ||
+            (correlationReasons.length ? correlationReasons.join(", ") : null)
+          }
+        />
+        {"linked_market_count" in article ? (
+          <ExplainLine
+            label="Search links"
+            value={`${fmtInt(article.linked_market_count)} related markets in search`}
+          />
+        ) : null}
+      </span>
+    </span>
+  );
+}
+
+function ExplainMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <span>
+      <span className="block uppercase tracking-wider text-muted-foreground/80">
+        {label}
+      </span>
+      <span className="block truncate font-medium text-foreground">{value}</span>
+    </span>
+  );
+}
+
+function ExplainLine({
+  label,
+  value,
+}: {
+  label: string;
+  value: string | null;
+}) {
+  if (!value) return null;
+  return (
+    <span className="mt-2 block">
+      <span className="font-medium text-foreground">{label}: </span>
+      {value}
+    </span>
+  );
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function textValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && !!item)
+    : [];
+}
+
+const FALLBACK_NEWS_GENERIC_TERMS = new Set([
+  "above",
+  "after",
+  "before",
+  "below",
+  "director",
+  "event",
+  "leave",
+  "leaves",
+  "market",
+  "price",
+  "resolve",
+  "trade",
+  "trades",
+  "trading",
+  "will",
+  "year",
+]);
+
+const FALLBACK_NEWS_ANCHORS = new Set([
+  "ai",
+  "bnb",
+  "btc",
+  "cpi",
+  "doj",
+  "eth",
+  "fbi",
+  "fed",
+  "gdp",
+  "mlb",
+  "nba",
+  "nfl",
+  "nhl",
+  "nfp",
+  "pce",
+  "sec",
+  "sol",
+  "ufc",
+  "wti",
+  "xrp",
+]);
+
+function isRelatedSearchArticle(
+  article: SearchNewsResult,
+  query: string,
+  marketId?: string | null,
+  eventId?: string | null,
+): boolean {
+  if (
+    article.linked_markets.some(
+      (market) =>
+        market.market_id === marketId ||
+        (!!eventId && market.event_id === eventId),
+    )
+  ) {
+    return true;
+  }
+
+  const terms = fallbackSearchTerms(query);
+  if (!terms.length) return false;
+  const tokens = new Set(
+    `${article.title ?? ""} ${article.summary ?? ""}`
+      .toLowerCase()
+      .match(/[a-z0-9][a-z0-9_.-]*/g) ?? [],
+  );
+  const hits = terms.filter((term) => tokens.has(term));
+  if (hits.length >= Math.min(2, terms.length)) return true;
+  return hits.some((term) => FALLBACK_NEWS_ANCHORS.has(term));
+}
+
+function fallbackSearchTerms(query: string): string[] {
+  const seen = new Set<string>();
+  for (const raw of query.toLowerCase().match(/[a-z0-9][a-z0-9_.-]*/g) ?? []) {
+    if (FALLBACK_NEWS_GENERIC_TERMS.has(raw)) continue;
+    if (/^\d+$/.test(raw)) continue;
+    if (raw.length <= 2 && !FALLBACK_NEWS_ANCHORS.has(raw)) continue;
+    seen.add(raw);
+  }
+  return [...seen].slice(0, 8);
+}
+
+function formatExplainScore(value: number | null): string {
+  return value == null ? "n/a" : value.toFixed(value >= 1 ? 1 : 2);
+}
+
+function formatExplainPercent(value: number | null): string {
+  return value == null ? "n/a" : `${Math.round(value * 100)}%`;
+}
+
+function relevancePieces(
+  relevance: Record<string, unknown>,
+  factorHits: Record<string, unknown>,
+): string | null {
+  const pieces = [
+    ["lex", numberValue(relevance.lexical_relevance)],
+    ["entity", numberValue(relevance.entity_relevance)],
+    ["alias", numberValue(relevance.alias_relevance)],
+    ["factor", numberValue(relevance.factor_relevance)],
+  ]
+    .filter(([, value]) => value != null)
+    .map(([label, value]) => `${label} ${Number(value).toFixed(2)}`);
+  const factors = Object.keys(factorHits).slice(0, 4);
+  if (factors.length) pieces.push(`factors ${factors.join(", ")}`);
+  return pieces.length ? pieces.join(" / ") : null;
+}
+
+function RelatedNewsSearchList({ articles }: { articles: SearchNewsResult[] }) {
+  return (
+    <div>
+      <div className="px-4 py-2 border-b border-border bg-secondary/20 text-[11px] uppercase tracking-wider text-muted-foreground">
+        Search-backed related news
+      </div>
+      <ul className="divide-y divide-border max-h-[480px] overflow-auto">
+        {articles.map((article, i) => (
+          <li
+            key={`${article.article_id ?? "related"}-${i}`}
+            className="px-4 py-3 hover:bg-secondary/30 transition-colors"
+          >
+            <a
+              href={article.url ?? "#"}
+              target="_blank"
+              rel="noreferrer"
+              className="block group"
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className="text-sm font-medium leading-tight group-hover:text-primary line-clamp-2">
+                  {article.title}
+                </div>
+                <ExternalLink className="h-3 w-3 mt-0.5 text-muted-foreground flex-shrink-0" />
+              </div>
+              <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                {article.source ? <span>{article.source}</span> : null}
+                {article.first_seen_at ?? article.published_at ? (
+                  <>
+                    <span>/</span>
+                    <span>{fmtAgo(article.first_seen_at ?? article.published_at)}</span>
+                  </>
+                ) : null}
+                {article.linked_market_count ? (
+                  <>
+                    <span>/</span>
+                    <span>{fmtInt(article.linked_market_count)} linked markets</span>
+                  </>
+                ) : null}
+              </div>
+            </a>
+            {article.linked_markets.length ? (
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                <NewsExplainHover article={article} />
+                {article.linked_markets.slice(0, 4).map((market) => (
+                  <Link
+                    key={market.market_id}
+                    to={`/markets/${encodeURIComponent(market.market_id)}`}
+                    className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    {market.market_id}
+                  </Link>
+                ))}
+              </div>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }

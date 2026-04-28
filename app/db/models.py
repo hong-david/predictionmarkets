@@ -512,3 +512,45 @@ class CaseEvidence(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
+
+
+class PipelineHeartbeat(Base):
+    __tablename__ = "pipeline_heartbeats"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    label: Mapped[str] = mapped_column(String(128), nullable=False)
+    component_type: Mapped[str] = mapped_column(
+        String(32), default="job", nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), default="starting", nullable=False, index=True
+    )
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    count: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    heartbeat_count: Mapped[int] = mapped_column(
+        BigInteger, default=0, nullable=False
+    )
+    success_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    error_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        index=True,
+    )

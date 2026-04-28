@@ -34,13 +34,17 @@ export function EmptyState({
   );
 }
 
-/** Live-pulse dot. Green = streaming, yellow = stale, red = error. */
-export function StatusDot({ tone = "live" }: { tone?: "live" | "stale" | "error" }) {
+type StatusTone = "live" | "healthy" | "stale" | "empty" | "error";
+
+/** Live-pulse dot. Green = healthy, yellow = stale/empty, red = error. */
+export function StatusDot({ tone = "live" }: { tone?: StatusTone }) {
   const cls =
     tone === "error"
       ? "bg-[hsl(var(--severity-high))]"
       : tone === "stale"
         ? "bg-[hsl(var(--severity-medium))]"
+        : tone === "empty"
+          ? "bg-muted-foreground/50"
         : "bg-[hsl(var(--severity-low))]";
   return (
     <span

@@ -106,7 +106,7 @@ export default function EventGroupPage() {
                 <th className="text-left px-3 py-2.5 font-medium">Priority</th>
                 <th className="text-right px-3 py-2.5 font-medium">Last</th>
                 <th className="text-right px-3 py-2.5 font-medium">Trades</th>
-                <th className="text-right px-3 py-2.5 font-medium">Rule rows</th>
+                <th className="text-right px-3 py-2.5 font-medium">Alert history</th>
               </tr>
             </thead>
             <tbody>

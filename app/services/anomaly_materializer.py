@@ -1,15 +1,58 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy.orm import Session
 
 from app.db.models import Anomaly, Market, MarketSnapshot
 from app.services.anomaly_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
+from app.services.market_metrics import bump_anomaly_metrics
+from app.services.pipeline_heartbeat import mark_pipeline_success
 
 # Do not store / refresh rows for weak scores — they dominated the market-detail
 # chart. ~3.0 ≈ a single "medium" rule firing with headroom, or a few stacked
 # low signals. Tune alongside `anomaly_engine` thresholds.
 _MIN_SCORE_TO_PERSIST = 3.0
+_COMPACTION_COOLDOWN = timedelta(minutes=30)
+_SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _severity_rank(value: object) -> int:
+    return _SEVERITY_RANK.get(str(value or "").lower(), 0)
+
+
+def _reason_signature(reasons: object) -> tuple[str, ...]:
+    if not isinstance(reasons, list):
+        return ()
+    return tuple(sorted({str(reason) for reason in reasons}))
+
+
+def _should_create_new_row(
+    existing: Anomaly | None,
+    *,
+    severity: str,
+    now: datetime,
+    cooldown: timedelta = _COMPACTION_COOLDOWN,
+) -> bool:
+    """Return true only for an alert transition worth preserving as history."""
+
+    if existing is None:
+        return True
+    if _severity_rank(severity) > _severity_rank(existing.severity):
+        return True
+    created_at = _aware(existing.created_at)
+    if created_at is None:
+        return False
+    return now - created_at >= cooldown
 
 
 def materialize_market_anomaly(
@@ -31,6 +74,7 @@ def materialize_market_anomaly(
             "created_anomalies": 0,
             "updated_anomalies": 0,
             "deleted_anomalies": 0,
+            "compacted_anomalies": 0,
         }
 
     book_raw = collect_book_activity_signals(db, market.id)
@@ -54,11 +98,13 @@ def materialize_market_anomaly(
                 "created_anomalies": 0,
                 "updated_anomalies": 0,
                 "deleted_anomalies": 1,
+                "compacted_anomalies": 0,
             }
         return {
             "created_anomalies": 0,
             "updated_anomalies": 0,
             "deleted_anomalies": 0,
+            "compacted_anomalies": 0,
         }
 
     if existing is not None:
@@ -70,6 +116,34 @@ def materialize_market_anomaly(
             "created_anomalies": 0,
             "updated_anomalies": 1,
             "deleted_anomalies": 0,
+            "compacted_anomalies": 0,
+        }
+
+    latest_existing = (
+        db.query(Anomaly)
+        .filter(Anomaly.market_pk == market.id)
+        .order_by(Anomaly.created_at.desc(), Anomaly.id.desc())
+        .first()
+    )
+    if not _should_create_new_row(
+        latest_existing,
+        severity=str(analysis["severity"]),
+        now=datetime.now(timezone.utc),
+    ):
+        latest_existing.latest_snapshot_id = effective_latest_snapshot_id
+        latest_existing.score = analysis["score"]
+        latest_existing.severity = analysis["severity"]
+        latest_existing.reasons = analysis["reasons"]
+        latest_existing.signals = {
+            **(analysis["signals"] or {}),
+            "compacted_from_latest_snapshot_id": effective_latest_snapshot_id,
+            "reason_signature": list(_reason_signature(analysis["reasons"])),
+        }
+        return {
+            "created_anomalies": 0,
+            "updated_anomalies": 1,
+            "deleted_anomalies": 0,
+            "compacted_anomalies": 1,
         }
 
     row = Anomaly(
@@ -81,10 +155,18 @@ def materialize_market_anomaly(
         signals=analysis["signals"],
     )
     db.add(row)
+    bump_anomaly_metrics(
+        db,
+        market_pk=market.id,
+        anomaly_ts=datetime.now(timezone.utc),
+        prior=market.manipulability_prior,
+        severity=str(analysis["severity"]),
+    )
     return {
         "created_anomalies": 1,
         "updated_anomalies": 0,
         "deleted_anomalies": 0,
+        "compacted_anomalies": 0,
     }
 
 
@@ -96,6 +178,7 @@ def materialize_anomalies(
     created = 0
     updated = 0
     deleted = 0
+    compacted = 0
 
     markets = db.query(Market).order_by(Market.id.desc()).limit(market_limit).all()
 
@@ -104,11 +187,28 @@ def materialize_anomalies(
         created += result["created_anomalies"]
         updated += result["updated_anomalies"]
         deleted += result["deleted_anomalies"]
+        compacted += result["compacted_anomalies"]
 
     db.commit()
+    mark_pipeline_success(
+        "quote_book_anomalies",
+        detail=(
+            f"Scanned {len(markets)} markets; created {created}, updated {updated}, "
+            f"compacted {compacted}, deleted {deleted}."
+        ),
+        count=created + updated,
+        metadata={
+            "scanned_markets": len(markets),
+            "created": created,
+            "updated": updated,
+            "compacted": compacted,
+            "deleted": deleted,
+        },
+    )
 
     return {
         "created_anomalies": created,
         "updated_anomalies": updated,
         "deleted_anomalies": deleted,
+        "compacted_anomalies": compacted,
     }

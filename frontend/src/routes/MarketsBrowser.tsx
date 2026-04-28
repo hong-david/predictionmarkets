@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 import { api } from "@/api/client";
+import type { MarketScope } from "@/api/types";
 import { Badge, priorVariant } from "@/components/Badge";
 import { Card } from "@/components/Card";
 import { MarketCell } from "@/components/MarketCell";
@@ -14,17 +15,22 @@ import { cn, fmtInt, fmtPrice } from "@/lib/utils";
 const SORT_OPTIONS = [
   {
     value: "surveillance_urgency",
-    label: "Alerts first (evidence, then priority)",
+    label: "Activity alerts first",
   },
-  { value: "priority", label: "Priority, then volume" },
+  { value: "top_trade_flag", label: "Highest trade flag" },
+  { value: "priority", label: "Watch priority, then trades" },
   { value: "trades_desc", label: "Most trades" },
   { value: "trades_asc", label: "Fewest trades" },
-  { value: "anomalies", label: "Most stored alerts" },
+  { value: "anomalies", label: "Most alert history" },
   { value: "recent", label: "Newest in database" },
   { value: "title", label: "Title A–Z" },
 ];
 
 const PAGE_SIZE = 50;
+
+function parseMarketScope(value: string | null): MarketScope {
+  return value === "historical" || value === "all" ? value : "active";
+}
 
 /**
  * Markets browser. Server-side filtering, sorting, and pagination keep
@@ -47,14 +53,15 @@ export default function MarketsBrowserPage() {
     category: searchParams.get("category") || undefined,
     prior: searchParams.get("prior") || undefined,
     confidence: searchParams.get("confidence") || undefined,
+    market_scope: parseMarketScope(searchParams.get("market_scope")),
     sort: searchParams.get("sort") || "surveillance_urgency",
     offset: Number(searchParams.get("offset") || 0),
     limit: PAGE_SIZE,
   };
 
   const breakdown = useQuery({
-    queryKey: ["breakdown"],
-    queryFn: api.breakdown,
+    queryKey: ["breakdown", params.market_scope],
+    queryFn: () => api.breakdown({ market_scope: params.market_scope }),
     staleTime: 60_000,
   });
 
@@ -81,8 +88,15 @@ export default function MarketsBrowserPage() {
     if (params.category) n++;
     if (params.prior) n++;
     if (params.confidence) n++;
+    if (params.market_scope !== "active") n++;
     return n;
-  }, [params.q, params.category, params.prior, params.confidence]);
+  }, [
+    params.q,
+    params.category,
+    params.prior,
+    params.confidence,
+    params.market_scope,
+  ]);
 
   const totalLabel = list.data
     ? activeFilterCount > 0
@@ -129,9 +143,15 @@ export default function MarketsBrowserPage() {
                 <th className="text-left px-4 py-2.5 font-medium">Market</th>
                 <th
                   className="text-left px-3 py-2.5 font-medium"
+                  title="Live/open versus retained historical markets."
+                >
+                  State
+                </th>
+                <th
+                  className="text-left px-3 py-2.5 font-medium"
                   title={priorHelp()}
                 >
-                  Priority
+                  Watch priority
                 </th>
                 <th
                   className="text-left px-3 py-2.5 font-medium"
@@ -139,25 +159,18 @@ export default function MarketsBrowserPage() {
                 >
                   Classifier
                 </th>
-                <th className="text-right px-3 py-2.5 font-medium">Last</th>
+                <th
+                  className="text-right px-3 py-2.5 font-medium"
+                  title="Latest stored quote or trade price from the newest snapshot/projection."
+                >
+                  Last
+                </th>
                 <th className="text-right px-3 py-2.5 font-medium">Trades</th>
                 <th
                   className="text-right px-3 py-2.5 font-medium"
-                  title="Total stored anomaly rows: one per ticker snapshot (quote) that met the score floor — not one per trade. A hyped event can have many more rows than trade prints."
+                  title="Saved market-level quote/book alert history. A market can have many alert rows without every row being a separate trade."
                 >
-                  Alerts
-                </th>
-                <th
-                  className="text-right px-3 py-2.5 font-medium"
-                  title="0–100 from how many materialized alert rows exist for this market (not manipulability prior)"
-                >
-                  Evidence
-                </th>
-                <th
-                  className="text-right px-3 py-2.5 font-medium"
-                  title="0–100 combined ‘Alerts first’ signal: evidence + category priority"
-                >
-                  Urgency
+                  Alert history
                 </th>
                 <th
                   className="text-right px-3 py-2.5 font-medium w-28"
@@ -172,7 +185,7 @@ export default function MarketsBrowserPage() {
                 <SkeletonRows />
               ) : list.isError ? (
                 <tr>
-                  <td colSpan={9}>
+                  <td colSpan={8}>
                     <EmptyState>Failed to load markets: {String(list.error)}</EmptyState>
                   </td>
                 </tr>
@@ -184,6 +197,9 @@ export default function MarketsBrowserPage() {
                   >
                     <td className="px-4 py-2.5">
                       <MarketCell market={m} showCategory />
+                    </td>
+                    <td className="px-3 py-2.5 align-top">
+                      <StateBadge lifecycle={m.market_lifecycle} status={m.status} />
                     </td>
                     <td className="px-3 py-2.5 align-top">
                       {m.manipulability_prior ? (
@@ -214,12 +230,6 @@ export default function MarketsBrowserPage() {
                         <span className="text-muted-foreground">0</span>
                       )}
                     </td>
-                    <td className="px-3 py-2.5 text-right num text-sm align-top text-muted-foreground">
-                      {m.evidence_score}
-                    </td>
-                    <td className="px-3 py-2.5 text-right num text-sm align-top text-muted-foreground">
-                      {m.urgency_score}
-                    </td>
                     <td className="px-3 py-2.5 text-right align-top">
                       {m.event_id ? (
                         <Link
@@ -232,14 +242,14 @@ export default function MarketsBrowserPage() {
                             : "1 contract"}
                         </Link>
                       ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
+                        <span className="text-xs text-muted-foreground">single</span>
                       )}
                     </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td colSpan={9}>
+                  <td colSpan={8}>
                     <EmptyState>No markets match these filters.</EmptyState>
                   </td>
                 </tr>
@@ -333,6 +343,39 @@ function SortSelect({
   );
 }
 
+function StateBadge({
+  lifecycle,
+  status,
+}: {
+  lifecycle: string | null | undefined;
+  status: string | null | undefined;
+}) {
+  const state = lifecycle || "other";
+  const label =
+    state === "active" ? "active" : state === "historical" ? "historical" : state;
+  const title =
+    state === "active"
+      ? "This market is open/active and has not passed its close time."
+      : state === "historical"
+        ? "This market is closed, finalized, settled, or past its close time."
+        : `Exchange status: ${status ?? "unknown"}`;
+  return (
+    <span
+      title={title}
+      className={cn(
+        "inline-flex rounded border px-1.5 py-0.5 text-[11px] uppercase tracking-wider",
+        state === "active"
+          ? "border-[hsl(var(--severity-low))]/50 text-[hsl(var(--severity-low))]"
+          : state === "historical"
+            ? "border-border text-muted-foreground"
+            : "border-border text-muted-foreground",
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
 function FilterChips({
   params,
   breakdown,
@@ -343,9 +386,15 @@ function FilterChips({
     category?: string;
     prior?: string;
     confidence?: string;
+    market_scope: MarketScope;
   };
   breakdown:
-    | { by_category: { key: string; count: number }[]; by_prior: { key: string; count: number }[]; by_confidence: { key: string; count: number }[] }
+    | {
+        by_category: { key: string; count: number }[];
+        by_prior: { key: string; count: number }[];
+        by_confidence: { key: string; count: number }[];
+        category_x_prior: { category: string; prior: string; count: number }[];
+      }
     | undefined;
   onChange: (key: string, value: string | null) => void;
 }) {
@@ -367,8 +416,35 @@ function FilterChips({
     </button>
   );
 
+  const crossCount = (category: string, prior: string) =>
+    breakdown?.category_x_prior.find(
+      (row) => row.category === category && row.prior === prior,
+    )?.count ?? 0;
+
+  const priorityCount = (prior: string, fallback: number) =>
+    params.category ? crossCount(params.category, prior) : fallback;
+
+  const topicCount = (category: string, fallback: number) =>
+    params.prior ? crossCount(category, params.prior) : fallback;
+
   return (
     <div className="space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[11px] uppercase tracking-wider text-muted-foreground mr-1">
+          State
+        </span>
+        {[
+          ["active", "Active/open"],
+          ["historical", "Historical"],
+          ["all", "All retained"],
+        ].map(([value, label]) =>
+          chip(
+            params.market_scope === value,
+            label,
+            () => onChange("market_scope", value === "active" ? null : value),
+          ),
+        )}
+      </div>
       <div className="flex items-center gap-2 flex-wrap">
         <span
           className="text-[11px] uppercase tracking-wider text-muted-foreground mr-1"
@@ -383,7 +459,7 @@ function FilterChips({
               params.prior === b.key,
               priorShort(b.key),
               () => onChange("prior", params.prior === b.key ? null : b.key),
-              b.count,
+              priorityCount(b.key, b.count),
             ),
           )}
       </div>
@@ -399,7 +475,7 @@ function FilterChips({
               params.category === b.key,
               categoryDisplay(b.key),
               () => onChange("category", params.category === b.key ? null : b.key),
-              b.count,
+              topicCount(b.key, b.count),
             ),
           )}
       </div>
@@ -420,6 +496,9 @@ function SkeletonRows() {
             <Skeleton className="h-4 w-12" />
           </td>
           <td className="px-3 py-3">
+            <Skeleton className="h-4 w-16" />
+          </td>
+          <td className="px-3 py-3">
             <Skeleton className="h-4 w-12" />
           </td>
           <td className="px-3 py-3">
@@ -430,12 +509,6 @@ function SkeletonRows() {
           </td>
           <td className="px-3 py-3">
             <Skeleton className="h-4 w-10 ml-auto" />
-          </td>
-          <td className="px-3 py-3">
-            <Skeleton className="h-4 w-8 ml-auto" />
-          </td>
-          <td className="px-3 py-3">
-            <Skeleton className="h-4 w-8 ml-auto" />
           </td>
           <td className="px-2 py-3">
             <Skeleton className="h-4 w-8 mx-auto" />

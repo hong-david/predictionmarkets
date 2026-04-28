@@ -28,6 +28,21 @@ services:
     volumes:
       - clickhouse_data:/var/lib/clickhouse
 
+  opensearch:
+    image: opensearchproject/opensearch:2.15.0
+    container_name: predictionmarkets-opensearch
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+
 volumes:
   postgres_data:
   clickhouse_data:
+  opensearch_data:

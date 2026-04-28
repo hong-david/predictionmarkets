@@ -111,3 +111,91 @@ def test_candidate_limit_keeps_highest_scoring_profiles() -> None:
     candidates = news_market_candidates(article, [weaker, strong], max_candidates=1)
 
     assert [candidate.profile.market_pk for candidate in candidates] == [1]
+
+
+def test_generic_profile_words_do_not_crowd_out_specific_matches() -> None:
+    article = _article("Bitcoin pulls back from highs as crypto volume cools")
+    generic = _profile(
+        1,
+        category="sports_outcome",
+        keywords=["from", "will", "winner"],
+    )
+    crypto = _profile(
+        2,
+        category="crypto_strike",
+        keywords=["bitcoin", "btc", "crypto"],
+    )
+
+    candidates = news_market_candidates(article, [generic, crypto])
+
+    assert [candidate.profile.market_pk for candidate in candidates] == [2]
+
+
+def test_non_crypto_underlier_keyword_can_candidate_directly() -> None:
+    article = _article("Oil prices rise as supply risks grow")
+    oil = _profile(
+        1,
+        category="macro",
+        keywords=["wti", "oil", "above_threshold"],
+    )
+
+    candidates = news_market_candidates(article, [oil])
+
+    assert [candidate.profile.market_pk for candidate in candidates] == [1]
+    assert "oil" in candidates[0].matched_terms
+
+
+def test_macro_factor_candidate_uses_factor_specific_profile_anchor() -> None:
+    article = _article("Federal Reserve Board announces approval of bank merger")
+    oil = _profile(
+        1,
+        category="macro",
+        keywords=["wti", "oil", "above_threshold"],
+    )
+    fed = _profile(
+        2,
+        category="macro",
+        keywords=["fed", "rate", "above_threshold"],
+    )
+
+    candidates = news_market_candidates(article, [oil, fed])
+
+    assert [candidate.profile.market_pk for candidate in candidates] == [2]
+
+
+def test_corporate_factor_only_article_does_not_candidate_specific_metric_market() -> None:
+    article = _article(
+        "China blocks Meta takeover of AI agent developer Manus",
+        "Regulators opposed the acquisition.",
+    )
+    marriott_rooms = _profile(
+        1,
+        category="corporate",
+        keywords=[
+            "marriott",
+            "rooms",
+            "above_threshold",
+            "merger",
+            "single_actor_leverage",
+        ],
+    )
+
+    assert news_market_candidates(article, [marriott_rooms]) == []
+
+
+def test_corporate_factor_article_can_candidate_matching_company_market() -> None:
+    article = _article(
+        "China blocks Meta takeover of AI agent developer Manus",
+        "Regulators opposed the acquisition.",
+    )
+    meta_takeover = _profile(
+        1,
+        category="corporate",
+        keywords=["meta", "manus", "acquire", "above_threshold"],
+    )
+
+    candidates = news_market_candidates(article, [meta_takeover])
+
+    assert [candidate.profile.market_pk for candidate in candidates] == [1]
+    assert "keyword_overlap" in candidates[0].reasons
+    assert {"meta", "manus"}.issubset(candidates[0].matched_terms)

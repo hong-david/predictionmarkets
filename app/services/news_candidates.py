@@ -15,11 +15,111 @@ from typing import Iterable
 from app.db.models import MarketNewsProfile, NewsArticle
 from app.services.news_relevance import (
     CATEGORY_FACTOR_TERMS,
-    profile_supports_category_factor,
+    profile_supports_factor,
 )
 
 _TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
 _ORIENTATION_MARKERS = {"above_threshold", "below_threshold"}
+_ALLOWED_SHORT_TERMS = {
+    "ai",
+    "btc",
+    "eth",
+    "sol",
+    "xrp",
+    "bnb",
+    "sec",
+    "fed",
+    "cpi",
+    "pce",
+    "gdp",
+    "nfp",
+    "wti",
+    "oil",
+    "fda",
+    "nba",
+    "nfl",
+    "mlb",
+    "nhl",
+    "ufc",
+}
+_GENERIC_PROFILE_TERMS = {
+    "a",
+    "above",
+    "an",
+    "and",
+    "are",
+    "at",
+    "be",
+    "before",
+    "below",
+    "billion",
+    "by",
+    "company",
+    "companies",
+    "corp",
+    "corporation",
+    "during",
+    "end",
+    "event",
+    "for",
+    "from",
+    "game",
+    "greater",
+    "how",
+    "in",
+    "inc",
+    "international",
+    "is",
+    "its",
+    "least",
+    "league",
+    "less",
+    "llc",
+    "ltd",
+    "market",
+    "match",
+    "many",
+    "merger",
+    "million",
+    "most",
+    "new",
+    "not",
+    "of",
+    "on",
+    "or",
+    "over",
+    "plc",
+    "point",
+    "q1",
+    "q2",
+    "q3",
+    "q4",
+    "qualify",
+    "quarter",
+    "report",
+    "reported",
+    "reports",
+    "round",
+    "say",
+    "says",
+    "start",
+    "thousand",
+    "the",
+    "this",
+    "to",
+    "total",
+    "under",
+    "vs",
+    "what",
+    "when",
+    "which",
+    "who",
+    "will",
+    "win",
+    "winner",
+    "with",
+    "year",
+}
 
 
 @dataclass(frozen=True)
@@ -77,7 +177,11 @@ def _as_terms(values: Iterable[object] | None) -> tuple[str, ...]:
         dict.fromkeys(
             term
             for value in (values or [])
-            if (term := _norm(value)) and term not in _ORIENTATION_MARKERS
+            if (term := _norm(value))
+            and term not in _ORIENTATION_MARKERS
+            and term not in _GENERIC_PROFILE_TERMS
+            and not term.replace(".", "", 1).isdigit()
+            and (len(term) > 2 or term in _ALLOWED_SHORT_TERMS)
         )
     )
 
@@ -86,15 +190,14 @@ def _strong_factor_hits_for_category(
     article_text: str,
     profile: MarketNewsProfile,
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    if not profile_supports_category_factor(profile):
-        return ()
-
     factors = CATEGORY_FACTOR_TERMS.get(_norm(profile.category), {})
     if not factors:
         return ()
 
     hits_by_factor: list[tuple[str, tuple[str, ...]]] = []
     for factor, terms in factors.items():
+        if not profile_supports_factor(profile, factor):
+            continue
         hits = _phrase_hits(article_text, terms)
         if hits:
             hits_by_factor.append((factor, hits))
@@ -148,6 +251,14 @@ def news_market_candidates(
             matched_terms.extend(entity_hits)
 
         factor_hits = _strong_factor_hits_for_category(text, profile)
+        if (
+            factor_hits
+            and _norm(profile.category) == "corporate"
+            and not keyword_hits
+            and not alias_hits
+            and not entity_hits
+        ):
+            factor_hits = ()
         if factor_hits:
             score += 2.5
             reasons.append("category_factor")

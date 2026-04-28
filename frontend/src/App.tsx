@@ -5,6 +5,7 @@ import EventGroupPage from "./routes/EventGroup";
 import MarketDetailPage from "./routes/MarketDetail";
 import MarketsBrowserPage from "./routes/MarketsBrowser";
 import OverviewPage from "./routes/Overview";
+import { GlobalSearch } from "./components/GlobalSearch";
 import { cn } from "./lib/utils";
 
 function NavTab({ to, label, end }: { to: string; label: string; end?: boolean }) {
@@ -47,10 +48,13 @@ export default function App() {
               </div>
             </div>
           </Link>
-          <nav className="flex items-center gap-1 rounded-lg bg-secondary/50 p-1">
-            <NavTab to="/" label="Overview" end />
-            <NavTab to="/markets" label="Markets" />
-          </nav>
+          <div className="flex items-center gap-3">
+            <GlobalSearch />
+            <nav className="flex items-center gap-1 rounded-lg bg-secondary/50 p-1">
+              <NavTab to="/" label="Overview" end />
+              <NavTab to="/markets" label="Markets" />
+            </nav>
+          </div>
         </div>
       </header>
       <main className="container flex-1 py-6 animate-fade-in">

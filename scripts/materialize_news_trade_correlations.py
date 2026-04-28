@@ -12,23 +12,54 @@ from app.services.news_trade_correlation import (
     materialize_news_trade_correlations,
     materialize_news_trade_correlations_async,
 )
+from app.services.pipeline_heartbeat import (
+    mark_pipeline_error,
+    mark_pipeline_start,
+    mark_pipeline_success,
+    new_run_id,
+)
 
 
 async def _watch(args: argparse.Namespace) -> None:
     while True:
-        result = await materialize_news_trade_correlations_async(
-            max_events=args.max_events,
-            batch_size=args.batch_size,
-            min_relevance=args.min_relevance,
-            lookback_hours=args.lookback_hours,
-            max_trades_per_event=args.max_trades_per_event,
-            trade_flag_scorer_version=args.trade_flag_scorer_version,
-            rescore=args.rescore,
-            promote_cases=not args.no_promote_cases,
-            dry_run=args.dry_run,
-            sleep_seconds=args.batch_sleep_seconds,
+        run_id = new_run_id("news-trade")
+        mark_pipeline_start(
+            "news_trade_correlations",
+            detail="Starting async news/trade correlation sweep.",
+            run_id=run_id,
         )
-        print(json.dumps(result, indent=2, sort_keys=True))
+        try:
+            result = await materialize_news_trade_correlations_async(
+                max_events=args.max_events,
+                batch_size=args.batch_size,
+                min_relevance=args.min_relevance,
+                lookback_hours=args.lookback_hours,
+                max_trades_per_event=args.max_trades_per_event,
+                trade_flag_scorer_version=args.trade_flag_scorer_version,
+                rescore=args.rescore,
+                promote_cases=not args.no_promote_cases,
+                dry_run=args.dry_run,
+                sleep_seconds=args.batch_sleep_seconds,
+            )
+            mark_pipeline_success(
+                "news_trade_correlations",
+                detail=(
+                    f"Processed {result.get('processed', 0)} events; "
+                    f"promoted {result.get('promoted', 0)}."
+                ),
+                run_id=run_id,
+                count=int(result.get("updated") or 0),
+                metadata=result,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+        except Exception as exc:
+            mark_pipeline_error(
+                "news_trade_correlations",
+                exc,
+                detail="Async news/trade correlation sweep failed.",
+                run_id=run_id,
+            )
+            raise
         await asyncio.sleep(args.interval_seconds)
 
 
@@ -61,21 +92,46 @@ def main() -> None:
         asyncio.run(_watch(args))
         return
 
+    run_id = new_run_id("news-trade")
+    mark_pipeline_start(
+        "news_trade_correlations",
+        detail="Starting news/trade correlation materializer.",
+        run_id=run_id,
+    )
     if args.async_run:
-        result = asyncio.run(
-            materialize_news_trade_correlations_async(
-                max_events=args.max_events,
-                batch_size=args.batch_size,
-                min_relevance=args.min_relevance,
-                lookback_hours=args.lookback_hours,
-                max_trades_per_event=args.max_trades_per_event,
-                trade_flag_scorer_version=args.trade_flag_scorer_version,
-                rescore=args.rescore,
-                promote_cases=not args.no_promote_cases,
-                dry_run=args.dry_run,
-                sleep_seconds=args.batch_sleep_seconds,
+        try:
+            result = asyncio.run(
+                materialize_news_trade_correlations_async(
+                    max_events=args.max_events,
+                    batch_size=args.batch_size,
+                    min_relevance=args.min_relevance,
+                    lookback_hours=args.lookback_hours,
+                    max_trades_per_event=args.max_trades_per_event,
+                    trade_flag_scorer_version=args.trade_flag_scorer_version,
+                    rescore=args.rescore,
+                    promote_cases=not args.no_promote_cases,
+                    dry_run=args.dry_run,
+                    sleep_seconds=args.batch_sleep_seconds,
+                )
             )
-        )
+            mark_pipeline_success(
+                "news_trade_correlations",
+                detail=(
+                    f"Processed {result.get('processed', 0)} events; "
+                    f"promoted {result.get('promoted', 0)}."
+                ),
+                run_id=run_id,
+                count=int(result.get("updated") or 0),
+                metadata=result,
+            )
+        except Exception as exc:
+            mark_pipeline_error(
+                "news_trade_correlations",
+                exc,
+                detail="Async news/trade correlation materializer failed.",
+                run_id=run_id,
+            )
+            raise
         print(json.dumps(result, indent=2, sort_keys=True))
         return
 
@@ -93,9 +149,25 @@ def main() -> None:
             promote_cases=not args.no_promote_cases,
             dry_run=args.dry_run,
         )
+        mark_pipeline_success(
+            "news_trade_correlations",
+            detail=(
+                f"Processed {result.get('processed', 0)} events; "
+                f"promoted {result.get('promoted', 0)}."
+            ),
+            run_id=run_id,
+            count=int(result.get("updated") or 0),
+            metadata=result,
+        )
         print(json.dumps(result, indent=2, sort_keys=True))
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        mark_pipeline_error(
+            "news_trade_correlations",
+            exc,
+            detail="News/trade correlation materializer failed.",
+            run_id=run_id,
+        )
         raise
     finally:
         db.close()

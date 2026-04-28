@@ -150,7 +150,7 @@ RULES: list[Rule] = [
     ),
     Rule(
         name="corporate.merger",
-        pattern=_re(r"^KX(?:MERGER|ACQUISITION|MA)"),
+        pattern=_re(r"^KX(?:MERGER|ACQUISITION|MA)(?:-|$)"),
         category="corporate",
         subcategory="merger",
         tags=("merger", "single_actor_leverage"),

@@ -2,6 +2,12 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app.db.models import Market
+from app.services.news_correlation import (
+    is_news_profile_candidate,
+    market_news_search_query,
+    profile_for_market,
+)
 from app.services.news_ingestor import ingest_global_news, normalize_gdelt_article
 
 
@@ -39,6 +45,7 @@ def test_ingest_global_news_fails_open_when_gdelt_unavailable(monkeypatch) -> No
         "app.services.news_ingestor.refresh_market_news_profiles", fake_refresh
     )
     monkeypatch.setattr("app.services.news_ingestor.fetch_gdelt_articles", fake_fetch)
+    monkeypatch.setattr("app.services.news_ingestor.fetch_rss_articles", lambda *a, **k: [])
 
     result = ingest_global_news(
         object(),
@@ -53,3 +60,108 @@ def test_ingest_global_news_fails_open_when_gdelt_unavailable(monkeypatch) -> No
     assert result["news_events_linked"] == 0
     assert result["provider_status"] == "unavailable"
     assert "ConnectTimeout" in result["fetch_error"]
+
+
+def test_news_profile_scope_includes_retention_excluded_news_markets() -> None:
+    market = Market(
+        id=1,
+        platform="kalshi",
+        market_id="KXBTC-TEST",
+        title="Will Bitcoin trade above $100,000 by year end?",
+        status="out_of_scope",
+        category="crypto_strike",
+        classifier_layer="prefix_rule",
+        classifier_confidence="high",
+        classifier_tags=["crypto", "btc", "public_underlying"],
+    )
+
+    assert is_news_profile_candidate(market) is True
+
+    profile = profile_for_market(market)
+    assert "bitcoin" in profile["normalized_keywords"]
+    assert "btc" in profile["normalized_keywords"]
+    assert "above_threshold" in profile["normalized_keywords"]
+
+
+def test_news_profile_ignores_untrusted_classifier_tags_as_anchors() -> None:
+    market = Market(
+        id=1,
+        platform="kalshi",
+        market_id="KXNASDAQ100U-TEST",
+        title="Will the Nasdaq-100 be above 28699.99 at 4pm EDT?",
+        status="out_of_scope",
+        category="crypto_strike",
+        classifier_layer="knn_embedding",
+        classifier_confidence="medium",
+        classifier_tags=["crypto", "btc", "public_underlying"],
+    )
+
+    profile = profile_for_market(market)
+
+    assert "nasdaq-100" in profile["normalized_keywords"]
+    assert "above_threshold" in profile["normalized_keywords"]
+    assert "btc" not in profile["normalized_keywords"]
+    assert "bitcoin" not in profile["normalized_keywords"]
+    assert "crypto" not in profile["normalized_keywords"]
+
+
+def test_news_profile_drops_structural_classifier_tags_for_corporate_metrics() -> None:
+    market = Market(
+        id=4,
+        platform="kalshi",
+        market_id="KXMAR-26MAYROOMS-1760000",
+        title="Will Marriott International report above 1.76 million total rooms in Q1 2026?",
+        status="active",
+        category="corporate",
+        classifier_layer="prefix_rule",
+        classifier_confidence="high",
+        classifier_tags=["merger", "single_actor_leverage"],
+    )
+
+    profile = profile_for_market(market)
+
+    assert "marriott" in profile["normalized_keywords"]
+    assert "rooms" in profile["normalized_keywords"]
+    assert "above_threshold" in profile["normalized_keywords"]
+    assert "merger" not in profile["normalized_keywords"]
+    assert "single_actor_leverage" not in profile["normalized_keywords"]
+    assert "international" not in profile["normalized_keywords"]
+    assert "report" not in profile["normalized_keywords"]
+    assert "million" not in profile["normalized_keywords"]
+
+
+def test_news_profile_scope_still_excludes_unhydrated_and_exotic_markets() -> None:
+    unknown = Market(
+        id=1,
+        platform="kalshi",
+        market_id="KXUNKNOWN",
+        title="KXUNKNOWN",
+        status="unknown",
+        category="other",
+    )
+    exotic = Market(
+        id=2,
+        platform="kalshi",
+        market_id="KXMVECROSSCATEGORY-TEST",
+        title="Will this multi-leg combo resolve yes?",
+        status="out_of_scope",
+        category="exotic_combo",
+    )
+
+    assert is_news_profile_candidate(unknown) is False
+    assert is_news_profile_candidate(exotic) is False
+
+
+def test_market_news_search_query_drops_dates_ticker_and_generic_terms() -> None:
+    market = Market(
+        id=3,
+        platform="kalshi",
+        market_id="KXKASHOUT-26APR-MAY01",
+        title="Will Kash Patel leaves as FBI Director before May 1, 2026?",
+        status="active",
+        category="politics",
+    )
+
+    query = market_news_search_query(market)
+
+    assert query == "kash patel fbi"

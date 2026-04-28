@@ -56,7 +56,11 @@ def test_stats_returns_expected_keys(client: TestClient) -> None:
     assert r.status_code == 200
     body = r.json()
     expected = {
+        "market_scope",
         "markets",
+        "markets_all",
+        "markets_active",
+        "markets_historical",
         "markets_status_unknown",
         "markets_high_prior",
         "markets_with_flags",
@@ -64,10 +68,12 @@ def test_stats_returns_expected_keys(client: TestClient) -> None:
         "snapshots",
         "book_events",
         "anomalies",
+        "news_articles",
         "anomalies_high_severity",
     }
     assert expected <= body.keys()
-    for k in expected:
+    assert body["market_scope"] in {"active", "historical", "all"}
+    for k in expected - {"market_scope"}:
         assert isinstance(body[k], int) and body[k] >= 0
 
 
@@ -84,6 +90,40 @@ def test_breakdown_returns_pivots(client: TestClient) -> None:
     assert "category_x_prior" in body
     for entry in body["category_x_prior"]:
         assert {"category", "prior", "count"} <= entry.keys()
+
+
+def test_pipeline_health_returns_component_statuses(client: TestClient) -> None:
+    r = client.get("/api/dashboard/pipeline-health")
+    assert r.status_code == 200
+    body = r.json()
+    assert {"generated_at", "summary", "components"} <= body.keys()
+    assert body["summary"]["total"] == len(body["components"])
+    assert body["summary"]["status"] in {"healthy", "degraded", "empty", "error"}
+    expected_keys = {
+        "api",
+        "market_poller",
+        "ws_trade_feed",
+        "news_ingest",
+        "news_links",
+        "news_trade_correlations",
+        "trade_flags",
+        "quote_book_anomalies",
+        "retention_projection",
+        "storage_guardrails",
+    }
+    assert expected_keys == {c["key"] for c in body["components"]}
+    for component in body["components"]:
+        assert {
+            "key",
+            "label",
+            "status",
+            "latest_at",
+            "age_seconds",
+            "count",
+            "description",
+            "detail",
+        } <= component.keys()
+        assert component["status"] in {"healthy", "stale", "empty", "error"}
 
 
 def test_markets_list_pagination_and_filters(client: TestClient) -> None:
@@ -109,6 +149,7 @@ def test_markets_list_pagination_and_filters(client: TestClient) -> None:
             "market_priority",
             "evidence_score",
             "urgency_score",
+            "top_trade_flag_score",
             "reasons",
         } <= m.keys()
 
@@ -121,6 +162,14 @@ def test_markets_list_pagination_and_filters(client: TestClient) -> None:
     assert body2["filtered"] <= body2["total"]
     for m in body2["markets"]:
         assert m["category"] == "sports_outcome"
+
+    r_sort = client.get(
+        "/api/dashboard/markets",
+        params={"sort": "top_trade_flag", "limit": 5},
+    )
+    assert r_sort.status_code == 200
+    for m in r_sort.json()["markets"]:
+        assert "top_trade_flag_score" in m
 
     # NULL category in DB is shown as the string "unclassified" in
     # breakdown charts; the list filter must match the same rule.
@@ -192,7 +241,7 @@ def test_market_series_shape(client: TestClient) -> None:
     assert isinstance(body["trades"], list)
     assert isinstance(body["snapshots"], list)
     for t in body["trades"]:
-        assert {"ts", "yes_price", "count", "taker_side"} <= t.keys()
+        assert {"ts", "yes_price", "count", "taker_side", "trade_dollar_amount"} <= t.keys()
         if "suspicion" in t and t["suspicion"] is not None:
             assert 0.0 <= float(t["suspicion"]) <= 10.0
         if "cluster_0_10" in t and t["cluster_0_10"] is not None:

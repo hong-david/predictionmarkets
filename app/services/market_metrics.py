@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -10,12 +11,16 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.models import MarketMetric
+from app.services.pipeline_heartbeat import record_pipeline_heartbeat
 from app.services.retention import StorageDecision
 from app.services.surveillance_scores import (
     evidence_score_0_100,
     prior_rank,
     urgency_score_0_100,
 )
+
+_RETENTION_PROJECTION_HEARTBEAT_INTERVAL_SEC = 60.0
+_last_retention_projection_heartbeat = 0.0
 
 
 def _cents(value: Decimal | None) -> int | None:
@@ -28,6 +33,24 @@ def _contracts(value: Decimal | None) -> int | None:
     if value is None:
         return None
     return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _maybe_heartbeat_retention_projection(decision: StorageDecision) -> None:
+    global _last_retention_projection_heartbeat
+    now = time.monotonic()
+    if now - _last_retention_projection_heartbeat < (
+        _RETENTION_PROJECTION_HEARTBEAT_INTERVAL_SEC
+    ):
+        return
+    _last_retention_projection_heartbeat = now
+    record_pipeline_heartbeat(
+        "retention_projection",
+        detail=(
+            f"MarketMetric projection active; latest storage tier {decision.tier} "
+            f"with retention score {decision.score}."
+        ),
+        metadata={"storage_tier": decision.tier, "reasons": list(decision.reasons)},
+    )
 
 
 def upsert_quote_metrics(
@@ -91,6 +114,7 @@ def upsert_quote_metrics(
         },
     )
     db.execute(stmt)
+    _maybe_heartbeat_retention_projection(decision)
 
 
 def bump_trade_metrics(db: Session, *, market_pk: int, trade_ts: datetime) -> None:
@@ -107,6 +131,48 @@ def bump_trade_metrics(db: Session, *, market_pk: int, trade_ts: datetime) -> No
             "last_trade_ts": func.greatest(
                 func.coalesce(MarketMetric.last_trade_ts, trade_ts),
                 trade_ts,
+            ),
+            "updated_at": func.now(),
+        },
+    )
+    db.execute(stmt)
+
+
+def bump_anomaly_metrics(
+    db: Session,
+    *,
+    market_pk: int,
+    anomaly_ts: datetime,
+    prior: str | None,
+    severity: str | None,
+) -> None:
+    high_increment = 1 if str(severity or "").lower() in {"high", "critical"} else 0
+    pr = prior_rank(prior)
+    stmt = pg_insert(MarketMetric).values(
+        market_pk=market_pk,
+        anomaly_count=1,
+        high_anomaly_count=high_increment,
+        last_anomaly_ts=anomaly_ts,
+        evidence_score=evidence_score_0_100(anomaly_count=1),
+        urgency_score=urgency_score_0_100(prior_rank=pr, anomaly_count=1),
+        updated_at=func.now(),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["market_pk"],
+        set_={
+            "anomaly_count": MarketMetric.anomaly_count + 1,
+            "high_anomaly_count": MarketMetric.high_anomaly_count + high_increment,
+            "last_anomaly_ts": func.greatest(
+                func.coalesce(MarketMetric.last_anomaly_ts, anomaly_ts),
+                anomaly_ts,
+            ),
+            "evidence_score": func.greatest(
+                MarketMetric.evidence_score,
+                stmt.excluded.evidence_score,
+            ),
+            "urgency_score": func.greatest(
+                MarketMetric.urgency_score,
+                stmt.excluded.urgency_score,
             ),
             "updated_at": func.now(),
         },

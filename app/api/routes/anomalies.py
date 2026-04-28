@@ -12,7 +12,7 @@ router = APIRouter(tags=["anomalies (legacy on-the-fly)"], deprecated=True)
 @router.get(
     "/markets/{market_id}/anomaly",
     summary="Recompute anomaly from snapshots (legacy)",
-    description="Prefer `GET /api/dashboard/markets/{id}/anomalies` for materialized rule rows; "
+    description="Prefer `GET /api/dashboard/markets/{id}/anomalies` for saved alert rows; "
     "this endpoint re-runs the engine for debugging.",
 )
 def get_market_anomaly(

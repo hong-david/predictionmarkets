@@ -5,19 +5,22 @@
 **Glossary (terms used in the UI and code)**
 
 | Term | Meaning |
-|------|--------|
-| **Market (contract)** | One tradeable contract (a Kalshi *ticker*), not the whole “event” or news story. |
-| **Snapshot** | A row of best bid/ask, last price, and volume saved every time the exchange sends a *ticker* update for that market. |
-| **Manipulability prior** | A rough “how plausibly could non-public *information* move this market?” label — a **priority** input (what to watch), not **evidence** that something happened. |
-| **Anomaly (stored row)** | A **rule score** from the latest few dozen snapshots (and book activity) materialized in the `anomalies` table when the score clears the persistence **floor** in `anomaly_materializer`. The UI calls these **stored alerts**; not a per-trade “insider” verdict. |
-| **Priority prior** | The `manipulability_prior` classifier label (“how leak-prone is this *kind* of market?”). The Overview **High-priority markets** count is **only** “high + elevated” — separate from the “high” **single** bar, and from **evidence** (see **Markets with alerts**). |
-| **Stored alert count** (per market) | `COUNT(*)` in `anomalies` for that market. The materializer **inserts a new row** for each *new* `latest_snapshot_id` (ticker/quote) that produces a high enough rule score. **Trades** are a separate, much sparser count — a hyped event can have thousands of quote updates and hundreds of those stored as alerts but only a few hundred **executions** on the tape, so 1255 vs 283 is normal. |
-| **Z-score (here)** | How many standard deviations the *latest* move is from *this* market’s own *recent* history of moves (rolling baseline). |
-| **Order-book event** | One line-level change: full level snapshot, or a delta (add/cancel size) on one price. |
-| **Trade tape** | Public list of executed trades (price, size, which side was aggressive). |
-| **Cumulative volume (snapshot `volume_fp`)** | **Lifetime** (or “so far” on the series) **contracts** cleared on a market, from the exchange ticker. Anomaly’s “large volume *delta*” is the **change in this** between two snapshot rows — the sum of many small prints in that interval, not the same number as a single bar on the per-trade chart. |
-| **Chart histogram** | Each bar is **one trade’s** `count` (how many contracts in that print), green = taker bought Yes, red = taker bought No, blue = side unknown. |
-| **Public news (GDELT)** | The GDELT Project’s free *document* API: a searchable index of open-web headlines (no key in our setup). We build a query from **title and subtitle** (as an OR), pull articles in a time window, and the detail page can use **“Near last activity”** (about 7d before the latest print or stored flag) or **30d to close** to line up story timing with the chart. We do *not* claim causality. |
+|------|---------|
+| **Market contract** | One tradeable Kalshi ticker. A single Kalshi event can have many contracts, such as different dates, thresholds, or outcomes. |
+| **Event group** | Contracts sharing the same Kalshi `event_ticker`. The event page groups them for comparison; trades and flags remain contract-specific. |
+| **Active/open market** | A market still open or active and not past `close_time`. Historical markets are retained for post-mortem review but are separated from live monitoring panels. |
+| **Watch priority** | The classifier's `manipulability_prior` bucket. It means "worth watching because this type of market may react to information"; it is not evidence of suspicious trading. |
+| **Snapshot** | A stored ticker update: best bid/ask, last price, volume, open interest, and liquidity when available. |
+| **Trade print** | One public execution from Kalshi's trade tape: price, contracts, side, event time, and ingest time. |
+| **Estimated dollars** | `contracts * side price` for one trade print. It is estimated notional paid for contracts, not profit/loss or account exposure. |
+| **Local trade outlier** | A market-detail score for a print versus that contract's recent tape: size, price jump, and clustering. It helps pick prints to inspect; it is not a durable alert by itself. |
+| **Top trade flag** | A durable `trade_flags` row that combines local tape outlier score with context such as sector baselines, price impact, follow-through, sibling-market movement, market priority, and news timing. |
+| **Alert history** | Market-level quote, volume, spread, and order-book rule rows stored in `anomalies`. The overview calls these **Market activity alerts**. They are separate from trade-specific flags. |
+| **Order-book update** | A retained L2 snapshot level or delta. Low-value book noise can be dropped or compacted by the retention policy. |
+| **News kept** | Deduped article metadata saved from GDELT and RSS/Atom sources: title, URL, timing, source, summary/entities when available, and scoring components. Full raw article bodies are not the core data product. |
+| **News-linked signal** | A linked article/market row whose relevance, YES/NO direction, and trade timing clear display thresholds. It suggests something to review, not causality. |
+| **OpenSearch** | Optional fuzzy search and suggestions over markets and stored news. Postgres remains the source of truth and the API falls back to Postgres search when OpenSearch is down. |
+| **ClickHouse** | Optional hot raw store for retained high-volume trades, quote changes, and L2 events. The dashboard should read compact Postgres projections and flags first. |
 
 **Pattern targets (long-term)** Informed flow, thin-liquidity moves, order-book games, and cross-market effects — with realistic limits (e.g. no wash-trading *proof* without account ids).
 
@@ -35,108 +38,95 @@ This README is updated when behavior or structure changes in a non-trivial way.
 
 ```mermaid
 flowchart LR
-    subgraph EXTERNAL[External]
-        KREST[Kalshi REST API]
-        KWS[Kalshi WebSocket\nticker + trade + orderbook_delta]
-        NEWS[Open-web news\nGDELT DOC API now\nRSS/source polling later]
-    end
+  subgraph External["External data"]
+    KREST["Kalshi REST"]
+    KWS["Kalshi WebSocket"]
+    NEWS["GDELT and RSS feeds"]
+  end
 
-    subgraph INGEST[Ingest]
-        POLLER[scripts/poll_markets.py\n+ market_ingestor.py]
-        WSCONS[scripts/run_ws_ticker_consumer.py\n-> kalshi_ws.consume_market_data_forever]
-        NEWSJOB[scripts/ingest_news.py\nfail-open global news ingest]
-    end
+  subgraph Ingest["Ingest jobs"]
+    POLLER["Market poller"]
+    WS["WebSocket consumer"]
+    NEWSJOB["News ingestor"]
+  end
 
-    subgraph DB[Postgres control plane + projections]
-        TMARKETS[(markets)]
-        TSNAPS[(market_snapshots)]
-        TTRADES[(trades)]
-        TBOOK[(book_events)]
-        TANOM[(anomalies)]
-        TMETRICS[(market_metrics)]
-        TFLAGS[(trade_flags\ntrade_baselines)]
-        TNEWS[(news_* + case_evidence)]
-    end
+  subgraph Postgres["Postgres source of truth"]
+    MARKETS["markets"]
+    SNAPSHOTS["market_snapshots"]
+    TRADES["trades"]
+    BOOK["book_events"]
+    ANOM["anomalies"]
+    METRICS["market_metrics"]
+    FLAGS["trade_flags"]
+    NEWSDB["news tables and case_evidence"]
+  end
 
-    subgraph CH[ClickHouse optional raw hot store]
-        CHTRADES[(kalshi_trades_raw)]
-        CHQUOTES[(kalshi_quote_changes_raw)]
-        CHL2[(kalshi_l2_events_raw)]
-    end
+  subgraph Processing["Processing and projections"]
+    CLASSIFIER["Market classifier"]
+    ANOMMAT["Async anomaly materializer"]
+    BASELINES["Trade baseline materializer"]
+    FLAGMAT["Trade flag materializer"]
+    NEWSLINK["News linker and scorer"]
+    CORR["News trade correlation"]
+    RETENTION["Retention projection"]
+  end
 
-    subgraph PROC[Processing]
-        CLASSIFIER[classifier\ntaxonomy, rules, kNN, LLM]
-        BOOKSIG[book_activity_signals\n3m order-book stats]
-        ENGINE[anomaly_engine\nrolling z + static fallbacks]
-        MAT[anomaly_materializer]
-        BASELINES[trade baseline materializer\ncategory/subcategory p95-p99]
-        TRADEFLAG[trade flag materializer\nlocal + contextual scoring]
-        NEWSLINK[market-news linker\nlexical candidate generation]
-    end
+  subgraph OptionalStores["Optional hot stores"]
+    CH["ClickHouse raw tape"]
+    OS["OpenSearch discovery index"]
+  end
 
-    subgraph SERVE[Serving]
-        API[FastAPI app/main.py\n/api/health + legacy /api/markets* (deprecated in OpenAPI)\n/api/dashboard/* canonical for the SPA]
-        SPA[Vite + React + TypeScript\nfrontend/ -> dist/ static\nOverview · Markets · event group · market detail]
-    end
+  subgraph Serving["Serving"]
+    API["FastAPI dashboard API"]
+    SPA["React dashboard"]
+  end
 
-    KREST -->|GET /markets| POLLER
-    KWS -->|ticker msg| WSCONS
-    KWS -->|trade msg| WSCONS
-    KWS -->|orderbook_snapshot / orderbook_delta| WSCONS
-    NEWS -->|article search| NEWSJOB
+  KREST --> POLLER
+  KWS --> WS
+  NEWS --> NEWSJOB
 
-    POLLER -->|paginated cursor sweep\nupsert + snapshot| TMARKETS
-    POLLER --> TSNAPS
-    POLLER -->|raw market dict| CLASSIFIER
-    CLASSIFIER -->|category, subcategory,\nmanipulability_prior, tags| TMARKETS
-    WSCONS -->|lazy-upsert unknown ticker\nstatus='unknown' sentinel| TMARKETS
-    WSCONS -->|bounded queue + worker tasks| TSNAPS
-    WSCONS -->|projection updates| TMETRICS
-    WSCONS -->|raw backend=postgres/dual\nINSERT ON CONFLICT DO NOTHING| TTRADES
-    WSCONS -->|raw backend=postgres/dual\nbook rows| TBOOK
-    WSCONS -->|raw backend=clickhouse/dual\nbatched JSONEachRow| CHTRADES
-    WSCONS -->|retained quote changes| CHQUOTES
-    WSCONS -->|retained L2 events| CHL2
-    NEWSJOB -->|normalized articles + profiles| TNEWS
-    NEWSJOB --> NEWSLINK
-    NEWSLINK -->|candidate links| TNEWS
+  POLLER --> MARKETS
+  POLLER --> SNAPSHOTS
+  POLLER --> CLASSIFIER
+  CLASSIFIER --> MARKETS
 
-    WSCONS -->|after ticker snapshot| MAT
-    TBOOK --> BOOKSIG
-    MAT --> ENGINE
-    ENGINE --> MAT
-    BOOKSIG --> ENGINE
-    MAT --> TANOM
-    TTRADES --> BASELINES
-    BASELINES --> TFLAGS
-    TTRADES --> TRADEFLAG
-    TSNAPS --> TRADEFLAG
-    TNEWS --> TRADEFLAG
-    TRADEFLAG -->|durable flags| TFLAGS
-    TRADEFLAG -->|high/critical promotion| TMETRICS
-    TRADEFLAG -->|case windows| TNEWS
+  WS --> SNAPSHOTS
+  WS --> TRADES
+  WS --> BOOK
+  WS --> METRICS
+  WS --> CH
+  WS --> ANOMMAT
 
-    API --> TMARKETS
-    API --> TSNAPS
-    API --> TANOM
-    API --> TTRADES
-    API --> TBOOK
-    API --> TFLAGS
-    API --> TNEWS
-    SPA -->|/api/dashboard/*| API
+  NEWSJOB --> NEWSDB
+  NEWSJOB --> NEWSLINK
+  NEWSLINK --> NEWSDB
+  NEWSLINK --> CORR
 
-    classDef ext fill:#fef3c7,stroke:#d97706,color:#000
-    classDef ing fill:#dbeafe,stroke:#2563eb,color:#000
-    classDef db fill:#dcfce7,stroke:#16a34a,color:#000
-    classDef ch fill:#cffafe,stroke:#0891b2,color:#000
-    classDef proc fill:#ede9fe,stroke:#7c3aed,color:#000
-    classDef api fill:#fee2e2,stroke:#dc2626,color:#000
-    class KREST,KWS,NEWS ext
-    class POLLER,WSCONS,NEWSJOB ing
-    class TMARKETS,TSNAPS,TTRADES,TBOOK,TANOM,TMETRICS,TFLAGS,TNEWS db
-    class CHTRADES,CHQUOTES,CHL2 ch
-    class CLASSIFIER,BOOKSIG,ENGINE,MAT,BASELINES,TRADEFLAG,NEWSLINK proc
-    class API,SPA api
+  SNAPSHOTS --> ANOMMAT
+  BOOK --> ANOMMAT
+  ANOMMAT --> ANOM
+  ANOMMAT --> METRICS
+
+  TRADES --> BASELINES
+  BASELINES --> FLAGMAT
+  TRADES --> FLAGMAT
+  SNAPSHOTS --> FLAGMAT
+  NEWSDB --> FLAGMAT
+  CORR --> FLAGMAT
+  FLAGMAT --> FLAGS
+  FLAGMAT --> NEWSDB
+  FLAGMAT --> RETENTION
+  RETENTION --> METRICS
+
+  MARKETS --> OS
+  NEWSDB --> OS
+  API --> MARKETS
+  API --> METRICS
+  API --> ANOM
+  API --> FLAGS
+  API --> NEWSDB
+  API --> OS
+  SPA --> API
 ```
 
 **Architecture in plain English:** Postgres is the system of record for market metadata, read projections, flags, and cases. ClickHouse is optional hot raw storage for retained high-volume tape and L2 events. The WebSocket consumer processes broadly but only stores raw detail when the retention policy says it is worth keeping. The dashboard reads mostly from projections and flags, not from every raw event.
@@ -147,62 +137,85 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  subgraph pages[React Router]
-    O[Overview – stats + charts + links]
-    MB[Markets – URL filters + table]
-    MD[Market detail – chart + trades + news]
+  subgraph Pages["React Router"]
+    O["Overview"]
+    MB["Markets browser"]
+    EV["Event group"]
+    MD["Market detail"]
   end
-  Q[TanStack Query cache]
-  API2["/api/dashboard/*"]
+  Q["TanStack Query cache"]
+  API2["Dashboard API"]
+  SEARCH["Global search"]
   O --> Q
   MB --> Q
+  EV --> Q
   MD --> Q
   Q --> API2
+  SEARCH --> API2
 ```
 
 **Price chart (market detail):** `frontend/src/components/PriceChart.tsx` uses an **area** series with `LineType.Curved` and a light gradient under the line. The curve between trade times is a spline for readability, not a claim that the contract transacted at intermediate prices (public tape is discrete). Volume remains a per-trade histogram below.
 
 **URL state:** search params on `/markets` hold filters and sort so links are shareable. **Event grouping:** `GET /api/dashboard/events/{event_id}` (Kalshi `event_ticker` = `markets.event_id`) lists all leg contracts; the SPA route `/events/:eventId` shows the same. **Default list sort** `surveillance_urgency` puts markets with stored rule flags above “quiet” high-prior names. **First paint / Overview:** the home page uses a **single** `GET /api/dashboard/overview` to avoid four back-to-back JSON round-trips; cold loads still pay for the **first** JS download (Vite chunk includes Recharts) and the **first** run of several SQL counts / `GROUP BY`s on Postgres after an idle period.
 
+**Pipeline health:** `GET /api/dashboard/pipeline-health` returns a small heartbeat/freshness/count snapshot for API, market hydration, WS trades, news ingest, news links, news/trade correlations, trade flags, quote/book anomalies, the retention/storage-tier projection, and storage guardrails. The Overview header renders this as a compact expandable **Pipeline health** widget with latest heartbeat, last success, row count, and last error when available. The dots represent pipeline components: some are long-running processes, but others are jobs, materializers, or DB projections, not standalone services.
+
+**Search/discovery:** `GET /api/dashboard/search?q=...&scope=all|markets|news` searches hydrated markets and stored news. OpenSearch is the fast fuzzy/prefix path and powers the global header search; if OpenSearch is unavailable or the index has not been rebuilt, the endpoint falls back to Postgres plus the existing market-news profiles. That fallback is deliberately useful for sparse news: a market detail page with no exact stored link can still show search-backed related headlines and linked markets.
+
+**Active vs historical markets:** Dashboard list/ranking endpoints accept `market_scope=active|historical|all` and default to `active`. Active means an open/active market that is not past `close_time`; historical means closed/finalized/settled or past-close. Historical markets stay queryable for post-mortems, so suspicious behavior can still be reviewed without mixing resolved contracts into the live monitoring view.
+
+**Storage guardrails:** `GET /api/dashboard/storage-health` reports Postgres database/table sizes, local disk pressure, ClickHouse table/disk usage when reachable, and OpenSearch index/disk usage when reachable. The pipeline health widget includes the same signal as **Storage guardrails** so disk pressure shows up before writes fail.
+
 ### News vs prices (read path)
 
 `app/services/news_gdelt.py` centralizes the GDELT query string (title, optional subtitle in an **OR** group) and the date window. `GET /api/dashboard/markets/{id}/news?align=default|activity` returns `anchors` (last print time, last flag time, which window mode) plus articles for the detail UI.
 
-`scripts/ingest_news.py` is the background path. It refreshes market-news profiles, fetches global GDELT headlines, stores normalized article metadata, and candidate-links articles to markets. If GDELT is blocked, slow, or down, the job now fails open: it returns `provider_status="unavailable"`, records zero fetched articles, and lets the rest of the surveillance pipeline continue. The trade flag scorer simply has less news context until the next successful ingest.
+`scripts/run_news_surveillance_pipeline.py` is the normal background path. Each cycle ingests global news, materializes contextual trade flags, then refreshes news/trade correlations. `scripts/ingest_news.py` remains a focused one-shot ingest helper. The default surveillance sweep uses broad GDELT themes plus 46 RSS/Atom feeds across official/regulatory, business, crypto, general-news, weather, and sports sources, with a 7-day lookback and per-feed diagnostics in the pipeline heartbeat. Articles are URL-deduped and only kept as market links when relevance scoring clears the threshold, so a flat article count can mean "duplicates or weak matches," not necessarily that ingestion is dead. If GDELT is blocked, slow, rate-limited, or down, the job fails open: it records the provider error, keeps RSS ingest working, and lets the rest of the surveillance pipeline continue. The trade flag scorer simply has less news context until the next successful ingest.
 
 ### Detection pipeline (backend)
 
 ```mermaid
 flowchart TD
-  subgraph QUOTE[Quote/order-book alert path]
-    SN[recent market_snapshots] --> AE[anomaly_engine\nrolling z + static fallback]
-    BE[recent book_events] --> BS[book_activity_signals\n3m churn/pull stats]
-    BS --> AE
-    AE --> AM[anomaly_materializer]
-    AM --> AN[(anomalies)]
+  subgraph QuotePath["Quote and order-book alert path"]
+    SN["Recent snapshots"] --> AQ["Anomaly queue"]
+    BE["Recent book updates"] --> AQ
+    AQ --> AE["Anomaly engine"]
+    AE --> AM["Batched anomaly materializer"]
+    AM --> AN["anomalies"]
+    AM --> MM["market_metrics"]
   end
 
-  subgraph TRADE[Trade flag path]
-    TR[trades ascending] --> TS[trade_suspicion\nlocal 0-10 outlier]
-    TR --> TB[trade_burst\n30s cluster score]
-    TR --> BL[trade_baselines\nsector p95/p99]
-    TS --> TC[trade_context\nimpact + follow-through + peers]
+  subgraph NewsPath["News ingest and linking"]
+    RAWNEWS["GDELT and RSS articles"] --> NA["Normalize and URL dedupe"]
+    NA --> NP["news_articles"]
+    NP --> NL["Market candidate generation"]
+    NL --> NR["Relevance and direction scoring"]
+    NR --> NE["news_events"]
+  end
+
+  subgraph TradePath["Trade flag path"]
+    TR["Trade tape"] --> TS["Local outlier scoring"]
+    TR --> TB["Burst and cluster scoring"]
+    TR --> BL["Sector baselines"]
+    TS --> TC["Contextual trade scorer"]
     TB --> TC
     BL --> TC
     SN --> TC
-    NE[news_events\nlinked headlines] --> TC
-    TC --> TF[(trade_flags)]
-    TF --> CE[(case_evidence)]
-    TF --> MM[(market_metrics\nretention promotion)]
+    NE --> NT["News trade correlation"]
+    NT --> TC
+    TC --> TF["trade_flags"]
+    TF --> CE["case_evidence"]
+    TF --> MM
   end
 
-  AN --> API3[/dashboard APIs/]
+  AN --> API3["Dashboard APIs"]
+  NE --> API3
   TF --> API3
-  TS --> SER[market series\nimmediate inspection]
+  TS --> SER["Market series inspection"]
   TB --> SER
 ```
 
-**Per-trade `suspicion`** still appears in the series API for immediate inspection. Durable `trade_flags` are the persisted version: they combine local tape outliers, sector baselines, quote impact, follow-through, sibling-market moves, and news timing. **Chart markers** on the detail page are stored rule rows, not one marker per trade.
+**Per-trade `suspicion`** still appears in the series API for immediate inspection. Durable `trade_flags` are the persisted version: they combine local tape outliers, sector baselines, quote impact, follow-through, sibling-market moves, and news timing. Trade payloads also expose `trade_dollar_amount`, an estimated notional for the print (`contracts * side price`) used on the market detail and overview tables. **Chart markers** on the detail page are stored rule rows, not one marker per trade.
 
 **What GDELT failure means:** it is not a blocker for quotes, trades, retention, or the dashboard. It only removes one score component: `pre_news_directional_move`. Existing flags still work from tape, sector, quote, and cross-market behavior. When news ingest succeeds later, the flag materializer can rerun and add the news-timing evidence.
 
@@ -215,7 +228,7 @@ flowchart TD
 
 - **`markets`** — one row per market, keyed externally by `market_id` (Kalshi ticker). Owns `event_id`, status, open/close times, and the classifier output (`category`, `subcategory`, `manipulability_prior`, `classifier_tags`, `classifier_layer`, `classifier_rule`, `classifier_confidence`, `classifier_version`).
 - **`market_snapshots`** — append-only time series of L1 quote + aggregates for a market (`yes/no bid/ask`, `last_price`, `volume_fp`, `volume_24h_fp`, `open_interest_fp`, `liquidity_dollars`).
-- **`trades`** — append-only public-trade tape (`trade_id` unique, `taker_side`, `count_fp`, `yes_price_dollars`, `no_price_dollars`, event-time `ts`, ingest-time `received_at`).
+- **`trades`** — append-only public-trade tape (`trade_id` unique, `taker_side`, `count_fp`, `yes_price_dollars`, `no_price_dollars`, event-time `ts`, ingest-time `received_at`). API responses derive estimated print dollars from these stored price and count fields.
 - **`book_events`** — append-only order-book event log. Each row is one price level: snapshot rows (`is_snapshot=true`) carry the absolute level size in `size_fp`; delta rows carry a signed `delta_fp` (positive adds contracts, negative removes, zero removes the level). Stamped with `session_id` (per WS connection) and Kalshi's per-subscription `seq`. Idempotency is enforced by a unique constraint on `(session_id, seq, side, price_dollars)`.
 - **`anomalies`** — materialized output of the anomaly engine per `(market, latest_snapshot_id)` with `score`, `severity`, `reasons`, JSON `signals`.
 - **`market_metrics`** — compact serving projection keyed by `market_pk`: latest quote cents, volume/OI hints, trade/anomaly counters, storage tier, retention score/reasons, and dashboard scores. This is the first step toward serving market lists from tiny read models instead of raw tape scans.
@@ -228,6 +241,7 @@ flowchart TD
 
 - **Postgres** via SQLAlchemy 2 (`psycopg` driver) with **Alembic** migrations.
 - **ClickHouse** is available in `docker-compose.yml` for high-volume raw tape and L2 event storage. Schema lives in `sql/clickhouse_kalshi.sql`; writes are batched with `JSONEachRow`.
+- **OpenSearch** is available in `docker-compose.yml` for market/news discovery and suggestions. It is not the source of truth; rebuild it from Postgres with `scripts/rebuild_search_index.py`, and the API falls back to Postgres if it is down.
 - **FastAPI / Uvicorn** for the API.
 - **websockets** + **cryptography** for Kalshi WS auth and feed.
 - **pytest**, **ruff**, **mypy** for tests and linting.
@@ -237,6 +251,16 @@ flowchart TD
 ### Local dev workflow
 
 Two processes side by side. The API serves JSON; Vite serves the frontend with hot-reload and proxies `/api/*` calls to the API.
+
+For the full local surveillance stack, use the supervisor. It pins the API port, starts the selected pipeline components, writes logs under `.pipeline-logs/`, and restarts failed children with backoff:
+
+```bash
+.venv/Scripts/python -m scripts.run_pipeline --api-port 8000
+# optional hot-reload frontend too:
+.venv/Scripts/python -m scripts.run_pipeline --api-port 8000 --with-vite
+```
+
+The lower-level two-process workflow is still useful when you only want API/UI iteration:
 
 ```bash
 # Terminal 1 — from repo root, with venv on PATH (API required for Overview)
@@ -291,7 +315,7 @@ This section tracks the architectural decisions actually present in the code, pl
 | **Durable case evidence, not infinite raw history** | The important output is a compact, replayable evidence bundle around suspicious windows. | Research queries over discarded raw noise are limited, but storage growth is controlled. |
 
 - **Public data only, named-pattern surveillance.** No account-level data is available from Kalshi's public feed. The detector taxonomy in §1 was chosen so each pattern is either fully detectable from public data or explicitly scoped out (wash trading).
-- **Two notions: priority vs evidence.** (1) **Manipulability prior** — a slow-moving human-tuned **priority**: “is this the *kind* of market where an informed leak is plausible?”. (2) **Evidence / action** — something in *our* data (a **stored alert** row, or a **trade outlier** column on the series response) has fired. The markets list can sort by **surveillance_urgency** so (2) dominates: until at least one materialized `anomalies` row exists, we do *not* float the market to the top just because prior is high. Per-trade `suspicion` in the series API is a *local* **0..10** outlier score from z-features over the last ~50 prints on that ticker (JSON field name unchanged) — useful for which leg to look at, not a legal conclusion.
+- **Two notions: priority vs evidence.** (1) **Watch priority** is the classifier's `manipulability_prior`: "is this the kind of market where an information leak is plausible?". (2) **Evidence** is something in our data: a market-level **alert history** row, a durable **top trade flag**, or a local trade outlier on the series response. The markets list default sort, `surveillance_urgency`, puts markets with alert history above quiet priority-only names. The `top_trade_flag` sort instead ranks by the highest single durable trade flag score for that market. Per-trade `suspicion` in the series API remains a local 0..10 outlier score over recent prints on that ticker. It is useful for choosing which leg to inspect, not a legal conclusion.
 - **Append-only event tables.** `market_snapshots` and `trades` are append-only so detectors can be replayed deterministically against historical data when rules change.
 - **Event time vs ingest time are stored separately.** `trades.ts` is the Kalshi `ts_ms` (the moment the trade executed); `trades.received_at` is when the row was inserted. Surveillance queries are event-time queries; `received_at` exists for clock-skew / pipeline-latency monitoring.
 - **`Numeric`, not `float`, for prices and volumes.** Money- and contract-quantity-like fields are stored at exchange precision (`Numeric(12, 4)` for dollar prices, `Numeric(18, 2)` for `*_fp` quantities) to avoid binary-floating-point error. The SQLAlchemy ORM types those columns as **`Decimal` / `Decimal | None` in `app/db/models.py`**; JSON responses still convert with `float()` at the API boundary.
@@ -307,9 +331,10 @@ This section tracks the architectural decisions actually present in the code, pl
   - `book_events` indexes `(market_pk, id)` instead. Snapshot rows do not carry `ts_ms`, so `ts` is nullable; the autoincrement `id` is monotonic per insert and never null, which is what replays actually need.
   - The latest migration adds newest-first composite indexes for hot read paths: snapshots by `(market_pk, ts desc, id desc)`, trades by `(market_pk, ts desc, id desc)`, recent book events by `(market_pk, received_at desc)`, and anomalies by market/severity plus created time.
 - **Unique external IDs as constraints.** `markets.market_id` and `trades.trade_id` are both indexed `UNIQUE`. Dedup is enforced by the database, not application logic.
-- **Anomaly engine + book hints + persistence gate.** `analyze_market` uses **rolling z-scores** (stricter `z` in code than a naive 2.0) on spread, ref-price change, and volume delta when enough history exists (default 40 snapshots in the materializer); otherwise static fallbacks. `book_activity_signals` adds points from **high order-book event rate** and **sustained cancel/pull** in a 3-minute window. **`materialize_market_anomaly` only creates/keeps a row** when the computed score is **≥ 3.0**; weaker snapshots delete a row for the same `latest_snapshot_id` so the DB and chart are not full of one-rule “low” noise. **No full L2 reconstruction in RAM yet** — churn heuristics only; a real spoofing detector would rebuild the book from `book_events`.
+- **Anomaly engine + book hints + persistence gate.** `analyze_market` uses rolling z-scores on spread, reference-price change, and volume delta when enough history exists; otherwise static fallbacks. `book_activity_signals` adds high order-book event rate and sustained cancel/pull hints from recent L2 activity. The async/batched materializer only keeps rows that clear the persistence floor and compacts continuing alerts instead of inserting on every anomalous snapshot. No full L2 reconstruction in RAM yet; churn heuristics only, so a deeper spoofing detector would rebuild the book from retained `book_events` or ClickHouse raw windows.
 - **Per-trade outlier (API).** `trade_suspicion.py` scores each print vs a local window and returns **0..10** for the series response only; it does not write `anomalies`. The market-detail table labels this **Outlier** (not “suspicious trade”).
 - **Burst / cluster (API, tape-only).** `trade_burst.py` measures dense same-side windows (default 30s) on the same ascending tape as the chart; the series response adds per-trade `cluster_0_10` and a `tape_cluster` summary. It is a behavioral cluster *hypothesis* — Kalshi’s public API does not expose account ids, so the UI phrasing does not assert identity.
+- **Anomaly compaction.** Continuing quote/book alerts update the active anomaly row instead of inserting on every anomalous snapshot. New rows are reserved for first alert, severity upgrade, or a 30-minute cooldown sample. That keeps the chart/explainability trail while stopping anomalous high-frequency markets from producing millions of near-duplicate rows.
 - **Contextual trade flags (durable, explainable, no trained model).** `trade_context.py` asks whether a print was unusually well-timed or market-moving for its sector: large vs peer p95/p99, high impact per contract, follow-through after the print, coherent or isolated sibling-market moves, and pre-news directional timing. `scripts/materialize_trade_baselines.py` writes peer baselines; `scripts/materialize_trade_flags.py` writes `trade_flags`. High/critical flags promote the market's retention tier, and critical or pre-news flags create `case_evidence` windows.
 - **Explicit priority vs evidence in JSON.** `app/services/surveillance_scores.py` defines **0..100** `evidence_score` and `urgency_score`, plus a string `market_priority` (classifier `manipulability_prior` or `unclassified`) and `reasons[]` (deduped **snake_case** slugs from materialized `anomalies.reasons` for that market). The dashboard list/detail/series endpoints in `app/api/routes/dashboard.py` expose these in addition to the legacy `manipulability_prior` / `anomaly_count` fields the UI already had.
 - **Legacy JSON routes (compat only).** `app/api/routes/markets.py`, `app/api/routes/features.py`, and `app/api/routes/anomalies.py` remain registered under `/api/...` for old scripts, but the routers and operations are **marked deprecated** in the OpenAPI schema; the product contract is `/api/dashboard/*` used by the React app.
@@ -318,11 +343,12 @@ This section tracks the architectural decisions actually present in the code, pl
 - **Backoff / reconnect on WS failures.** `consume_market_data_forever` reconnects with exponential backoff capped at 30s, so a transient Kalshi or network blip doesn't kill the consumer.
 - **Periodic universe sweep, not single-page polling.** Both `scripts/bootstrap_markets.py` (one-shot) and `scripts/poll_markets.py` (interval-driven) walk Kalshi's `cursor`-based pagination via `iter_markets(status="open")` and ingest in fixed-size batches. The pre-fix poller called `get_markets(limit=25)` once per cycle, which meant the alphabetical front-load (~50k dead `KXMVECROSSCATEGORY...` markets) was the only thing it ever touched, and the lazy-upsert backlog from the WS feed was never hydrated. Sweeping the full open set is the only design that keeps the WS feed and REST metadata in sync without a per-ticker hydration endpoint. Defaults: `interval=300s`, `batch=500`. Both scripts share a `chunked()` helper in `app/services/market_ingestor.py` so the iteration shape stays in one place.
 - **Targeted hydration of the lazy-upsert backlog (per-ticker REST).** The bulk `/markets` sweep is filtered by `status=open`, but Kalshi's high-trade-count markets right now (live NBA / MLB / UFC games, BTC 15-minute strikes that just expired) are `'active'` or `'finalized'`, not `'open'`. So the bulk sweep would never hydrate them and the dashboard would show them as `KXNBAGAME-...` ticker strings forever. `scripts/hydrate_unknown_markets.py` solves this by hitting Kalshi's per-ticker `/markets/{ticker}` endpoint for each row with `status='unknown'`. With `--top-by-trades` it orders the queue by descending `count(*)` from `trades`, so dashboard-visible markets get hydrated first. ~20 req/s with the default sleep is comfortably under any sane rate limit and drains 50 markets in ~25 seconds. This script is a backlog drainer, not a long-running daemon — it exits when the queue is empty.
+- **Durable pipeline heartbeats.** `pipeline_heartbeats` records the last heartbeat/success/error for pipeline components. `scripts.run_pipeline` is the local supervisor: it starts API, poller, WS, and news pipeline on pinned ports, writes one log pair per child, and restarts failed children with backoff. The health widget reads heartbeats first and falls back to DB freshness/count checks when a component has never reported.
 - **Frontend split: SPA in `frontend/`, JSON API in FastAPI.** The previous "embedded HTML in a Python module" dashboard was demoable but capped what surveillance UI we could build — no real charting, no per-market drill-down, no virtualised tables for the 24k-market universe. The current design separates the two halves on a clean JSON contract: FastAPI exposes everything the dashboard needs under `/api/dashboard/*` (typed responses, paginated, filterable), and a Vite + React + TypeScript frontend in `frontend/` consumes that surface. Pinned trade-offs: (1) **No SSR / Next.js.** Dashboard is read-only and authenticated-server-side eventually; client-side fetching with TanStack Query is enough and keeps the build trivial. (2) **No global state library.** All shared state (filters, search, sort, pagination) lives in URL search params via `react-router-dom`'s `useSearchParams` so a copy-pasted link reproduces the exact same filtered view, and TanStack Query handles server-state caching. (3) **TanStack Table over a custom grid.** 24k markets is well within its virtualised-row capacity; rolling our own would be busywork. (4) **TradingView `lightweight-charts` over Recharts for the price chart.** Same library Polymarket / Kalshi use; built-in crosshair, time-axis zoom, anomaly-marker overlay (`setMarkers`). Recharts is reserved for the small breakdown bar charts where its declarative React API wins. (5) **Single-process production deploy.** No nginx, no separate static host: FastAPI's catch-all route serves `frontend/dist/index.html` plus `assets/` directly. Mounting `StaticFiles(html=True)` at `/` was tried first and rejected because Starlette's mount-at-root absorbs sibling routes including `/api/*`; a path-based catch-all that explicitly skips reserved prefixes (`api/`, `docs`, `redoc`, `openapi.json`) routes correctly without trickery. (6) **Public-API namespace moved under `/api/*`.** `/health`, `/markets`, `/anomalies`, `/features` all gained the `/api` prefix so the SPA can own URL paths like `/markets/:id` without colliding. The router files themselves don't carry an `/api` prefix; it's added in `app/main.py` via `include_router(prefix="/api")` so each router stays composable in isolation. (7) **GDELT for correlated news, with explicit graceful degradation.** The detail page's news panel hits GDELT 2.0's free DOC API with a 5-second timeout. Any failure (network, parse, GDELT down) returns `provider="unavailable"` with an empty article list; the frontend renders an empty state rather than an error toast. Meaningful: the project is graded on its surveillance backend, not its news vendor — this fails open instead of breaking the page.
 - **Tiered raw retention instead of a boolean gate.** In-scope markets still update projections and anomaly state, but raw event storage now flows through `storage_decision_for_event`: `observe_only`, `sampled`, `hot`, `triggered`, or `case`. The score combines prior, close-time, 24h volume, OI, materialized anomalies, news-match/pre-news signals, trade bursts, and L2 pull signals. `should_persist_raw_tape` remains as a compatibility wrapper, but new code can inspect the full tier, score, TTL, sample rate, and reason list. Quiet markets can update `market_metrics` without writing raw tape; sampled/hot/triggered/case markets retain compact raw rows.
 - **ClickHouse raw backend rollout.** `KALSHI_RAW_BACKEND=postgres` is the default and preserves the old Postgres raw tables. `dual` writes Postgres plus batched ClickHouse rows; trade rows are only enqueued after Postgres accepts the `trade_id`, so reconnect replays are not forwarded during rollout. `clickhouse` keeps raw trade/quote/L2 in ClickHouse only while Postgres projections still update. The batcher flushes on `CLICKHOUSE_BATCH_MAX_ROWS` or `CLICKHOUSE_BATCH_FLUSH_INTERVAL_SEC`, and logs/drops rows if the bounded batch queue is full.
 - **Projection-first serving direction.** `market_metrics` stores latest quote cents, volume/OI hints, counters, retention tier, and score reasons. Today the dashboard still has legacy raw-table queries in places; the intended direction is to move list/overview reads onto `market_metrics` and compact feature tables while raw ClickHouse data expires quickly unless promoted as evidence.
-- **Global-first news correlation.** The detail page still has GDELT-on-demand, and `scripts/ingest_news.py` now adds the background path: refresh market news profiles, fetch global GDELT articles, upsert normalized article metadata, and candidate-link articles to markets through lexical relevance. The trade flag materializer consumes those links to score pre-news directional moves and promote durable cases.
+- **Global-first news correlation.** The detail page can show stored or search-backed news, but the main path is background-first: `scripts/run_news_surveillance_pipeline.py` refreshes market news profiles, fetches GDELT/RSS articles, upserts normalized article metadata, candidate-links articles to markets, materializes trade flags, and updates news/trade correlations. The trade flag materializer consumes those links to score pre-news directional moves and promote durable cases.
 - **Retention / scope policy in one place.** Whether a market deserves to be in the surveillance universe at all is a single decision encoded in `app/services/retention.py`: `EXCLUDED_CATEGORIES = {"exotic_combo", "crypto_strike"}` and `EXCLUDED_PRIORS = {"very_low"}`. Both the REST ingestor (`ingest_markets_payload`) and the WS lazy-upsert path (`_get_or_create_market`) call into the same predicate, so out-of-scope markets are dropped at the door — the classifier runs once per ingest, and the same `Classification` powers both the scope decision and the row stamping. The policy is a frozenset module constant rather than env config because "what does our system pay attention to" is the kind of decision a regulator wants to see in code review, not in a `.env`. Retroactive cleanup (`scripts/prune_markets.py`) reads the same predicate and uses the DB-level `ON DELETE CASCADE` (added in migration `f1a2c3d4b5e6`) so a single `DELETE FROM markets WHERE ...` cleans up every dependent row in `market_snapshots` / `trades` / `book_events` / `anomalies` — no slow ORM iteration, no orphaned children. Today's exclusions: Kalshi's `KXMVECROSSCATEGORY-*` parlay catalog (~285k rows of derived combinations whose manipulability-prior really should come from the constituent legs, which is a v2 problem), crypto strike markets, and `weather` (public physical underlying, no insider-leakable signal). Specifically *not* excluded: other `low` priors like `popculture.ratings`, because the trade tape itself can still surface spoofing / momentum-ignition signals that don't depend on the underlying being insider-leakable.
 - **Layered classifier with explicit confidence.** Markets are classified into a category / subcategory / manipulability-prior tuple by a four-layer pipeline (`app/services/classifier/`): Kalshi taxonomy adapter → ticker / regex prefix rules → k-NN over a small char-n-gram TF-IDF seed corpus → optional LLM zero-shot fallback. The first layer that returns `confidence != "low"` wins; lower-confidence verdicts are kept only as fallback when every later layer also abstains. The priority map (`priorities.py`) is the *only* place a human value judgment lives in the codebase — the classifiers themselves are mechanical. Trade-offs the design pins down: (1) **Off-the-shelf, not a trained model.** No labels, no class-imbalance fixes, no retraining cadence, and the explanation `"matched_rule=sports.ufc"` is regulator-defensible in a way that a model output isn't. (2) **No torch / sentence-transformers dep.** The k-NN layer is pure-stdlib char-n-gram TF-IDF — slightly less accurate than a sentence transformer but ~5MB instead of ~700MB, and the public API of the layer is the same so we can swap implementations if accuracy ever becomes the bottleneck. (3) **Layer 4 (LLM) defaults to a no-op.** Setting `default_llm_classifier()` to return `NullLLMClassifier()` means the orchestrator has a 4-layer architecture but the default deployment runs only 3 — opting in to Ollama / a cloud LLM is one config change. (4) **Low-confidence safety clamp.** When the orchestrator's final verdict is `confidence="low"`, `manipulability_prior` is clamped down from `high`/`medium_high` to `medium` so a misclassified market can't escalate onto the high-prior watchlist. (5) **Versioning.** A `CLASSIFIER_VERSION` int travels with every classification; a backfill script reclassifies on bump. Cosmetic refactors don't touch it; rule / seed / map changes do.
 
@@ -330,12 +356,41 @@ This section tracks the architectural decisions actually present in the code, pl
 
 Most recent first.
 
+#### 2026-04-28 — Trade dollar display, top-flag sort, and README refresh
+
+- **Trade dollars:** market-detail local trade outliers and Overview top trade flags now show estimated print dollars (`contracts * side price`) alongside contract count.
+- **Markets sort:** `/api/dashboard/markets?sort=top_trade_flag` ranks markets by the highest single durable `trade_flags.score`; the Markets page exposes this as **Highest trade flag**.
+- **Docs:** glossary and architecture diagrams were refreshed around current terminology, OpenSearch, ClickHouse, news ingest/linking, async anomaly materialization, trade flags, and pipeline projections. Mermaid labels were simplified so GitHub renders the diagrams.
+
+#### 2026-04-28 — Alert history naming, active home panels, and OpenSearch
+
+- **UI naming:** market-level saved anomaly rows are now called **Alert history** on market detail and **Market activity alerts** / **Saved market alerts** on overview surfaces. Trade-specific rows remain **Top trade flags**, and per-market chart inspection remains **Local trade outliers**.
+- **Active home panels:** the Overview **Most traded markets** and **Market activity alerts** panels always show active/open markets, even when the page-level scope is switched to historical/all for aggregate stats and breakdown charts.
+- **Markets list:** the **Last** column now falls back from latest snapshot `last_price` to bid/ask midpoint and then latest trade price, so open markets with quote-only snapshots no longer render blank.
+- **Search deployment:** the optional search fast path is now OpenSearch-compatible (`OPENSEARCH_*` config, `opensearch` Docker service, provider `opensearch`) with Postgres/profile fallback still intact.
+
+#### 2026-04-28 — OpenSearch target and wider news intake
+
+- **Search deployment:** the hosted path now targets AWS/OpenSearch, while keeping OpenSearch as a rebuildable discovery index rather than the source of truth.
+- **News coverage:** the default RSS/Atom source list expanded to 46 feeds across official/regulatory, business, crypto, general-news, weather, and sports sources. News surveillance defaults now use a 7-day lookback, up to 500 articles per sweep, and up to 150 items per RSS feed.
+- **Diagnostics:** news pipeline heartbeats include per-feed counts, so a low stored-article count can be traced to source coverage, duplicate URLs, weak market links, or external provider failures. GDELT remains fail-open; RSS continues even when GDELT times out or rate-limits.
+- **Local sweep note:** stored article counts are intentionally not expected to grow linearly with every scrape; URL dedupe, weak market links, stale articles, and source failures can keep the retained count flat while the pipeline still runs.
+
+#### 2026-04-27 — Pipeline supervisor, heartbeats, and anomaly compaction
+
+- **Schema:** migration `b7d9e4c2a801` adds `pipeline_heartbeats`, a durable last heartbeat/success/error row per pipeline component.
+- **Operations:** `scripts/run_pipeline.py` starts API, poller, WS, and news pipeline on pinned ports, writes child logs under `.pipeline-logs/`, and restarts failed children with backoff.
+- **Dashboard:** `GET /api/dashboard/pipeline-health` now prefers heartbeat rows and exposes heartbeat/success/error fields; the Overview widget shows them in the expanded panel.
+- **Storage:** `anomaly_materializer` compacts continuing quote/book alerts into the active row, only inserting new rows for first alert, severity upgrade, or the cooldown sample.
+- **Guardrails:** `scripts/run_retention_maintenance.py` prunes old L2/book rows and low-tier snapshots in bounded dry-run-first batches; `scripts/verify_clickhouse_retention.py` checks raw ClickHouse TTL drift; `scripts/backfill_market_metrics.py` rebuilds compact dashboard counts; `scripts/qa_historical_signals.py` audits closed/past-close markets for pre-close flags and pre-news signals.
+- **Cloud path:** `Dockerfile` builds the React dashboard into the FastAPI image. `docs/deployment.md` describes both the current <$50 AWS appliance path and the later managed upgrade path.
+
 #### 2026-04-27 — Contextual trade flags, peer baselines, and global news ingest
 
 - **Schema:** migration `af3b92d18c01` adds `trade_flags` and `trade_baselines`. Flags are versioned by scorer, link back to `trades`, can point at `case_evidence`, and carry score components/reasons/features for audit.
 - **Scoring:** `app/services/trade_context.py` adds an explainable contextual scorer on top of the local trade outlier score. It uses sector baselines, quote impact, follow-through, sibling-market behavior, news timing, market priority, and near-resolution context; no trained model is required.
 - **Materializers:** `scripts/materialize_trade_baselines.py` builds category/subcategory p95/p99 baselines; `scripts/materialize_trade_flags.py` persists durable flags and promotes high/critical flags into `market_metrics` retention tiers and `case_evidence`.
-- **News:** `app/services/news_ingestor.py` and `scripts/ingest_news.py` provide the global-first GDELT ingest path: normalize article metadata, refresh `market_news_profiles`, and write `news_events` candidate links before a user opens a market page. Network/API failures now return `provider_status="unavailable"` instead of failing the job.
+- **News:** `app/services/news_ingestor.py`, `scripts/ingest_news.py`, and the watched `scripts/run_news_surveillance_pipeline.py` provide the global-first news path: normalize article metadata, refresh `market_news_profiles`, write `news_events` candidate links before a user opens a market page, then update news/trade correlations. Network/API failures now return `provider_status="unavailable"` instead of failing the job.
 - **Dashboard/read path:** `/api/dashboard` suspicious-trade payloads prefer persisted `trade_flags` when available, while market detail still computes contextual scores on the requested window for immediate inspection.
 - **Tests:** targeted scoring/news tests plus the full suite pass (`136 passed, 21 skipped`).
 
@@ -394,15 +449,15 @@ Most recent first.
 
 #### 2026-04-26 (later) — Product copy, trade outlier 0–10, “why” reasons
 
-- **UI** (`frontend/src/routes/Overview.tsx`, `MarketsBrowser.tsx`, `MarketDetail.tsx`, `App.tsx`, `lib/labels.ts`): user-facing **priority** vs **stored alerts** (replacing “triage / flags / rule rows” in most surfaces), sort labels like **Alerts first** and **Priority, then volume**, market-detail **Outlier** column (0–10), app tagline “Monitoring public Kalshi data for unusual market activity.”
+- **UI** (`frontend/src/routes/Overview.tsx`, `MarketsBrowser.tsx`, `MarketDetail.tsx`, `App.tsx`, `lib/labels.ts`): user-facing **priority** vs **alert history** (replacing “triage / flags / rule rows” in most surfaces), sort labels like **Activity alerts first** and **Priority, then volume**, market-detail **Outlier** column (0–10), app tagline “Monitoring public Kalshi data for unusual market activity.”
 - **`app/services/trade_suspicion.py`:** per-print score is **0..10** (linear map from capped z-features of size and |Δ yes price|); the old `min(20, …)` scale could not exceed ~6 and was misleading.
 - **`frontend/src/lib/reasonPhrases.ts`:** `humanizeAnomalyReason()` for short plain-English lines; market detail **Why you might see an alert** lists deduped reasons from materialized `anomalies.reasons[]`.
 - **Amber row highlight** on the trade table: outlier **≥3.5** (aligned with 0–10), plus the existing large-size / large-jump heuristics.
 - **Changelog / glossary (this file):** glossary and “current design choices” updated so **priority** and **evidence** are not conflated.
 
-#### 2026-04-26 (later) — “Flags” vs trade count: copy
+#### 2026-04-26 (later) — Alert history vs trade count copy
 
-- **UI** / **glossary:** `anomaly_count` is **not** one flag per print — it is **stored rule rows** (mostly one per *ticker snapshot* that met the score floor). Renamed table column to **Rule rows** and market-detail stat to **Rule rows** with tooltips. README glossary row explains why that number can be ≫ trade count on active markets.
+- **UI / glossary:** `anomaly_count` is not one trade flag per print. It counts market-level alert-history rows, mostly ticker snapshots that met the quote/book score floor. The UI now separates **Alert history** from **Top trade flags** so users do not expect alert count and trade count to match.
 #### 2026-04-26 (later) — Uvicorn / Windows: WinError 10013, Vite proxy
 
 - **vite.config.ts** reads `VITE_DEV_API_TARGET` (e.g. `http://127.0.0.1:8001`) so the dev server can follow Uvicorn when the default **:8000** bind is denied on Windows. **README** §Local dev updated.
@@ -415,9 +470,9 @@ Most recent first.
 - **`GET /api/dashboard/overview`:** one JSON with `stats` + `breakdown` + `top_markets` + `recent_anomalies`; the React home page uses this instead of four fetches. **Tests:** `tests/test_dashboard_api.py` (`test_overview_bundles_expected_keys` when `RUN_INTEGRATION=1`); `tests/test_news_gdelt.py` for pure helpers.
 - **News:** `app/services/news_gdelt.py` — boolean-style query from **title *OR* subtitle**; `align=activity` uses the latest trade or `anomalies` row to set a **narrow** window for comparing headlines to the tape. Market detail: toggle + local timestamps on each article. `.gitignore` now ignores a stray `nul` on Windows.
 
-#### 2026-04-26 — Triage vs evidence, stricter rules, local times, fewer chart markers
+#### 2026-04-26 — Priority vs evidence, stricter rules, local times, fewer chart markers
 
-- **Overview stats:** the **Triage (top prior)** number is **classifier** “high + elevated” *only* — it equals the **sum** of the “high” and “medium_high” bars in the breakdown chart, not a single bar and not by itself “suspicious trades.” **Markets with risk flags** = `COUNT(DISTINCT anomalies.market_pk)`; **Unusual activity rows** = total `anomalies` table rows. **Markets** table renames: **Triage** / **Flags** (with tooltips).
+- **Overview stats:** watch-priority numbers come from the classifier and are not suspicious-trade counts. Market-level alert history is `anomalies`; trade-specific rows are `trade_flags`. The UI has since moved from the older "triage/flags" naming to **Watch priority**, **Alert history**, **Market activity alerts**, and **Top trade flags**.
 - **`anomaly_engine`:** stricter rolling z, wider static spread, larger static volume-jump floors. **`anomaly_materializer`:** only persist / update when `score >= 3.0`; else delete a row for that `latest_snapshot_id` if present.
 - **`/markets?sort=surveillance_urgency`:** key is `(8 + 0.4 * (prior_rank+1)) * ln(1+anomaly_count)` when `anomaly_count > 0` so more stored flags outrank a higher triage with fewer.
 - **PriceChart:** `localization` so axis and crosshair use the **browser’s** locale/time; markers still skip `score < 3` (legacy low rows). **fmtTime** / trade column label **(local)**. Earlier same-day: step line, one marker per snap time, nearest-time snap, glossary on bars vs snapshot volume.
@@ -646,14 +701,14 @@ Top book-receiving markets after the third fix were exactly the ones surveillanc
 
 ## Running locally
 
-Prerequisites: Python 3.11+, Postgres, and Kalshi API credentials (`KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`). Docker Compose includes Postgres, Redis, and ClickHouse for the local stack.
+Prerequisites: Python 3.11+, Postgres, and Kalshi API credentials (`KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`). Docker Compose includes Postgres, Redis, ClickHouse, and OpenSearch for the local stack.
 
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -r requirements.txt   # Windows; use .venv/bin/pip on *nix
 
 # Configure .env (postgres_*, redis_*, kalshi_*, clickhouse_* — see app/core/config.py)
-docker compose up -d postgres redis clickhouse
+docker compose up -d postgres redis clickhouse opensearch
 .venv/Scripts/python -m alembic upgrade head
 
 # Optional raw ClickHouse store. Run once after ClickHouse starts.
@@ -702,6 +757,11 @@ PYTHONPATH=. .venv/Scripts/python -m scripts.materialize_trade_flags
 
 # Ingest global news and candidate-link articles to active market profiles.
 PYTHONPATH=. .venv/Scripts/python -m scripts.ingest_news
+
+# Build the optional OpenSearch discovery index used by global search.
+# The dashboard search endpoint still works with a Postgres/profile fallback
+# when OpenSearch is stopped or empty.
+PYTHONPATH=. .venv/Scripts/python -m scripts.rebuild_search_index
 
 # Then open http://127.0.0.1:8000/ for the live dashboard
 # (or http://127.0.0.1:8000/docs for interactive Swagger).

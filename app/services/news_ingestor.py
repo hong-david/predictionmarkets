@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any
 
 import httpx
+from sqlalchemy import case, or_
 from sqlalchemy.orm import Session
 
 from app.db.models import Market, MarketNewsProfile, NewsArticle
 from app.services.news_correlation import (
+    NEWS_PROFILE_EXCLUDED_CATEGORIES,
     NormalizedArticle,
+    is_news_profile_candidate,
     record_news_market_candidate,
     upsert_article,
     upsert_market_news_profile,
@@ -30,9 +34,19 @@ from app.services.news_sources import (
 )
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+GDELT_QUERY_PAUSE_SECONDS = 1.0
 DEFAULT_GLOBAL_NEWS_QUERY = (
     "breaking OR announced OR reports OR decision OR injury OR earnings "
     "OR merger OR court OR Fed OR CPI"
+)
+DEFAULT_GLOBAL_NEWS_QUERIES: tuple[str, ...] = (
+    DEFAULT_GLOBAL_NEWS_QUERY,
+    "Federal Reserve OR FOMC OR inflation OR CPI OR PCE OR jobs report OR unemployment OR GDP",
+    "SEC OR CFTC OR Treasury OR DOJ OR lawsuit OR court ruling OR antitrust OR merger",
+    "Bitcoin OR Ethereum OR crypto OR ETF OR stablecoin OR blockchain OR digital asset",
+    "election OR primary OR polling OR candidate OR governor OR senate OR supreme court",
+    "injury OR lineup OR roster OR suspension OR transfer OR playoff OR championship",
+    "oil OR natural gas OR OPEC OR EIA OR hurricane OR wildfire OR weather warning",
 )
 
 
@@ -80,7 +94,7 @@ def fetch_gdelt_articles(
     since: datetime,
     until: datetime,
     limit: int,
-    timeout: float = 10.0,
+    timeout: float = 20.0,
 ) -> list[NormalizedArticle]:
     params = {
         "query": query,
@@ -92,7 +106,11 @@ def fetch_gdelt_articles(
         "enddatetime": until.strftime("%Y%m%d%H%M%S"),
     }
     with httpx.Client(timeout=timeout) as client:
-        response = client.get(GDELT_DOC_URL, params=params)
+        response = client.get(
+            GDELT_DOC_URL,
+            params=params,
+            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+        )
         response.raise_for_status()
         data = response.json()
     articles = data.get("articles") if isinstance(data, dict) else None
@@ -107,19 +125,49 @@ def fetch_gdelt_articles(
     return out
 
 
+def _gdelt_queries_for_sweep(query: str) -> tuple[str, ...]:
+    """Use several broad-but-themed queries for the default global sweep.
+
+    A single GDELT query is capped and tends to overfit the most generic
+    headlines. Multiple themed queries widen collection while downstream
+    URL dedupe and market-link scoring still keep unrelated news out of the UI.
+    """
+
+    cleaned = (query or "").strip()
+    if not cleaned or cleaned == DEFAULT_GLOBAL_NEWS_QUERY:
+        return DEFAULT_GLOBAL_NEWS_QUERIES
+    return (cleaned,)
+
+
 def refresh_market_news_profiles(
     db: Session,
     *,
     max_markets: int,
 ) -> int:
+    missing_profile_first = case(
+        (MarketNewsProfile.market_pk.is_(None), 0),
+        else_=1,
+    )
     rows = (
         db.query(Market)
-        .filter(Market.status.notin_(("unknown", "out_of_scope")))
+        .outerjoin(MarketNewsProfile, MarketNewsProfile.market_pk == Market.id)
+        .filter(or_(Market.status.is_(None), Market.status != "unknown"))
+        .filter(
+            or_(
+                Market.category.is_(None),
+                Market.category.notin_(tuple(NEWS_PROFILE_EXCLUDED_CATEGORIES)),
+            )
+        )
         .filter(Market.title != Market.market_id)
-        .order_by(Market.updated_at.desc())
+        .order_by(
+            missing_profile_first.asc(),
+            MarketNewsProfile.updated_at.asc().nullsfirst(),
+            Market.updated_at.desc(),
+        )
         .limit(max_markets)
         .all()
     )
+    rows = [market for market in rows if is_news_profile_candidate(market)]
     for market in rows:
         upsert_market_news_profile(db, market)
     return len(rows)
@@ -198,21 +246,33 @@ def ingest_global_news(
     if fetched is None:
         fetched = []
         if include_gdelt:
-            try:
-                gdelt_articles = fetch_gdelt_articles(
-                    query=query,
-                    since=since,
-                    until=until,
-                    limit=limit,
-                )
-                fetched.extend(gdelt_articles)
-                source_counts["gdelt"] = len(gdelt_articles)
-            except (httpx.HTTPError, ValueError) as exc:
-                fetch_errors.append(f"gdelt: {type(exc).__name__}: {exc}")
+            gdelt_articles_seen = 0
+            gdelt_errors = 0
+            for gdelt_query in _gdelt_queries_for_sweep(query):
+                try:
+                    gdelt_articles = fetch_gdelt_articles(
+                        query=gdelt_query,
+                        since=since,
+                        until=until,
+                        limit=limit,
+                    )
+                    fetched.extend(gdelt_articles)
+                    gdelt_articles_seen += len(gdelt_articles)
+                except (httpx.HTTPError, ValueError) as exc:
+                    gdelt_errors += 1
+                    fetch_errors.append(
+                        f"gdelt {gdelt_query[:80]}: {type(exc).__name__}: {exc}"
+                    )
+                time.sleep(GDELT_QUERY_PAUSE_SECONDS)
+            source_counts["gdelt"] = gdelt_articles_seen
+            source_counts["gdelt_queries"] = len(_gdelt_queries_for_sweep(query))
+            if gdelt_errors:
+                source_counts["gdelt_errors"] = gdelt_errors
 
         if rss_feed_list:
             rss_articles_seen = 0
             rss_errors = 0
+            rss_feed_counts: dict[str, int] = {}
             for result in fetch_rss_articles(
                 rss_feed_list,
                 since=since,
@@ -221,10 +281,13 @@ def ingest_global_news(
             ):
                 fetched.extend(result.articles)
                 rss_articles_seen += len(result.articles)
+                rss_feed_counts[result.source_name] = len(result.articles)
                 if result.error:
                     rss_errors += 1
                     fetch_errors.append(f"rss {result.source_name}: {result.error}")
             source_counts["rss"] = rss_articles_seen
+            source_counts["rss_feeds"] = len(rss_feed_list)
+            source_counts["rss_feed_counts"] = rss_feed_counts
             if rss_errors:
                 source_counts["rss_errors"] = rss_errors
 

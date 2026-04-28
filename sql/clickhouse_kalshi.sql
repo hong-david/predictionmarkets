@@ -16,7 +16,12 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_trades_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts, trade_id)
-TTL toDateTime(ts) + INTERVAL 7 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.kalshi_quote_changes_raw
 (
@@ -35,7 +40,12 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_quote_changes_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts)
-TTL toDateTime(ts) + INTERVAL 3 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 3 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 3 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.kalshi_l2_events_raw
 (
@@ -54,7 +64,36 @@ CREATE TABLE IF NOT EXISTS surveillance.kalshi_l2_events_raw
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(ts)
 ORDER BY (market_pk, ts, session_id, seq)
-TTL toDateTime(ts) + INTERVAL 1 DAY DELETE;
+TTL toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 6 HOUR DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE;
+
+ALTER TABLE surveillance.kalshi_trades_raw MODIFY TTL
+    toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE;
+
+ALTER TABLE surveillance.kalshi_quote_changes_raw MODIFY TTL
+    toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 3 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 90 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 3 DAY DELETE;
+
+ALTER TABLE surveillance.kalshi_l2_events_raw MODIFY TTL
+    toDateTime(ts) + INTERVAL 1 HOUR DELETE WHERE storage_tier = 'observe_only',
+    toDateTime(ts) + INTERVAL 6 HOUR DELETE WHERE storage_tier = 'sampled',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE WHERE storage_tier = 'hot',
+    toDateTime(ts) + INTERVAL 7 DAY DELETE WHERE storage_tier = 'triggered',
+    toDateTime(ts) + INTERVAL 30 DAY DELETE WHERE storage_tier = 'case',
+    toDateTime(ts) + INTERVAL 1 DAY DELETE;
 
 CREATE TABLE IF NOT EXISTS surveillance.market_features_1m
 (

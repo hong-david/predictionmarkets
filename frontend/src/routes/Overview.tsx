@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { ChevronDown } from "lucide-react";
 import {
   Bar,
   BarChart,
@@ -12,13 +14,21 @@ import {
 import { Link, useNavigate } from "react-router-dom";
 
 import { api } from "@/api/client";
-import type { BreakdownEntry, NewsSignal, SuspiciousTrade } from "@/api/types";
+import type {
+  BreakdownEntry,
+  MarketScope,
+  NewsSignal,
+  PipelineComponentStatus,
+  PipelineHealth,
+  PipelineSummaryStatus,
+  SuspiciousTrade,
+} from "@/api/types";
 import { Badge, severityVariant } from "@/components/Badge";
 import { Card, CardBody, CardHeader } from "@/components/Card";
 import { MarketCell } from "@/components/MarketCell";
 import { categoryDisplay, priorDisplay, priorShort } from "@/lib/labels";
 import { EmptyState, Skeleton, StatusDot } from "@/components/StatusBits";
-import { fmtAgo, fmtInt, fmtPrice, fmtTime } from "@/lib/utils";
+import { fmtAgo, fmtDollars, fmtInt, fmtPrice, fmtTime } from "@/lib/utils";
 
 /** Order priors high → low so chart bars line up with intuition. */
 const PRIOR_ORDER: Record<string, number> = {
@@ -87,9 +97,10 @@ function StatTile({
 
 export default function OverviewPage() {
   const navigate = useNavigate();
+  const [marketScope, setMarketScope] = useState<MarketScope>("active");
   const overview = useQuery({
-    queryKey: ["overview"],
-    queryFn: () => api.overview({ top: 15, anomalies: 15 }),
+    queryKey: ["overview", marketScope],
+    queryFn: () => api.overview({ top: 15, anomalies: 15, market_scope: marketScope }),
     refetchInterval: 8_000,
   });
   const st = overview.data?.stats;
@@ -113,9 +124,12 @@ export default function OverviewPage() {
       <div className="space-y-4">
         <section className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <StatusDot tone="error" />
-            <span>API error</span>
+          <div className="flex flex-col items-end gap-2">
+            <PipelineHealthWidget />
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <StatusDot tone="error" />
+              <span>Overview API error</span>
+            </div>
           </div>
         </section>
         <Card>
@@ -151,16 +165,20 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-6">
-      <section className="flex items-center justify-between">
+      <section className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
           <p className="text-sm text-muted-foreground">
-            Snapshot of tracked markets and activity · {fmtInt(st?.markets)} in scope
+            Snapshot of {scopeLabel(marketScope).toLowerCase()} markets and activity · {fmtInt(st?.markets)} in view
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <StatusDot tone={tone} />
-          <span>{updated}</span>
+        <div className="flex flex-col items-start gap-2 sm:items-end">
+          <PipelineHealthWidget />
+          <ScopeToggle value={marketScope} onChange={setMarketScope} />
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <StatusDot tone={tone} />
+            <span>{updated}</span>
+          </div>
         </div>
       </section>
 
@@ -172,35 +190,35 @@ export default function OverviewPage() {
         ) : st ? (
           <>
             <StatTile
-              label="Markets"
+              label={`${scopeLabel(marketScope)} markets`}
               value={fmtInt(st.markets)}
-              sub={`${fmtInt(st.markets_status_unknown)} still loading titles from the exchange`}
+              sub={`${fmtInt(st.markets_active)} active/open · ${fmtInt(st.markets_historical)} historical retained · ${fmtInt(st.markets_status_unknown)} still hydrating.`}
             />
             <StatTile
-              label="High-priority markets"
+              label="High watch-priority"
               value={fmtInt(st.markets_high_prior)}
-              sub="“High” + “elevated” priority (classifier) — sum of the two left bars, not a single bar and not “bad trades” by itself"
+              sub="High plus elevated classifier buckets. Priority means this contract type is worth watching; it is not a suspicious-trade verdict."
               tone="primary"
             />
             <StatTile
-              label="Markets with alerts"
-              value={fmtInt(st.markets_with_flags)}
-              sub="At least one stored alert row; use the Markets list default sort to rank them"
+              label="News kept"
+              value={fmtInt(st.news_articles)}
+              sub="Deduped article records saved after ingest. The pipeline keeps headlines, summaries, timing, entities, and links when they look usable."
             />
             <StatTile
               label="Trades stored"
               value={fmtInt(st.trades)}
-              sub="Executions we’ve recorded from the live feed"
+              sub="Public exchange execution prints retained from the live feed. These are trades, not orders or quotes."
             />
             <StatTile
-              label="Order book events"
+              label="Order-book updates"
               value={fmtInt(st.book_events)}
-              sub="Full book snapshots and price-level updates (how the order book changes)"
+              sub="Retained snapshots and price-level changes showing bid/ask depth. Low-value book noise may be dropped by retention policy."
             />
             <StatTile
-              label="Stored alerts"
+              label="Saved market alerts"
               value={fmtInt(st.anomalies)}
-              sub={`${fmtInt(st.anomalies_high_severity)} “high” — total materialized rule rows in the DB (mostly per quote, not per trade)`}
+              sub={`${fmtInt(st.anomalies_high_severity)} high severity. Saved quote/book alert history for later review after raw data is compacted.`}
               tone={st.anomalies_high_severity > 0 ? "danger" : "default"}
             />
           </>
@@ -210,8 +228,8 @@ export default function OverviewPage() {
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <Card>
           <CardHeader
-            title="Markets by priority"
-            subtitle="Classifier only (sensitivity of this market type). The “High-priority markets” stat is the sum of “high + elevated” in those bars. “Markets with alerts” is separate (evidence). Markets with no prior label are hidden from this chart."
+            title="Markets by watch priority"
+            subtitle="Priority is a classifier bucket from the market topic, wording, and contract type. It tells us what deserves closer monitoring; actual alerts and news links are separate signals."
           />
           <CardBody>
             <BreakdownBarChart
@@ -235,15 +253,6 @@ export default function OverviewPage() {
                   buildMarketsQuery("prior", row.key),
                 )
               }
-            />
-            <BreakdownLinkList
-              kind="prior"
-              rows={filterUnclassified(br?.by_prior)
-                .sort(
-                  (a, b) =>
-                    (PRIOR_ORDER[a.key] ?? 99) - (PRIOR_ORDER[b.key] ?? 99),
-                )
-                .map((b) => ({ ...b, displayKey: priorDisplay(b.key) }))}
             />
           </CardBody>
         </Card>
@@ -273,15 +282,6 @@ export default function OverviewPage() {
                 )
               }
             />
-            <BreakdownLinkList
-              kind="category"
-              rows={filterUnclassified(br?.by_category)
-                .slice(0, 10)
-                .map((b) => ({
-                  ...b,
-                  displayKey: categoryDisplay(b.key),
-                }))}
-            />
           </CardBody>
         </Card>
       </section>
@@ -290,7 +290,7 @@ export default function OverviewPage() {
         <Card>
           <CardHeader
             title="Most traded markets"
-            subtitle="Where we’ve seen the most execution prints recently"
+            subtitle="Active/open markets with the most retained execution prints in the recent trade sample, plus estimated dollars paid for those contracts."
           />
           <div>
             {overview.isPending ? (
@@ -305,6 +305,7 @@ export default function OverviewPage() {
                   <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
                     <th className="text-left px-4 py-2 font-medium">Market</th>
                     <th className="text-right px-4 py-2 font-medium">Trades</th>
+                    <th className="text-right px-4 py-2 font-medium">Total $ volume</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -319,6 +320,9 @@ export default function OverviewPage() {
                       <td className="px-4 py-2.5 text-right num text-sm">
                         {fmtInt(m.trade_count)}
                       </td>
+                      <td className="px-4 py-2.5 text-right num text-sm">
+                        {fmtDollars(m.trade_dollar_volume)}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -329,8 +333,8 @@ export default function OverviewPage() {
 
         <Card>
           <CardHeader
-            title="Recent activity flags"
-            subtitle="Scored from spread, price moves, and volume vs. recent history"
+            title="Market activity alerts"
+            subtitle="Active/open markets with saved quote, volume, spread, and order-book alert history. These are market alerts, not individual trade accusations."
             right={
               recentFlags
                 ? `${fmtInt(recentFlags.count)} shown`
@@ -343,7 +347,7 @@ export default function OverviewPage() {
                 <Skeleton className="h-32" />
               </div>
             ) : !recentFlags?.anomalies.length ? (
-              <EmptyState>No flags stored yet.</EmptyState>
+              <EmptyState>No market activity alerts saved yet.</EmptyState>
             ) : (
               <ul className="divide-y divide-border">
                 {recentFlags.anomalies.map((a) => (
@@ -399,10 +403,12 @@ export default function OverviewPage() {
       <Card>
         <CardHeader
           title="News-linked signals"
-          subtitle="Linked articles ranked by pre-news trade alignment. These scores combine relevance, YES/NO direction, timing, and market tape behavior."
+          subtitle="Vetted market/news links, with trade-aligned rows ranked first. Scores combine relevance, YES/NO direction, timing, and market tape behavior when available."
           right={
             newsSignals
-              ? `${fmtInt(newsSignals.count)} at score ${newsSignals.min_score.toFixed(1)}+`
+              ? newsSignals.min_score > 0
+                ? `${fmtInt(newsSignals.count)} at score ${newsSignals.min_score.toFixed(1)}+`
+                : `${fmtInt(newsSignals.count)} directional links`
               : undefined
           }
         />
@@ -412,7 +418,10 @@ export default function OverviewPage() {
               <Skeleton className="h-32" />
             </div>
           ) : !newsSignals?.signals.length ? (
-            <EmptyState>No news-linked trade signals materialized yet.</EmptyState>
+            <EmptyState>
+              No news-linked signals to show yet. Stored articles may exist, but none
+              currently pass the market-link, direction, and trade-timing filters.
+            </EmptyState>
           ) : (
             <table className="w-full">
               <thead>
@@ -436,8 +445,8 @@ export default function OverviewPage() {
 
       <Card>
         <CardHeader
-          title="Most unusual prints"
-          subtitle="Local outlier score from public tape only: size vs this market's recent prints, price jump, and same-side clustering. This is triage, not an insider-trading verdict."
+          title="Top trade flags"
+          subtitle="Individual trade candidates ranked by the stronger of local outlier score and context score. Context can include liquidity impact, sector baselines, linked news timing, sibling-market movement, and market priority."
           right={
             suspiciousTrades
               ? `${fmtInt(suspiciousTrades.count)} shown from latest ${fmtInt(suspiciousTrades.sample)} prints`
@@ -450,7 +459,7 @@ export default function OverviewPage() {
               <Skeleton className="h-32" />
             </div>
           ) : !suspiciousTrades?.trades.length ? (
-            <EmptyState>No unusual prints found in the recent sample.</EmptyState>
+            <EmptyState>No trade flags found in the recent sample.</EmptyState>
           ) : (
             <table className="w-full">
               <thead>
@@ -460,6 +469,12 @@ export default function OverviewPage() {
                   <th className="text-right px-3 py-2.5 font-medium">Score</th>
                   <th className="text-right px-3 py-2.5 font-medium">Yes</th>
                   <th className="text-right px-3 py-2.5 font-medium">Contracts</th>
+                  <th
+                    className="text-right px-3 py-2.5 font-medium"
+                    title="Estimated dollars paid in this print: contracts times the side price."
+                  >
+                    Est $
+                  </th>
                   <th className="text-left px-3 py-2.5 font-medium">Why</th>
                 </tr>
               </thead>
@@ -474,6 +489,200 @@ export default function OverviewPage() {
       </Card>
     </div>
   );
+}
+
+function scopeLabel(scope: MarketScope): string {
+  if (scope === "historical") return "Historical";
+  if (scope === "all") return "All tracked";
+  return "Active/open";
+}
+
+function ScopeToggle({
+  value,
+  onChange,
+}: {
+  value: MarketScope;
+  onChange: (scope: MarketScope) => void;
+}) {
+  const options: { value: MarketScope; label: string; title: string }[] = [
+    {
+      value: "active",
+      label: "Active",
+      title: "Markets still open or active according to status/close time.",
+    },
+    {
+      value: "historical",
+      label: "Historical",
+      title: "Closed, finalized, settled, or past-close markets kept for review.",
+    },
+    {
+      value: "all",
+      label: "All",
+      title: "Active and historical retained markets.",
+    },
+  ];
+  return (
+    <div className="flex items-center gap-1 rounded-md border border-border p-0.5 text-[11px]">
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          title={option.title}
+          onClick={() => onChange(option.value)}
+          className={
+            value === option.value
+              ? "rounded px-2 py-0.5 bg-secondary text-foreground"
+              : "rounded px-2 py-0.5 text-muted-foreground hover:text-foreground"
+          }
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function PipelineHealthWidget() {
+  const [expanded, setExpanded] = useState(false);
+  const health = useQuery({
+    queryKey: ["pipeline-health"],
+    queryFn: () => api.pipelineHealth(),
+    refetchInterval: 10_000,
+    staleTime: 5_000,
+    retry: 1,
+  });
+  const data = health.data;
+  const summaryTone = health.isError
+    ? "error"
+    : pipelineSummaryTone(data?.summary.status);
+  const summaryText = health.isError
+    ? "Health unavailable"
+    : health.isPending && !data
+      ? "Checking"
+      : pipelineSummaryText(data);
+  const errorMessage =
+    health.error instanceof Error
+      ? health.error.message
+      : String(health.error ?? "Pipeline health could not be loaded.");
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((v) => !v)}
+        className="inline-flex items-center gap-2 rounded-md border border-border bg-card/80 px-2.5 py-1.5 text-xs text-muted-foreground shadow-sm hover:bg-secondary/60 hover:text-foreground transition-colors"
+      >
+        <StatusDot tone={summaryTone} />
+        <span className="font-medium text-foreground">Pipeline health</span>
+        <span>{summaryText}</span>
+        <ChevronDown
+          className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`}
+        />
+      </button>
+      {expanded ? (
+        <div className="absolute right-0 top-full z-30 mt-2 w-[min(92vw,440px)] overflow-hidden rounded-lg border border-border bg-card text-card-foreground shadow-lg">
+          <div className="border-b border-border px-3 py-2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-semibold">Pipeline health</div>
+                <div className="text-[11px] text-muted-foreground">
+                  Jobs, materializers, feeds, and projections
+                </div>
+              </div>
+              {data ? (
+                <div className="text-[11px] text-muted-foreground">
+                  {fmtAgo(data.generated_at)}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          {health.isError ? (
+            <div className="px-3 py-3 text-xs text-muted-foreground">
+              <div className="font-medium text-foreground">Health unavailable</div>
+              <div className="mt-1 break-words">{errorMessage}</div>
+            </div>
+          ) : !data ? (
+            <div className="px-3 py-3">
+              <Skeleton className="h-24" />
+            </div>
+          ) : (
+            <ul className="max-h-[420px] overflow-y-auto divide-y divide-border">
+              {data.components.map((component) => (
+                <li key={component.key} className="px-3 py-2.5">
+                  <div className="flex items-start gap-2">
+                    <div className="pt-1">
+                      <StatusDot tone={pipelineComponentTone(component.status)} />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <div className="truncate text-xs font-medium text-foreground">
+                          {component.label}
+                        </div>
+                        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                          {component.status}
+                        </div>
+                      </div>
+                      <div className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                        {component.detail || component.description}
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                        <span>latest {fmtAgo(component.latest_at)}</span>
+                        {component.heartbeat_at ? (
+                          <span>heartbeat {fmtAgo(component.heartbeat_at)}</span>
+                        ) : null}
+                        {component.last_success_at ? (
+                          <span>success {fmtAgo(component.last_success_at)}</span>
+                        ) : null}
+                        {component.count != null ? (
+                          <span>
+                            {fmtInt(component.count)}{" "}
+                            {component.source === "heartbeat" ? "last batch" : "rows"}
+                          </span>
+                        ) : null}
+                        {component.component_type ? (
+                          <span>{component.component_type}</span>
+                        ) : null}
+                      </div>
+                      {component.last_error ? (
+                        <div className="mt-1 text-[11px] leading-snug text-[hsl(var(--severity-high))]">
+                          {component.last_error}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function pipelineSummaryTone(status: PipelineSummaryStatus | undefined) {
+  if (status === "healthy") return "live";
+  if (status === "error") return "error";
+  if (status === "empty") return "empty";
+  return "stale";
+}
+
+function pipelineComponentTone(status: PipelineComponentStatus) {
+  if (status === "healthy") return "live";
+  if (status === "error") return "error";
+  if (status === "empty") return "empty";
+  return "stale";
+}
+
+function pipelineSummaryText(data: PipelineHealth | undefined): string {
+  if (!data) return "Checking";
+  const s = data.summary;
+  if (s.status === "healthy") return "All live";
+  if (s.error > 0) return `${s.error} error${s.error === 1 ? "" : "s"}`;
+  if (s.stale > 0) return `${s.stale} stale`;
+  if (s.empty > 0) return `${s.empty} empty`;
+  return "Degraded";
 }
 
 function NewsSignalRow({ signal }: { signal: NewsSignal }) {
@@ -514,8 +723,21 @@ function NewsSignalRow({ signal }: { signal: NewsSignal }) {
           ) : null}
         </div>
       </td>
-      <td className="px-3 py-2.5 text-right num font-semibold text-[hsl(var(--severity-high))]">
-        {signal.pre_news_trade_score.toFixed(2)}
+      <td className="px-3 py-2.5 text-right">
+        {signal.pre_news_trade_score > 0 ? (
+          <div className="num font-semibold text-[hsl(var(--severity-high))]">
+            {signal.pre_news_trade_score.toFixed(2)}
+          </div>
+        ) : (
+          <div>
+            <div className="num font-semibold text-foreground">
+              {signal.relevance_score.toFixed(2)}
+            </div>
+            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              relevance
+            </div>
+          </div>
+        )}
       </td>
       <td className="px-3 py-2.5 text-xs text-muted-foreground">
         {signal.direction_label ?? "ambiguous"}
@@ -559,6 +781,9 @@ function SuspiciousTradeRow({ trade }: { trade: SuspiciousTrade }) {
       <td className="px-3 py-2.5 text-right num text-sm">
         {fmtInt(trade.count != null ? Math.round(trade.count) : null)}
       </td>
+      <td className="px-3 py-2.5 text-right num text-sm">
+        {fmtDollars(trade.trade_dollar_amount)}
+      </td>
       <td className="px-3 py-2.5">
         <div className="flex flex-wrap gap-1">
           {(trade.reasons.length ? trade.reasons : ["statistical_outlier"]).map((r) => (
@@ -572,45 +797,6 @@ function SuspiciousTradeRow({ trade }: { trade: SuspiciousTrade }) {
         </div>
       </td>
     </tr>
-  );
-}
-
-function BreakdownLinkList({
-  kind,
-  rows,
-}: {
-  kind: "category" | "prior";
-  rows:
-    | Array<BreakdownEntry & { displayKey?: string }>
-    | undefined;
-}) {
-  if (!rows?.length) return null;
-  return (
-    <div className="mt-3 border-t border-border pt-3">
-      <p className="text-[11px] text-muted-foreground mb-2">
-        Open a filtered list (same data as the bars) — all labels shown in full
-      </p>
-      <ul className="max-h-44 overflow-y-auto space-y-1.5 pr-1">
-        {rows.map((r) => (
-          <li key={r.key}>
-            <Link
-              to={buildMarketsQuery(kind, r.key)}
-              className="flex items-center justify-between gap-3 rounded-md px-2 py-1 text-sm hover:bg-secondary/50 transition-colors"
-            >
-              <span
-                className="min-w-0 truncate"
-                title={r.displayKey ?? r.key}
-              >
-                {r.displayKey ?? r.key}
-              </span>
-              <span className="num text-muted-foreground flex-shrink-0">
-                {r.count.toLocaleString()}
-              </span>
-            </Link>
-          </li>
-        ))}
-      </ul>
-    </div>
   );
 }
 

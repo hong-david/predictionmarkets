@@ -1,0 +1,72 @@
+{
+  "family": "predictionmarkets-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<account-id>:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<account-id>:role/predictionmarketsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "<account-id>.dkr.ecr.<region>.amazonaws.com/predictionmarkets:<tag>",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "APP_ENV", "value": "production" },
+        { "name": "APP_HOST", "value": "0.0.0.0" },
+        { "name": "APP_PORT", "value": "8000" },
+        { "name": "POSTGRES_HOST", "value": "<rds-endpoint>" },
+        { "name": "POSTGRES_PORT", "value": "5432" },
+        { "name": "POSTGRES_DB", "value": "surveillance" },
+        { "name": "REDIS_HOST", "value": "<elasticache-endpoint>" },
+        { "name": "REDIS_PORT", "value": "6379" },
+        { "name": "CLICKHOUSE_URL", "value": "https://<clickhouse-cloud-host>:8443" },
+        { "name": "CLICKHOUSE_DATABASE", "value": "surveillance" },
+        { "name": "ELASTICSEARCH_URL", "value": "https://<elastic-cloud-deployment-endpoint>" },
+        { "name": "KALSHI_PRIVATE_KEY_PATH", "value": "" },
+        { "name": "KALSHI_RAW_BACKEND", "value": "dual" }
+      ],
+      "secrets": [
+        {
+          "name": "POSTGRES_USER",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/postgres-user"
+        },
+        {
+          "name": "POSTGRES_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/postgres-password"
+        },
+        {
+          "name": "CLICKHOUSE_USER",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/clickhouse-user"
+        },
+        {
+          "name": "CLICKHOUSE_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/clickhouse-password"
+        },
+        {
+          "name": "KALSHI_API_KEY_ID",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/kalshi-api-key-id"
+        },
+        {
+          "name": "KALSHI_PRIVATE_KEY_PEM",
+          "valueFrom": "arn:aws:secretsmanager:<region>:<account-id>:secret:predictionmarkets/kalshi-private-key-pem"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/predictionmarkets",
+          "awslogs-region": "<region>",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,117 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-surveillance}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-surveillance}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KALSHI_RAW_BACKEND: postgres
+      KALSHI_BOOK_MARKET_LIMIT: ${KALSHI_BOOK_MARKET_LIMIT:-5}
+      KALSHI_WS_WORKER_COUNT: ${KALSHI_WS_WORKER_COUNT:-1}
+      KALSHI_WS_QUEUE_SIZE: ${KALSHI_WS_QUEUE_SIZE:-2500}
+      RETENTION_BOOK_EVENTS_MAX_AGE_DAYS: ${RETENTION_BOOK_EVENTS_MAX_AGE_DAYS:-1}
+      RETENTION_SNAPSHOT_OBSERVE_MAX_AGE_DAYS: ${RETENTION_SNAPSHOT_OBSERVE_MAX_AGE_DAYS:-1}
+      RETENTION_SNAPSHOT_SAMPLED_MAX_AGE_DAYS: ${RETENTION_SNAPSHOT_SAMPLED_MAX_AGE_DAYS:-3}
+      RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS: ${RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS:-14}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8000:8000"
+
+  pipeline:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      KALSHI_RAW_BACKEND: postgres
+      KALSHI_BOOK_MARKET_LIMIT: ${KALSHI_BOOK_MARKET_LIMIT:-5}
+      KALSHI_WS_WORKER_COUNT: ${KALSHI_WS_WORKER_COUNT:-1}
+      KALSHI_WS_QUEUE_SIZE: ${KALSHI_WS_QUEUE_SIZE:-2500}
+    command:
+      - python
+      - -m
+      - scripts.run_pipeline
+      - --skip-api
+      - --poll-interval-seconds
+      - "900"
+      - --poll-batch-size
+      - "250"
+      - --anomaly-market-limit
+      - "50"
+      - --hydrate-unknown-max
+      - "100"
+      - --news-interval-seconds
+      - "3600"
+      - --news-lookback-hours
+      - "72"
+      - --news-limit
+      - "200"
+      - --news-max-markets
+      - "8000"
+      - --news-max-profiles
+      - "8000"
+      - --max-candidates-per-article
+      - "50"
+      - --max-news-events
+      - "500"
+      - --news-batch-size
+      - "50"
+      - --with-retention-maintenance
+      - --retention-execute
+      - --retention-analyze
+      - --retention-interval-seconds
+      - "3600"
+      - --retention-book-event-days
+      - "1"
+      - --retention-observe-snapshot-days
+      - "1"
+      - --retention-sampled-snapshot-days
+      - "3"
+      - --retention-hot-snapshot-days
+      - "14"
+      - --retention-batch-size
+      - "5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+volumes:
+  postgres_data:

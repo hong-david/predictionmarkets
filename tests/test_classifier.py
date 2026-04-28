@@ -153,6 +153,7 @@ class TestLayer2PrefixRules:
 
     def test_unmatched_returns_none(self):
         assert classify_via_prefix_rules("ABCNOTAKALSHIPREFIX") is None
+        assert classify_via_prefix_rules("KXMAR-26MAYROOMS-1760000") is None
 
     def test_empty_ticker_returns_none(self):
         assert classify_via_prefix_rules("") is None

@@ -7,8 +7,11 @@ import type {
   MarketSeries,
   MarketsList,
   NewsSignalsList,
+  PipelineHealth,
   DashboardOverview,
+  MarketScope,
   RecentAnomaliesList,
+  SearchResponse,
   SuspiciousTradesList,
   SystemStats,
   TopMarketsList,
@@ -45,18 +48,26 @@ async function get<T>(
 
 export const api = {
   /** Single round-trip for the home page (stats + charts + two side lists). */
-  overview: (params?: { top?: number; anomalies?: number }) =>
+  overview: (params?: { top?: number; anomalies?: number; market_scope?: MarketScope }) =>
     get<DashboardOverview>("/api/dashboard/overview", {
       top: params?.top,
       anomalies: params?.anomalies,
+      market_scope: params?.market_scope,
     }),
-  stats: () => get<SystemStats>("/api/dashboard/stats"),
-  breakdown: () => get<Breakdown>("/api/dashboard/breakdown"),
+  stats: (params?: { market_scope?: MarketScope }) =>
+    get<SystemStats>("/api/dashboard/stats", {
+      market_scope: params?.market_scope,
+    }),
+  breakdown: (params?: { market_scope?: MarketScope }) =>
+    get<Breakdown>("/api/dashboard/breakdown", {
+      market_scope: params?.market_scope,
+    }),
   markets: (params: {
     q?: string;
     category?: string;
     prior?: string;
     confidence?: string;
+    market_scope?: MarketScope;
     status?: string;
     include_unhydrated?: boolean;
     sort?:
@@ -64,6 +75,7 @@ export const api = {
       | "trades_asc"
       | "priority"
       | "surveillance_urgency"
+      | "top_trade_flag"
       | "recent"
       | "title"
       | "anomalies"
@@ -105,4 +117,7 @@ export const api = {
       limit,
       min_score: minScore,
     }),
+  pipelineHealth: () => get<PipelineHealth>("/api/dashboard/pipeline-health"),
+  search: (q: string, scope: "all" | "markets" | "news" = "all", limit = 10) =>
+    get<SearchResponse>("/api/dashboard/search", { q, scope, limit }),
 };

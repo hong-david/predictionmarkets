@@ -28,7 +28,7 @@ def test_direct_lexical_match_still_scores():
     assert lexical_relevance(article, _crypto_profile()) > 0
     assert result.score > 0
     assert result.components["lexical_relevance"] > 0
-    assert result.components["scorer"] == "hybrid_news_relevance_v1"
+    assert result.components["scorer"] == "hybrid_news_relevance_v2"
 
 
 def test_orthogonal_crypto_policy_article_links_above_default_threshold():
@@ -102,3 +102,113 @@ def test_factor_match_needs_profile_anchor_when_category_is_broad():
 
     assert result.components["factor_relevance"] == 0
     assert result.score < 0.35
+
+
+def test_macro_oil_article_gets_direction_hint_from_underlier_terms():
+    article = NewsArticle(
+        canonical_url_hash="x",
+        canonical_url="https://example.com/oil",
+        title="Oil prices rise as US-Iran peace talks stall",
+        keywords=["oil", "prices", "rise"],
+    )
+    profile = MarketNewsProfile(
+        market_pk=3,
+        normalized_keywords=["wti", "oil", "above_threshold"],
+        entities=[],
+        aliases=["KXWTI-TEST"],
+        category="macro",
+    )
+
+    result = hybrid_news_relevance(article, profile)
+
+    assert result.components["direction_hint"] == "bullish_underlier"
+
+
+def test_fed_rate_cut_hint_is_bearish_for_rate_underlier():
+    article = NewsArticle(
+        canonical_url_hash="x",
+        canonical_url="https://example.com/fed-cut",
+        title="Fed signals faster rate cuts after weak inflation data",
+        keywords=["fed", "rate", "cuts"],
+    )
+    profile = MarketNewsProfile(
+        market_pk=4,
+        normalized_keywords=["fed", "rate", "above_threshold"],
+        entities=[],
+        aliases=["KXFED-TEST"],
+        category="macro",
+    )
+
+    result = hybrid_news_relevance(article, profile)
+
+    assert result.components["direction_hint"] == "bearish_underlier"
+
+
+def test_macro_factor_matching_is_factor_specific():
+    article = NewsArticle(
+        canonical_url_hash="x",
+        canonical_url="https://example.com/fed-bank",
+        title="Federal Reserve Board announces approval of bank merger application",
+        keywords=["federal", "reserve", "approval"],
+    )
+    oil_profile = MarketNewsProfile(
+        market_pk=5,
+        normalized_keywords=["wti", "oil", "above_threshold"],
+        entities=[],
+        aliases=["KXWTI-TEST"],
+        category="macro",
+    )
+
+    result = hybrid_news_relevance(article, oil_profile)
+
+    assert result.components["factor_relevance"] == 0
+    assert result.score < 0.35
+
+
+def test_corporate_factor_only_article_does_not_link_specific_metric_market():
+    article = NewsArticle(
+        canonical_url_hash="x",
+        canonical_url="https://example.com/meta-takeover",
+        title="China blocks Meta takeover of AI agent developer Manus",
+        summary="Regulators opposed the acquisition.",
+    )
+    marriott_rooms = MarketNewsProfile(
+        market_pk=6,
+        normalized_keywords=[
+            "marriott",
+            "rooms",
+            "above_threshold",
+            "merger",
+            "single_actor_leverage",
+        ],
+        entities=[],
+        aliases=["KXMAR-26MAYROOMS"],
+        category="corporate",
+    )
+
+    result = hybrid_news_relevance(article, marriott_rooms)
+
+    assert result.components["factor_relevance"] == 0
+    assert result.components["factor_hits"] == {}
+    assert result.score < 0.35
+
+
+def test_corporate_metric_article_links_on_specific_underlier_terms():
+    article = NewsArticle(
+        canonical_url_hash="x",
+        canonical_url="https://example.com/marriott-rooms",
+        title="Marriott reports growth in total rooms ahead of quarterly filing",
+        summary="The hotel operator's room count rose again.",
+    )
+    marriott_rooms = MarketNewsProfile(
+        market_pk=7,
+        normalized_keywords=["marriott", "rooms", "above_threshold"],
+        entities=[],
+        aliases=["KXMAR-26MAYROOMS"],
+        category="corporate",
+    )
+
+    result = hybrid_news_relevance(article, marriott_rooms)
+
+    assert result.components["lexical_relevance"] >= 0.5
+    assert result.score >= 0.35

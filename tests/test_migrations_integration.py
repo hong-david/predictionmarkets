@@ -52,7 +52,14 @@ def engine():
 def test_all_event_tables_exist(engine):
     insp = inspect(engine)
     tables = set(insp.get_table_names())
-    expected = {"markets", "market_snapshots", "anomalies", "trades", "book_events"}
+    expected = {
+        "markets",
+        "market_snapshots",
+        "anomalies",
+        "trades",
+        "book_events",
+        "pipeline_heartbeats",
+    }
     assert expected <= tables, f"missing: {expected - tables}"
 
 

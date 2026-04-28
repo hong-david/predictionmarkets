@@ -36,7 +36,7 @@ from app.services.surveillance_scores import (
 )
 from app.services.trade_suspicion import explain_trades_against_window
 
-NEWS_TRADE_SCORER_VERSION = 1
+NEWS_TRADE_SCORER_VERSION = 2
 NEWS_TRADE_MIN_RELEVANCE = 0.35
 NEWS_TRADE_SIGNAL_SCORE = 4.0
 NEWS_TRADE_STRONG_SIGNAL_SCORE = 7.0
@@ -117,6 +117,28 @@ def _market_direction(event: NewsEvent) -> tuple[int, str, float]:
     if label == "supports_no":
         return -1, label, confidence
     return 0, label, confidence
+
+
+def _has_direct_or_strong_news_match(event: NewsEvent) -> bool:
+    components = event.score_components if isinstance(event.score_components, dict) else {}
+    for key in ("lexical_relevance", "entity_relevance", "alias_relevance"):
+        if (_f(components.get(key)) or 0.0) > 0:
+            return True
+    candidate = components.get("candidate_generation")
+    if isinstance(candidate, dict):
+        reasons = {
+            str(reason)
+            for reason in (candidate.get("candidate_reasons") or [])
+            if str(reason or "").strip()
+        }
+        if reasons and reasons <= {"category_factor"}:
+            return False
+        matched_terms = candidate.get("matched_terms")
+        if isinstance(matched_terms, list) and matched_terms:
+            return True
+    if float(event.relevance_score or 0.0) >= 0.65:
+        return True
+    return False
 
 
 def _side_direction(side: str | None) -> int:
@@ -228,6 +250,9 @@ def score_news_trade_correlation(
     local_explanations = explain_trades_against_window(payloads, window=50)
     flags_by_trade = _trade_flag_map(trade_flags)
     desired_direction, direction_label, direction_confidence = _market_direction(event)
+    weak_ambiguous_news = (
+        desired_direction == 0 and not _has_direct_or_strong_news_match(event)
+    )
 
     best: dict | None = None
     previous_price: float | None = None
@@ -310,12 +335,15 @@ def score_news_trade_correlation(
                     min(1.5, aligned_move * 18.0), 3
                 )
                 reasons.append("price_moved_toward_news_side")
-        elif abs(pre_news_followthrough) >= 0.05:
+        elif not weak_ambiguous_news and abs(pre_news_followthrough) >= 0.08:
             component_scores["direction_alignment"] = 0.25
             component_scores["pre_news_move"] = 0.4
             reasons.append("ambiguous_news_with_pre_news_move")
 
         raw_score = sum(component_scores.values())
+        if weak_ambiguous_news:
+            raw_score = min(raw_score, NEWS_TRADE_SIGNAL_SCORE - 0.001)
+            reasons.append("ambiguous_weak_news_link")
         score = round(max(0.0, min(10.0, raw_score)), 3)
         if previous_price is None or price is not None:
             previous_price = price

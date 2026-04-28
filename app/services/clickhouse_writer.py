@@ -23,6 +23,14 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+def clickhouse_http_auth() -> tuple[str, str] | None:
+    if settings.clickhouse_password:
+        return (settings.clickhouse_user or "default", settings.clickhouse_password)
+    if settings.clickhouse_user and settings.clickhouse_user != "default":
+        return (settings.clickhouse_user, "")
+    return None
+
+
 def _json_default(value):
     if isinstance(value, datetime):
         if value.tzinfo is not None:
@@ -48,9 +56,7 @@ class ClickHouseWriter:
             for row in payload_rows
         )
         query = f"INSERT INTO {table} FORMAT JSONEachRow"
-        auth = None
-        if settings.clickhouse_user or settings.clickhouse_password:
-            auth = (settings.clickhouse_user, settings.clickhouse_password)
+        auth = clickhouse_http_auth()
         async with httpx.AsyncClient(timeout=self.timeout, auth=auth) as client:
             response = await client.post(
                 f"{settings.clickhouse_url}/",
@@ -69,9 +75,7 @@ class ClickHouseWriter:
             for row in payload_rows
         )
         query = f"INSERT INTO {table} FORMAT JSONEachRow"
-        auth = None
-        if settings.clickhouse_user or settings.clickhouse_password:
-            auth = (settings.clickhouse_user, settings.clickhouse_password)
+        auth = clickhouse_http_auth()
         with httpx.Client(timeout=self.timeout, auth=auth) as client:
             response = client.post(
                 f"{settings.clickhouse_url}/",

@@ -18,6 +18,12 @@ export function fmtPrice(n: number | null | undefined, digits = 3): string {
   return Number(n).toFixed(digits);
 }
 
+/** Approximate dollars paid, rounded for compact table display. */
+export function fmtDollars(n: number | null | undefined): string {
+  if (n == null) return "â€”";
+  return `$${Math.round(n).toLocaleString()}`;
+}
+
 /** ISO timestamp -> "5m ago" / "2d ago". Null-safe. */
 export function fmtAgo(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return "—";

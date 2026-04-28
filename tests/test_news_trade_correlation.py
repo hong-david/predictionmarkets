@@ -137,6 +137,35 @@ def test_ambiguous_news_needs_more_than_volume() -> None:
     assert "direction_aligned_with_news" not in result.reasons
 
 
+def test_ambiguous_factor_only_news_move_is_not_boosted() -> None:
+    event = _event("ambiguous")
+    event.relevance_score = 0.9
+    event.score_components = {
+        "lexical_relevance": 0.0,
+        "entity_relevance": 0.0,
+        "alias_relevance": 0.0,
+        "factor_relevance": 0.8,
+        "candidate_generation": {"candidate_reasons": ["category_factor"]},
+        "market_direction": {"label": "ambiguous", "confidence": 0.2},
+    }
+    trades = [
+        _trade("t1", _ts(11, 35), 0.50, 10, pk=1),
+        _trade("t2", _ts(11, 50), 0.51, 20, pk=2),
+        _trade("t3", _ts(11, 56), 0.60, 10, pk=3),
+    ]
+
+    result = score_news_trade_correlation(
+        article=_article(),
+        event=event,
+        trades=trades,
+    )
+
+    assert result.score < 4.0
+    assert result.status == "no_pre_news_signal"
+    assert "ambiguous_news_with_pre_news_move" not in result.reasons
+    assert "ambiguous_weak_news_link" in result.reasons
+
+
 def _session_factory():
     engine = create_engine(
         "sqlite://",

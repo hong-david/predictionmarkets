@@ -161,3 +161,25 @@ def test_orientation_keyword_survives_profile_tokenizer_stopwords() -> None:
     assert orientation_keywords_for_market_text(
         "Will Bitcoin trade below $80,000 by year end?"
     ) == ("below_threshold",)
+
+
+def test_macro_oil_direction_maps_to_market_threshold() -> None:
+    article = _article("Oil prices rise as US-Iran peace talks stall")
+    profile = _profile("will", "wti", "oil", "trade", "above", "95", category="macro")
+    relevance = hybrid_news_relevance(article, profile)
+
+    result = score_market_direction(article, profile, relevance.components)
+
+    assert result.label == "supports_yes"
+    assert result.underlier_direction == "bullish_underlier"
+
+
+def test_rate_cut_direction_supports_no_for_above_rate_market() -> None:
+    article = _article("Fed signals faster rate cuts after weak inflation data")
+    profile = _profile("will", "fed", "rate", "above", "4.00", category="macro")
+    relevance = hybrid_news_relevance(article, profile)
+
+    result = score_market_direction(article, profile, relevance.components)
+
+    assert result.label == "supports_no"
+    assert result.underlier_direction == "bearish_underlier"

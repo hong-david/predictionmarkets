@@ -40,6 +40,13 @@ from app.db.session import SessionLocal
 from app.services.anomaly_materializer import materialize_anomalies
 from app.services.kalshi_rest import KalshiRestClient
 from app.services.market_ingestor import chunked, ingest_markets_payload
+from app.services.pipeline_heartbeat import (
+    mark_pipeline_error,
+    mark_pipeline_start,
+    mark_pipeline_success,
+    new_run_id,
+    record_pipeline_heartbeat,
+)
 from scripts.hydrate_unknown_markets import hydrate_unknown_tickers
 
 
@@ -65,6 +72,13 @@ def run_cycle(
     that integration tests can drive without touching the network.
     """
     print(f"[{_utc_now()}] cycle start status={status!r} batch={batch_size} max={max_markets}", flush=True)
+    run_id = new_run_id("market-poller")
+    mark_pipeline_start(
+        "market_poller",
+        detail="Starting market sweep.",
+        run_id=run_id,
+        metadata={"status_filter": status, "max_markets": max_markets},
+    )
 
     client = KalshiRestClient()
     stream = client.iter_markets(status=status, max_markets=max_markets)
@@ -86,6 +100,14 @@ def run_cycle(
                 f"snapshots={result['snapshots_created']} "
                 f"running={totals}",
                 flush=True,
+            )
+            record_pipeline_heartbeat(
+                "market_poller",
+                detail=f"Processed {batches} batches; latest batch size {len(batch)}.",
+                run_id=run_id,
+                count=totals.get("updated_markets", 0)
+                + totals.get("inserted_markets", 0),
+                metadata={"batches": batches, **totals},
             )
 
         anomaly_result = materialize_anomalies(
@@ -111,6 +133,16 @@ def run_cycle(
         totals["missing_unknown"] = hydrate_result["missing"]
         totals["errored_unknown"] = hydrate_result["errored"]
 
+    mark_pipeline_success(
+        "market_poller",
+        detail=(
+            f"Completed {batches} batches; inserted {totals.get('inserted_markets', 0)}, "
+            f"updated {totals.get('updated_markets', 0)}, snapshots {totals.get('snapshots_created', 0)}."
+        ),
+        run_id=run_id,
+        count=totals.get("updated_markets", 0) + totals.get("inserted_markets", 0),
+        metadata={**totals, "batches": batches},
+    )
     return totals
 
 
@@ -180,15 +212,19 @@ def main() -> None:
 
     try:
         while True:
-            run_cycle(
-                status=status,
-                batch_size=args.batch,
-                max_markets=args.max,
-                anomaly_market_limit=args.anomaly_market_limit,
-                anomaly_lookback=args.anomaly_lookback,
-                hydrate_unknown_max=args.hydrate_unknown_max,
-                hydrate_unknown_sleep=args.hydrate_unknown_sleep,
-            )
+            try:
+                run_cycle(
+                    status=status,
+                    batch_size=args.batch,
+                    max_markets=args.max,
+                    anomaly_market_limit=args.anomaly_market_limit,
+                    anomaly_lookback=args.anomaly_lookback,
+                    hydrate_unknown_max=args.hydrate_unknown_max,
+                    hydrate_unknown_sleep=args.hydrate_unknown_sleep,
+                )
+            except Exception as exc:
+                mark_pipeline_error("market_poller", exc, detail="Market sweep failed.")
+                raise
             if args.once:
                 return
             time.sleep(args.interval)
