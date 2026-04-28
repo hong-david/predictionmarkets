@@ -71,6 +71,9 @@ def test_context_scores_liquidity_adjusted_followthrough() -> None:
     assert "large_size_vs_open_interest" in flagged["reasons"]
     assert "price_impact_persisted" in flagged["reasons"]
     assert flagged["features"]["size_vs_open_interest"] == 0.24
+    assert flagged["features"]["spread_at_trade"] == 0.08
+    assert flagged["features"]["directional_impact"] == 0.06
+    assert flagged["features"]["followthrough_5m"] == 0.11
 
 
 def test_peer_baseline_and_pre_news_timing_add_reasons() -> None:

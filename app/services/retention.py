@@ -87,7 +87,7 @@ EXCLUDED_PRIORS: frozenset[str] = frozenset({"very_low"})
 # --- Raw tape + order-book row persistence (second tier) -------------------
 #
 # In-scope markets (above) still get `markets` + quote snapshots and the
-# anomaly materializer. The **trades** and **book_events** tables are the
+# market-state alert materializer. The **trades** and **book_events** tables are the
 # main disk amplifiers. We only persist those rows when at least one
 # “surveillance-relevant” signal is true: high / medium_high prior, near
 # resolution, 24h volume or OI over a floor, or a materialized `anomalies`
@@ -176,7 +176,7 @@ def should_persist_raw_tape(
 ) -> bool:
     """Decide whether to write **trades** and **book_events** rows for this market.
 
-    Quote snapshots and anomaly materialization are unchanged — this only
+    Quote snapshots and market-state alert materialization are unchanged — this only
     gates the append-only tape and L2 tables.
 
     Callers that already know a materialized `anomalies` row exists should

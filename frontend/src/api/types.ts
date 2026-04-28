@@ -340,6 +340,88 @@ export interface PipelineHealth {
   components: PipelineHealthComponent[];
 }
 
+export interface NewsDiagnostics {
+  generated_at: string;
+  latest_at: string | null;
+  age_seconds: number | null;
+  provider_status: string | null;
+  fetch_error: string | null;
+  summary: {
+    articles_stored: number;
+    articles_seen_last_run: number;
+    articles_upserted_last_run: number;
+    article_clusters_seen_last_run: number;
+    news_events_linked: number;
+    news_events_linked_last_run: number;
+    positive_correlations: number;
+    profiles_refreshed_last_run: number;
+  };
+  source_counts: Record<string, unknown>;
+  rss_feed_details: Array<{
+    source?: string | null;
+    key?: string | null;
+    label?: string | null;
+    count?: number | null;
+    error?: string | null;
+    source_tier?: string | null;
+    authority_tier?: string | null;
+    topic_tags?: string[];
+  }>;
+  source_registry: {
+    total?: number;
+    enabled?: number;
+    available?: number;
+    rss_available?: number;
+    optional_unavailable?: Array<Record<string, unknown>>;
+    sources?: Array<Record<string, unknown>>;
+  };
+  heartbeats: Record<string, PipelineHealthComponent>;
+}
+
+export interface HistoricalSignalQaMarket {
+  market_id: string;
+  title: string;
+  status: string | null;
+  category: string | null;
+  prior: Prior | null;
+  close_time: string | null;
+  market_lifecycle: string;
+  trade_count: number;
+  metric_urgency_score: number;
+  qa_label: string;
+  flags: {
+    count_sample: number;
+    before_close_sample: number;
+    best_score: number;
+    best_severity: string | null;
+    best_ts: string | null;
+    best_reasons: string[];
+  };
+  pre_news: {
+    count_sample: number;
+    before_close_sample: number;
+    best_score: number;
+    best_article: string | null;
+    best_source: string | null;
+    first_seen_at: string | null;
+    leakage_window_seconds: number | null;
+  };
+  quote_book_anomalies: {
+    count: number;
+    high_count: number;
+    last_ts: string | null;
+  };
+}
+
+export interface HistoricalSignalQa {
+  generated_at: string;
+  limit: number;
+  min_flag_score: number;
+  category: string | null;
+  market_id: string | null;
+  markets: HistoricalSignalQaMarket[];
+}
+
 export interface SearchMarketResult {
   kind: "market";
   market_pk: number | null;

@@ -189,7 +189,7 @@ export function PriceChart({
       while (seenTimes.has(unix)) unix += 1;
       seenTimes.add(unix);
       const time = unix as UTCTimestamp;
-      linePoints.push({ time, value: t.yes_price });
+      linePoints.push({ time, value: clampProbability(t.yes_price) });
       volumePoints.push({
         time,
         value: t.count ?? 0,
@@ -309,6 +309,11 @@ function takerColor(t: TradePoint): string {
   if (t.taker_side === "yes") return "rgba(46, 204, 113, 0.55)";
   if (t.taker_side === "no") return "rgba(231, 76, 60, 0.55)";
   return "rgba(78, 161, 255, 0.45)";
+}
+
+function clampProbability(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
 }
 
 function dynamicProbabilityRange(values: number[]): { minValue: number; maxValue: number } {

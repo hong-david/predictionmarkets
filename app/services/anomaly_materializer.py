@@ -1,3 +1,5 @@
+"""Materialize market-state alert rows into the legacy `anomalies` table."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -5,14 +7,14 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.db.models import Anomaly, Market, MarketSnapshot
-from app.services.anomaly_engine import analyze_market
+from app.services.market_state_alert_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
 from app.services.market_metrics import bump_anomaly_metrics
 from app.services.pipeline_heartbeat import mark_pipeline_success
 
-# Do not store / refresh rows for weak scores — they dominated the market-detail
-# chart. ~3.0 ≈ a single "medium" rule firing with headroom, or a few stacked
-# low signals. Tune alongside `anomaly_engine` thresholds.
+# Do not store or refresh rows for weak scores; they dominated the market-detail
+# chart. ~3.0 is a single "medium" rule firing with headroom, or a few stacked
+# low signals. Tune alongside `market_state_alert_engine` thresholds.
 _MIN_SCORE_TO_PERSIST = 3.0
 _COMPACTION_COOLDOWN = timedelta(minutes=30)
 _SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -61,6 +63,7 @@ def materialize_market_anomaly(
     lookback: int = 40,
     latest_snapshot_id: int | None = None,
 ) -> dict[str, int]:
+    """Score and persist one market-state alert if the latest state warrants it."""
     snapshots = (
         db.query(MarketSnapshot)
         .filter(MarketSnapshot.market_pk == market.id)

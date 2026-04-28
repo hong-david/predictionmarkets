@@ -16,7 +16,9 @@ import { Link, useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
 import type {
   BreakdownEntry,
+  HistoricalSignalQaMarket,
   MarketScope,
+  NewsDiagnostics,
   NewsSignal,
   PipelineComponentStatus,
   PipelineHealth,
@@ -109,6 +111,20 @@ export default function OverviewPage() {
   const recentFlags = overview.data?.recent_anomalies;
   const suspiciousTrades = overview.data?.suspicious_trades;
   const newsSignals = overview.data?.news_signals;
+  const newsDiagnostics = useQuery({
+    queryKey: ["news-diagnostics"],
+    queryFn: () => api.newsDiagnostics(),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+    retry: 1,
+  });
+  const historicalQa = useQuery({
+    queryKey: ["historical-signal-qa"],
+    queryFn: () => api.historicalSignalQa({ limit: 6, min_flag_score: 5 }),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+    retry: 1,
+  });
 
   const updated = overview.dataUpdatedAt
     ? `updated ${fmtAgo(new Date(overview.dataUpdatedAt).toISOString())}`
@@ -443,6 +459,19 @@ export default function OverviewPage() {
         </div>
       </Card>
 
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <NewsDiagnosticsCard
+          data={newsDiagnostics.data}
+          loading={newsDiagnostics.isPending}
+          error={newsDiagnostics.error}
+        />
+        <HistoricalSignalQaCard
+          rows={historicalQa.data?.markets ?? []}
+          loading={historicalQa.isPending}
+          error={historicalQa.error}
+        />
+      </section>
+
       <Card>
         <CardHeader
           title="Top trade flags"
@@ -683,6 +712,153 @@ function pipelineSummaryText(data: PipelineHealth | undefined): string {
   if (s.stale > 0) return `${s.stale} stale`;
   if (s.empty > 0) return `${s.empty} empty`;
   return "Degraded";
+}
+
+function NewsDiagnosticsCard({
+  data,
+  loading,
+  error,
+}: {
+  data: NewsDiagnostics | undefined;
+  loading?: boolean;
+  error?: unknown;
+}) {
+  const err = error instanceof Error ? error.message : String(error ?? "");
+  const topFeeds = (data?.rss_feed_details ?? []).slice(0, 6);
+  return (
+    <Card>
+      <CardHeader
+        title="News ingest diagnostics"
+        subtitle="What the last global news sweep saw before relevance filtering and market linking."
+        right={data?.provider_status ?? undefined}
+      />
+      <CardBody>
+        {loading && !data ? (
+          <Skeleton className="h-40" />
+        ) : error ? (
+          <EmptyState>
+            <div className="text-left">
+              <div className="font-medium text-foreground">Diagnostics unavailable</div>
+              <div className="mt-1 text-xs break-words">{err}</div>
+            </div>
+          </EmptyState>
+        ) : !data ? (
+          <EmptyState>No news ingest heartbeat yet.</EmptyState>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <MiniMetric label="stored" value={fmtInt(data.summary.articles_stored)} />
+              <MiniMetric label="seen run" value={fmtInt(data.summary.articles_seen_last_run)} />
+              <MiniMetric label="linked" value={fmtInt(data.summary.news_events_linked)} />
+              <MiniMetric label="correlated" value={fmtInt(data.summary.positive_correlations)} />
+            </div>
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+              <span>latest {fmtAgo(data.latest_at)}</span>
+              <span>{fmtInt(data.source_registry.rss_available)} RSS feeds available</span>
+              {data.source_counts.gdelt != null ? (
+                <span>GDELT {fmtInt(Number(data.source_counts.gdelt))}</span>
+              ) : null}
+              {data.source_counts.congress_api_disabled ? (
+                <span>Congress API disabled</span>
+              ) : null}
+            </div>
+            {data.fetch_error ? (
+              <div className="rounded-md border border-[hsl(var(--severity-medium))]/30 bg-secondary/40 px-2 py-1.5 text-xs text-muted-foreground">
+                {data.fetch_error}
+              </div>
+            ) : null}
+            <div className="space-y-1">
+              <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                Top feeds last run
+              </div>
+              {!topFeeds.length ? (
+                <div className="text-xs text-muted-foreground">No per-feed counts recorded yet.</div>
+              ) : (
+                <ul className="divide-y divide-border rounded-md border border-border">
+                  {topFeeds.map((feed) => (
+                    <li key={feed.source ?? feed.label ?? "feed"} className="flex items-center justify-between gap-3 px-2 py-1.5 text-xs">
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">
+                          {feed.label ?? feed.source ?? "Feed"}
+                        </div>
+                        <div className="truncate text-[11px] text-muted-foreground">
+                          {feed.authority_tier ?? feed.source_tier ?? "source"}
+                          {feed.error ? ` · ${feed.error}` : ""}
+                        </div>
+                      </div>
+                      <div className="num text-muted-foreground">{fmtInt(feed.count)}</div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function HistoricalSignalQaCard({
+  rows,
+  loading,
+  error,
+}: {
+  rows: HistoricalSignalQaMarket[];
+  loading?: boolean;
+  error?: unknown;
+}) {
+  const err = error instanceof Error ? error.message : String(error ?? "");
+  return (
+    <Card>
+      <CardHeader
+        title="Historical signal QA"
+        subtitle="Closed or aged-out markets kept for post-mortem review of trade flags, pre-news timing, and quote/book alerts."
+      />
+      <CardBody>
+        {loading ? (
+          <Skeleton className="h-40" />
+        ) : error ? (
+          <EmptyState>
+            <div className="text-left">
+              <div className="font-medium text-foreground">Historical QA unavailable</div>
+              <div className="mt-1 text-xs break-words">{err}</div>
+            </div>
+          </EmptyState>
+        ) : !rows.length ? (
+          <EmptyState>No historical signal sample yet.</EmptyState>
+        ) : (
+          <ul className="divide-y divide-border">
+            {rows.map((row) => (
+              <li key={row.market_id} className="py-2.5 first:pt-0 last:pb-0">
+                <Link to={`/markets/${encodeURIComponent(row.market_id)}`} className="block hover:text-primary">
+                  <div className="line-clamp-1 text-sm font-medium">{row.title}</div>
+                </Link>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                  <span>{row.qa_label.replace(/_/g, " ")}</span>
+                  <span>{fmtInt(row.trade_count)} trades</span>
+                  <span>best flag {row.flags.best_score.toFixed(1)}</span>
+                  {row.pre_news.best_score > 0 ? (
+                    <span>pre-news {row.pre_news.best_score.toFixed(1)}</span>
+                  ) : null}
+                  <span>{fmtAgo(row.close_time)}</span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardBody>
+    </Card>
+  );
+}
+
+function MiniMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-border bg-secondary/30 px-2 py-1.5">
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
+      <div className="mt-0.5 num text-sm font-semibold">{value}</div>
+    </div>
+  );
 }
 
 function NewsSignalRow({ signal }: { signal: NewsSignal }) {

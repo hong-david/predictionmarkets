@@ -1,6 +1,14 @@
 from datetime import datetime, timezone
 
-from app.services.news_sources import dedupe_articles_by_url, parse_feed_articles
+from app.services.news_source_registry import (
+    apply_source_quality,
+    default_rss_feed_urls,
+)
+from app.services.news_sources import (
+    dedupe_articles_by_url,
+    fetch_rss_articles,
+    parse_feed_articles,
+)
 from app.services.news_correlation import NormalizedArticle
 
 
@@ -82,3 +90,53 @@ def test_dedupe_articles_by_url_keeps_first_copy():
     second = NormalizedArticle(canonical_url="https://example.com/b", title="Second")
 
     assert dedupe_articles_by_url([first, duplicate, second]) == [first, second]
+
+
+def test_default_source_registry_includes_official_feeds():
+    feeds = default_rss_feed_urls()
+
+    assert any("federalregister.gov/documents/search.rss" in feed for feed in feeds)
+    assert any("browse-edgar" in feed and "output=atom" in feed for feed in feeds)
+    assert any("medwatch/rss.xml" in feed.lower() for feed in feeds)
+
+
+def test_fetch_rss_articles_uses_registry_source_tier(monkeypatch):
+    captured: list[str | None] = []
+
+    def fake_fetch(_feed_url, **kwargs):
+        captured.append(kwargs.get("source_tier"))
+        return []
+
+    monkeypatch.setattr("app.services.news_sources.fetch_rss_feed_articles", fake_fetch)
+
+    result = fetch_rss_articles(
+        ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=100&output=atom",),
+        since=None,
+        until=None,
+        limit_per_feed=10,
+    )
+
+    assert captured == ["official"]
+    assert result[0].source_key == "sec_edgar_current_8k"
+    assert result[0].authority_tier == "official"
+
+
+def test_source_quality_boosts_only_plausibly_relevant_official_articles():
+    official = NormalizedArticle(
+        canonical_url="https://www.sec.gov/news/press-release/example",
+        title="SEC announces crypto task force",
+        source_tier="official",
+    )
+    broad = NormalizedArticle(
+        canonical_url="https://rss.nytimes.com/example",
+        title="Broad headline",
+        source_tier="broad",
+    )
+
+    official_score, official_component = apply_source_quality(0.32, official)
+    broad_score, broad_component = apply_source_quality(0.32, broad)
+
+    assert official_score > 0.35
+    assert official_component["applied"] is True
+    assert broad_score == 0.32
+    assert broad_component["applied"] is False

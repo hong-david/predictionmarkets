@@ -32,6 +32,7 @@ Performance notes:
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -60,10 +61,17 @@ from app.db.models import (
     Trade,
     TradeFlag,
 )
+from app.services.historical_signal_qa import historical_signal_report
 from app.services.news_correlation import market_news_search_query, profile_for_market
 from app.services.news_direction import components_with_market_direction
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
 from app.services.news_relevance import hybrid_news_relevance
+from app.services.news_source_registry import source_registry_diagnostics
+from app.services.market_lifecycle import (
+    market_lifecycle as _market_lifecycle,
+    market_scope_filters as _market_scope_filters,
+    normalize_market_scope as _normalize_market_scope,
+)
 from app.services.search_index import dashboard_search
 from app.services.storage_health import storage_health_detail, storage_health_snapshot
 from app.services.surveillance_scores import (
@@ -89,21 +97,12 @@ T = TypeVar("T")
 _DASHBOARD_CACHE_TTL_SEC = 30.0
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
-_ACTIVE_MARKET_STATUSES = frozenset({"open", "active"})
 _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
 _PIPELINE_MARKET_POLLER_STALE_AFTER = timedelta(hours=6)
 _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
-
-
-def _normalize_market_scope(market_scope: str | None) -> str:
-    scope = (market_scope or "active").lower()
-    if scope not in {"active", "historical", "all"}:
-        return "active"
-    return scope
-
 
 def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
     now = time.monotonic()
@@ -187,6 +186,19 @@ def _trade_notional_dollars(
         return None
 
 
+def _probability_float(value: object) -> float | None:
+    """Finite probability-like value clamped to Kalshi's [0, 1] range."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return min(1.0, max(0.0, out))
+
+
 def _reason_codes_for_market_pks(
     db: Session, market_pks: list[int]
 ) -> dict[int, list[str]]:
@@ -242,7 +254,7 @@ def _serialize_market_row(
         "is_active": lifecycle == "active",
         "trade_count": int(trade_count or 0),
         "anomaly_count": ac,
-        "last_price": float(last_price) if last_price is not None else None,
+        "last_price": _probability_float(last_price),
         "volume_24h": float(volume_24h) if volume_24h is not None else None,
         "trade_dollar_volume": float(trade_dollar_volume)
         if trade_dollar_volume is not None
@@ -310,13 +322,13 @@ def _latest_snapshot_values_for_market_pks(
 
     def _display_price(row) -> float | None:
         if row.last_price is not None:
-            return float(row.last_price)
+            return _probability_float(row.last_price)
         if row.yes_bid is not None and row.yes_ask is not None:
-            return (float(row.yes_bid) + float(row.yes_ask)) / 2.0
+            return _probability_float((float(row.yes_bid) + float(row.yes_ask)) / 2.0)
         if row.yes_bid is not None:
-            return float(row.yes_bid)
+            return _probability_float(row.yes_bid)
         if row.yes_ask is not None:
-            return float(row.yes_ask)
+            return _probability_float(row.yes_ask)
         return None
 
     values = {
@@ -352,7 +364,9 @@ def _latest_snapshot_values_for_market_pks(
                 int(row.market_pk), {"last_price": None, "volume_24h": None}
             )
             if current["last_price"] is None and row.last_price_cents is not None:
-                current["last_price"] = float(row.last_price_cents) / 100.0
+                current["last_price"] = _probability_float(
+                    float(row.last_price_cents) / 100.0
+                )
             if current["volume_24h"] is None and row.volume_24h_contracts is not None:
                 current["volume_24h"] = float(row.volume_24h_contracts)
     price_missing = [
@@ -385,7 +399,7 @@ def _latest_snapshot_values_for_market_pks(
                 int(row.market_pk), {"last_price": None, "volume_24h": None}
             )
             if current["last_price"] is None:
-                current["last_price"] = float(row.yes_price)
+                current["last_price"] = _probability_float(row.yes_price)
     return values
 
 
@@ -393,15 +407,9 @@ def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
     return {
         "ts": snapshot.ts.isoformat() if snapshot.ts else None,
         "market_pk": snapshot.market_pk,
-        "yes_bid": float(snapshot.yes_bid_dollars)
-        if snapshot.yes_bid_dollars is not None
-        else None,
-        "yes_ask": float(snapshot.yes_ask_dollars)
-        if snapshot.yes_ask_dollars is not None
-        else None,
-        "last_price": float(snapshot.last_price_dollars)
-        if snapshot.last_price_dollars is not None
-        else None,
+        "yes_bid": _probability_float(snapshot.yes_bid_dollars),
+        "yes_ask": _probability_float(snapshot.yes_ask_dollars),
+        "last_price": _probability_float(snapshot.last_price_dollars),
         "volume_24h": float(snapshot.volume_24h_fp)
         if snapshot.volume_24h_fp is not None
         else None,
@@ -433,9 +441,7 @@ def _peer_baseline_rows_for_market(
             "category": m.category,
             "subcategory": m.subcategory,
             "ts": t.ts.isoformat() if t.ts else None,
-            "yes_price": float(t.yes_price_dollars)
-            if t.yes_price_dollars is not None
-            else None,
+            "yes_price": _probability_float(t.yes_price_dollars),
             "count": float(t.count_fp) if t.count_fp is not None else None,
         }
         for t, m in reversed(rows)
@@ -853,11 +859,11 @@ def _pipeline_health_payload(db: Session) -> dict:
         return _component_from_heartbeat(
             heartbeats.get("quote_book_anomalies"),
             key="quote_book_anomalies",
-            label="Quote/book anomalies",
-            description="Quote and order-book anomaly materialization.",
+            label="Quote/book alerts",
+            description="Quote and order-book market-state alert materialization.",
             db_latest_at=latest_at,
             db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} stored quote/book anomaly rows.",
+            db_detail=f"{int(count or 0):,} stored quote/book alert rows.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
         )
@@ -979,8 +985,8 @@ def _pipeline_health_payload(db: Session) -> dict:
         ),
         (
             "quote_book_anomalies",
-            "Quote/book anomalies",
-            "Quote and order-book anomaly materialization.",
+            "Quote/book alerts",
+            "Quote and order-book market-state alert materialization.",
             quote_book_anomalies_component,
         ),
         (
@@ -1072,43 +1078,6 @@ def _hydrated_market_filters() -> list:
         Market.status.notin_(("unknown", "out_of_scope")),
         Market.title != Market.market_id,
     ]
-
-
-def _market_scope_filters(market_scope: str | None) -> list:
-    scope = _normalize_market_scope(market_scope)
-    status = func.lower(func.coalesce(Market.status, ""))
-    active = and_(
-        status.in_(tuple(_ACTIVE_MARKET_STATUSES)),
-        or_(Market.close_time.is_(None), Market.close_time > func.now()),
-    )
-    if scope == "active":
-        return [active]
-    if scope == "historical":
-        return [or_(status.notin_(tuple(_ACTIVE_MARKET_STATUSES)), Market.close_time <= func.now())]
-    return []
-
-
-def _market_lifecycle(market: Market, *, now: datetime | None = None) -> str:
-    now = now or datetime.now(timezone.utc)
-    status = (market.status or "").lower()
-    close_time = market.close_time
-    if close_time is not None:
-        close_time = (
-            close_time.replace(tzinfo=timezone.utc)
-            if close_time.tzinfo is None
-            else close_time.astimezone(timezone.utc)
-        )
-    if status in _ACTIVE_MARKET_STATUSES and (
-        close_time is None or close_time > now
-    ):
-        return "active"
-    if status in {"unknown", "out_of_scope"}:
-        return status
-    if close_time is not None and close_time <= now:
-        return "historical"
-    if status and status not in _ACTIVE_MARKET_STATUSES:
-        return "historical"
-    return "other"
 
 
 def _news_link_market_filters() -> list:
@@ -1297,6 +1266,149 @@ def get_pipeline_health(db: Session = Depends(get_db)) -> dict:
     while others are jobs, materializers, or compact DB projections.
     """
     return _pipeline_health_payload(db)
+
+
+def _news_diagnostics_payload(db: Session) -> dict:
+    now = _utc_now()
+    heartbeats = _pipeline_heartbeat_map(db)
+    ingest = heartbeats.get("news_ingest")
+    links = heartbeats.get("news_links")
+    correlations = heartbeats.get("news_trade_correlations")
+    metadata = ingest.metadata_json if ingest is not None and ingest.metadata_json else {}
+    source_counts = metadata.get("source_counts") if isinstance(metadata, dict) else None
+    if not isinstance(source_counts, dict):
+        source_counts = {}
+    registry = metadata.get("source_registry") if isinstance(metadata, dict) else None
+    if not isinstance(registry, dict):
+        registry = source_registry_diagnostics()
+
+    article_count, latest_seen, latest_published = db.query(
+        func.count(NewsArticle.id),
+        func.max(NewsArticle.first_seen_at),
+        func.max(NewsArticle.published_at),
+    ).one()
+    link_count, correlated_count, latest_link = (
+        db.query(
+            func.count(NewsEvent.id),
+            func.sum(case((NewsEvent.pre_news_trade_score > 0, 1), else_=0)),
+            func.max(NewsEvent.created_at),
+        ).one()
+    )
+
+    rss_feed_counts = source_counts.get("rss_feed_counts") or {}
+    rss_feed_details = source_counts.get("rss_feed_details") or []
+    if not rss_feed_details and isinstance(rss_feed_counts, dict):
+        rss_feed_details = [
+            {"source": source, "label": source, "count": count, "error": None}
+            for source, count in rss_feed_counts.items()
+        ]
+    if isinstance(rss_feed_details, list):
+        rss_feed_details = sorted(
+            [d for d in rss_feed_details if isinstance(d, dict)],
+            key=lambda d: int(d.get("count") or 0),
+            reverse=True,
+        )
+    else:
+        rss_feed_details = []
+
+    latest_at = _latest_datetime(latest_seen, latest_published, latest_link)
+    return {
+        "generated_at": now.isoformat(),
+        "latest_at": latest_at.isoformat() if latest_at else None,
+        "age_seconds": _age_seconds(latest_at, now=now),
+        "provider_status": metadata.get("provider_status")
+        if isinstance(metadata, dict)
+        else None,
+        "fetch_error": metadata.get("fetch_error") if isinstance(metadata, dict) else None,
+        "summary": {
+            "articles_stored": int(article_count or 0),
+            "articles_seen_last_run": int(metadata.get("articles_seen") or 0)
+            if isinstance(metadata, dict)
+            else 0,
+            "articles_upserted_last_run": int(metadata.get("articles_upserted") or 0)
+            if isinstance(metadata, dict)
+            else 0,
+            "article_clusters_seen_last_run": int(
+                metadata.get("article_clusters_seen") or 0
+            )
+            if isinstance(metadata, dict)
+            else 0,
+            "news_events_linked": int(link_count or 0),
+            "news_events_linked_last_run": int(
+                metadata.get("news_events_linked") or 0
+            )
+            if isinstance(metadata, dict)
+            else 0,
+            "positive_correlations": int(correlated_count or 0),
+            "profiles_refreshed_last_run": int(
+                metadata.get("profiles_refreshed") or 0
+            )
+            if isinstance(metadata, dict)
+            else 0,
+        },
+        "source_counts": source_counts,
+        "rss_feed_details": rss_feed_details,
+        "source_registry": registry,
+        "heartbeats": {
+            "news_ingest": _component_from_heartbeat(
+                ingest,
+                key="news_ingest",
+                label="News ingest",
+                description="Global article collection.",
+                db_latest_at=latest_at,
+                db_count=int(article_count or 0),
+                db_detail=f"{int(article_count or 0):,} stored articles.",
+                stale_after=_PIPELINE_DAILY_STALE_AFTER,
+                now=now,
+            ),
+            "news_links": _component_from_heartbeat(
+                links,
+                key="news_links",
+                label="News links",
+                description="Article-to-market relevance links.",
+                db_latest_at=latest_link,
+                db_count=int(link_count or 0),
+                db_detail=f"{int(link_count or 0):,} linked news events.",
+                stale_after=_PIPELINE_DAILY_STALE_AFTER,
+                now=now,
+            ),
+            "news_trade_correlations": _component_from_heartbeat(
+                correlations,
+                key="news_trade_correlations",
+                label="News/trade correlations",
+                description="Pre-news trade alignment materializer.",
+                db_latest_at=latest_link,
+                db_count=int(correlated_count or 0),
+                db_detail=f"{int(correlated_count or 0):,} positive correlations.",
+                stale_after=_PIPELINE_DAILY_STALE_AFTER,
+                now=now,
+            ),
+        },
+    }
+
+
+@router.get("/news-diagnostics")
+def get_news_diagnostics(db: Session = Depends(get_db)) -> dict:
+    """Latest news ingest diagnostics from DB counts and heartbeat metadata."""
+    return _news_diagnostics_payload(db)
+
+
+@router.get("/historical-signal-qa")
+def get_historical_signal_qa(
+    limit: int = Query(default=8, ge=1, le=50),
+    min_flag_score: float = Query(default=5.0, ge=0.0, le=10.0),
+    category: str | None = Query(default=None),
+    market_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Historical post-mortem sample for checking whether flags look useful."""
+    return historical_signal_report(
+        db,
+        limit=limit,
+        min_flag_score=min_flag_score,
+        category=category,
+        market_id=market_id,
+    )
 
 
 @router.get("/storage-health")
@@ -2500,15 +2612,11 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
         "latest_snapshot": (
             {
                 "ts": latest_snap.ts.isoformat() if latest_snap.ts else None,
-                "last_price_dollars": float(latest_snap.last_price_dollars)
-                if latest_snap.last_price_dollars is not None
-                else None,
-                "yes_bid_dollars": float(latest_snap.yes_bid_dollars)
-                if latest_snap.yes_bid_dollars is not None
-                else None,
-                "yes_ask_dollars": float(latest_snap.yes_ask_dollars)
-                if latest_snap.yes_ask_dollars is not None
-                else None,
+                "last_price_dollars": _probability_float(
+                    latest_snap.last_price_dollars
+                ),
+                "yes_bid_dollars": _probability_float(latest_snap.yes_bid_dollars),
+                "yes_ask_dollars": _probability_float(latest_snap.yes_ask_dollars),
                 "volume_24h_fp": float(latest_snap.volume_24h_fp)
                 if latest_snap.volume_24h_fp is not None
                 else None,
@@ -2560,12 +2668,8 @@ def get_market_series(
     trade_payloads = [
         {
             "ts": t.ts.isoformat() if t.ts else None,
-            "yes_price": float(t.yes_price_dollars)
-            if t.yes_price_dollars is not None
-            else None,
-            "no_price": float(t.no_price_dollars)
-            if t.no_price_dollars is not None
-            else None,
+            "yes_price": _probability_float(t.yes_price_dollars),
+            "no_price": _probability_float(t.no_price_dollars),
             "count": float(t.count_fp) if t.count_fp is not None else None,
             "trade_dollar_amount": _trade_notional_dollars(
                 yes_price=t.yes_price_dollars,

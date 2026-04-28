@@ -3,8 +3,8 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
 from app.db.models import Anomaly, Market, MarketSnapshot
-from app.services.anomaly_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
+from app.services.market_state_alert_engine import analyze_market
 
 router = APIRouter(tags=["anomalies (legacy on-the-fly)"], deprecated=True)
 

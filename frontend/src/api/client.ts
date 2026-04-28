@@ -1,11 +1,13 @@
 import type {
   Breakdown,
   EventGroup,
+  HistoricalSignalQa,
   MarketAnomalies,
   MarketDetail,
   MarketNews,
   MarketSeries,
   MarketsList,
+  NewsDiagnostics,
   NewsSignalsList,
   PipelineHealth,
   DashboardOverview,
@@ -117,6 +119,13 @@ export const api = {
       limit,
       min_score: minScore,
     }),
+  newsDiagnostics: () => get<NewsDiagnostics>("/api/dashboard/news-diagnostics"),
+  historicalSignalQa: (params?: {
+    limit?: number;
+    min_flag_score?: number;
+    category?: string;
+    market_id?: string;
+  }) => get<HistoricalSignalQa>("/api/dashboard/historical-signal-qa", params),
   pipelineHealth: () => get<PipelineHealth>("/api/dashboard/pipeline-health"),
   search: (q: string, scope: "all" | "markets" | "news" = "all", limit = 10) =>
     get<SearchResponse>("/api/dashboard/search", { q, scope, limit }),

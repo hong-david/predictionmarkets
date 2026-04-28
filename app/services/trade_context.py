@@ -8,11 +8,20 @@ kind of market?"
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Any
+
+from app.services.features.liquidity import safe_ratio
+from app.services.features.quotes import (
+    finite_float as _f,
+    parse_iso_datetime as _parse_ts,
+    quote_at_or_before,
+    row_quote_spread,
+    row_reference_price,
+)
+from app.services.features.rolling import percentile
 
 
 @dataclass(frozen=True)
@@ -34,51 +43,10 @@ class PeerBaseline:
     sample_size: int
 
 
-def _f(x: Any) -> float | None:
-    if x is None:
-        return None
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(v) or math.isinf(v):
-        return None
-    return v
-
-
-def _parse_ts(raw: Any) -> datetime | None:
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        out = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if out.tzinfo is None:
-        return out.replace(tzinfo=timezone.utc)
-    return out
-
-
 def _aware(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
-
-
-def _percentile(vals: list[float], pct: float) -> float:
-    if not vals:
-        return 0.0
-    s = sorted(vals)
-    if len(s) == 1:
-        return s[0]
-    pos = (len(s) - 1) * pct
-    lo = int(math.floor(pos))
-    hi = int(math.ceil(pos))
-    if lo == hi:
-        return s[lo]
-    return s[lo] + (s[hi] - s[lo]) * (pos - lo)
 
 
 def _market_key(row: dict[str, Any]) -> tuple[str, str]:
@@ -133,47 +101,12 @@ def build_peer_baselines(
         if len(vals) < min_points:
             continue
         out[key] = PeerBaseline(
-            count_p95=_percentile(vals, 0.95),
-            count_p99=_percentile(vals, 0.99),
-            abs_price_delta_p95=_percentile(deltas.get(key, []), 0.95),
+            count_p95=percentile(vals, 0.95),
+            count_p99=percentile(vals, 0.99),
+            abs_price_delta_p95=percentile(deltas.get(key, []), 0.95),
             sample_size=len(vals),
         )
     return out
-
-
-def _quote_ref(row: dict[str, Any]) -> float | None:
-    last = _f(row.get("last_price"))
-    if last is not None and last > 0:
-        return last
-    bid = _f(row.get("yes_bid"))
-    ask = _f(row.get("yes_ask"))
-    if bid is not None and ask is not None:
-        return (bid + ask) / 2.0
-    return None
-
-
-def _quote_spread(row: dict[str, Any]) -> float | None:
-    bid = _f(row.get("yes_bid"))
-    ask = _f(row.get("yes_ask"))
-    if bid is None or ask is None:
-        return None
-    return max(0.0, ask - bid)
-
-
-def _quote_at_or_before(
-    snapshots: list[dict[str, Any]],
-    ts: datetime,
-) -> dict[str, Any] | None:
-    best: dict[str, Any] | None = None
-    for row in snapshots:
-        rts = _parse_ts(row.get("ts"))
-        if rts is None:
-            continue
-        if rts <= ts:
-            best = row
-        else:
-            break
-    return best
 
 
 def _first_trade_price_at_or_after(
@@ -242,7 +175,7 @@ def _sibling_abs_moves(
         after: float | None = None
         for row in rows:
             ts = _parse_ts(row.get("ts"))
-            ref = _quote_ref(row)
+            ref = row_reference_price(row)
             if ts is None or ref is None:
                 continue
             if ts <= trade_ts:
@@ -289,9 +222,9 @@ def explain_trades_with_context(
             if prev_price is not None:
                 break
 
-        q = _quote_at_or_before(snapshots, ts)
+        q = quote_at_or_before(snapshots, ts)
         if prev_price is None and q is not None:
-            prev_price = _quote_ref(q)
+            prev_price = row_reference_price(q)
         if prev_price is None:
             prev_price = price
 
@@ -305,17 +238,9 @@ def explain_trades_with_context(
 
         open_interest = _f(q.get("open_interest")) if q else None
         volume_24h = _f(q.get("volume_24h")) if q else None
-        spread = _quote_spread(q) if q else None
-        size_vs_oi = (
-            count / open_interest
-            if count is not None and open_interest is not None and open_interest > 0
-            else None
-        )
-        size_vs_24h = (
-            count / volume_24h
-            if count is not None and volume_24h is not None and volume_24h > 0
-            else None
-        )
+        spread = row_quote_spread(q) if q else None
+        size_vs_oi = safe_ratio(count, open_interest)
+        size_vs_24h = safe_ratio(count, volume_24h)
         impact_cents_per_100 = (
             (abs_delta * 100.0) * 100.0 / count
             if count is not None and count > 0

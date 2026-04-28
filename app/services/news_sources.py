@@ -18,62 +18,13 @@ import httpx
 
 from app.services.news_correlation import NormalizedArticle
 from app.services.news_gdelt import tokenize_for_gdelt
-
-
-DEFAULT_RSS_FEEDS: tuple[str, ...] = (
-    # Public agencies / official releases.
-    "https://www.federalreserve.gov/feeds/press_all.xml",
-    "https://www.sec.gov/news/pressreleases.rss",
-    "https://www.cftc.gov/RSS/RSSGP/rssgp.xml",
-    "https://www.cftc.gov/RSS/RSSENF/rssenf.xml",
-    "https://www.ftc.gov/feeds/press-release.xml",
-    "https://www.ftc.gov/feeds/press-release-competition.xml",
-    "https://www.bls.gov/feed/empsit.rss",
-    "https://www.bls.gov/feed/cpi.rss",
-    "https://www.bls.gov/feed/bls_latest.rss",
-    "https://www.eia.gov/rss/todayinenergy.xml",
-    # Crypto / markets.
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://decrypt.co/feed",
-    # Broad news.
-    "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-    "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml",
-    "https://www.theguardian.com/world/rss",
-    "https://www.theguardian.com/us-news/rss",
-    "https://www.theguardian.com/business/rss",
-    "https://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://feeds.bbci.co.uk/news/politics/rss.xml",
-    "https://www.npr.org/rss/rss.php?id=1001",
-    "https://www.npr.org/rss/rss.php?id=1006",
-    "https://rss.politico.com/politics-news.xml",
-    # Markets / business wires with useful headlines.
-    "https://finance.yahoo.com/news/rssindex",
-    "https://www.marketwatch.com/rss/topstories",
-    "https://feeds.content.dowjones.io/public/rss/mw_topstories",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "https://www.cnbc.com/id/10000664/device/rss/rss.html",
-    "https://www.cnbc.com/id/10000113/device/rss/rss.html",
-    # Weather / public agencies.
-    "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
-    "https://www.noaa.gov/rss.xml",
-    "https://www.nhc.noaa.gov/index-at.xml",
-    "https://www.nhc.noaa.gov/index-ep.xml",
-    # Sports/injury/newswire style feeds. Individual feed failures are isolated.
-    "https://www.espn.com/espn/rss/news",
-    "https://www.espn.com/espn/rss/nfl/news",
-    "https://www.espn.com/espn/rss/nba/news",
-    "https://www.espn.com/espn/rss/mlb/news",
-    "https://www.espn.com/espn/rss/nhl/news",
-    "https://www.espn.com/espn/rss/soccer/news",
-    "https://www.theguardian.com/sport/rss",
-    "https://www.cbssports.com/rss/headlines/",
-    "https://www.mlb.com/feeds/news/rss.xml",
+from app.services.news_source_registry import (
+    default_rss_feed_urls,
+    source_for_url,
 )
+
+
+DEFAULT_RSS_FEEDS: tuple[str, ...] = default_rss_feed_urls()
 
 _RSS_NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -90,6 +41,11 @@ class SourceFetchResult:
     source_name: str
     articles: tuple[NormalizedArticle, ...]
     error: str | None = None
+    source_key: str | None = None
+    source_label: str | None = None
+    source_tier: str | None = None
+    authority_tier: str | None = None
+    topic_tags: tuple[str, ...] = ()
 
 
 def _clean_text(value: str | None) -> str | None:
@@ -269,12 +225,14 @@ def fetch_rss_articles(
     until: datetime | None,
     limit_per_feed: int,
     timeout: float = 10.0,
-    source_tier: str = "rss",
+    source_tier: str | None = None,
 ) -> list[SourceFetchResult]:
     """Fetch multiple RSS/Atom feeds while isolating per-feed failures."""
 
     results: list[SourceFetchResult] = []
     for feed_url in feed_urls:
+        source = source_for_url(feed_url)
+        tier = source_tier or (source.source_tier if source else "rss")
         try:
             articles = fetch_rss_feed_articles(
                 feed_url,
@@ -282,18 +240,99 @@ def fetch_rss_articles(
                 until=until,
                 limit=limit_per_feed,
                 timeout=timeout,
-                source_tier=source_tier,
+                source_tier=tier,
             )
-            results.append(SourceFetchResult(feed_url, tuple(articles)))
+            results.append(
+                SourceFetchResult(
+                    feed_url,
+                    tuple(articles),
+                    source_key=source.key if source else None,
+                    source_label=source.label if source else None,
+                    source_tier=tier,
+                    authority_tier=source.authority_tier if source else tier,
+                    topic_tags=source.topic_tags if source else (),
+                )
+            )
         except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
             results.append(
                 SourceFetchResult(
                     feed_url,
                     (),
                     error=f"{type(exc).__name__}: {exc}",
+                    source_key=source.key if source else None,
+                    source_label=source.label if source else None,
+                    source_tier=tier,
+                    authority_tier=source.authority_tier if source else tier,
+                    topic_tags=source.topic_tags if source else (),
                 )
             )
     return results
+
+
+def fetch_congress_articles(
+    *,
+    api_key: str,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    timeout: float = 10.0,
+) -> list[NormalizedArticle]:
+    """Fetch recent Congress.gov bill updates when an API key is configured."""
+
+    params = {
+        "api_key": api_key,
+        "format": "json",
+        "limit": max(1, min(int(limit), 250)),
+        "sort": "updateDate+desc",
+    }
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        response = client.get(
+            "https://api.congress.gov/v3/bill",
+            params=params,
+            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+    bills = data.get("bills") if isinstance(data, dict) else None
+    if not isinstance(bills, list):
+        return []
+
+    articles: list[NormalizedArticle] = []
+    for bill in bills:
+        if not isinstance(bill, dict):
+            continue
+        title = _clean_text(str(bill.get("title") or "").strip())
+        if not title:
+            bill_type = str(bill.get("type") or "bill").strip()
+            bill_number = str(bill.get("number") or "").strip()
+            title = f"{bill_type} {bill_number}".strip()
+        url = str(bill.get("url") or "").strip()
+        if not title or not url:
+            continue
+        latest_action = bill.get("latestAction")
+        summary = None
+        action_date = None
+        if isinstance(latest_action, dict):
+            summary = _clean_text(str(latest_action.get("text") or ""))
+            action_date = _parse_datetime(str(latest_action.get("actionDate") or ""))
+        published = (
+            _parse_datetime(str(bill.get("updateDateIncludingText") or ""))
+            or _parse_datetime(str(bill.get("updateDate") or ""))
+            or action_date
+            or _parse_datetime(str(bill.get("introducedDate") or ""))
+        )
+        article = NormalizedArticle(
+            canonical_url=url,
+            title=title,
+            published_at=published,
+            first_seen_at=published,
+            summary=summary,
+            keywords=_article_keywords(title, summary),
+            source_tier="official",
+        )
+        if _within_window(article, since=since, until=until):
+            articles.append(article)
+    return articles
 
 
 def dedupe_articles_by_url(articles: list[NormalizedArticle]) -> list[NormalizedArticle]:

@@ -1,11 +1,12 @@
-"""Unit tests for rolling-baseline logic in `anomaly_engine` (no DB)."""
+"""Unit tests for market-state alert scoring (no DB)."""
 
 from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
 
-from app.services.anomaly_engine import analyze_market
+from app.services.anomaly_engine import analyze_market as compat_analyze_market
+from app.services.market_state_alert_engine import analyze_market
 
 
 def _snap(
@@ -36,6 +37,21 @@ def test_rolling_wide_spread_on_latest() -> None:
     out = analyze_market(market, snaps, book_activity=None)
     assert out["score"] > 0
     assert any("wide spread" in r for r in out["reasons"])
+    assert compat_analyze_market is analyze_market
+
+
+def test_static_price_move_and_volume_delta_are_stable() -> None:
+    latest = _snap(bid="0.67", ask="0.73", last="0.70", vol="160")
+    previous = _snap(bid="0.48", ask="0.52", last="0.50", vol="100")
+    market = SimpleNamespace(market_id="KXTEST-MOVE", title="Move")
+
+    out = analyze_market(market, [latest, previous], book_activity=None)
+
+    assert "sharp price move (static threshold)" in out["reasons"]
+    assert "large volume jump (static threshold)" in out["reasons"]
+    assert out["signals"]["price_change"] == 0.2
+    assert out["signals"]["abs_price_change"] == 0.2
+    assert out["signals"]["volume_delta"] == 60.0
 
 
 def test_book_activity_bumps_score() -> None:

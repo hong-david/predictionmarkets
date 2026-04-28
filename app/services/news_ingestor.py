@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 import time
 from typing import Any
 
@@ -30,7 +31,12 @@ from app.services.news_relevance import hybrid_news_relevance
 from app.services.news_sources import (
     DEFAULT_RSS_FEEDS,
     dedupe_articles_by_url,
+    fetch_congress_articles,
     fetch_rss_articles,
+)
+from app.services.news_source_registry import (
+    apply_source_quality,
+    source_registry_diagnostics,
 )
 
 GDELT_DOC_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -198,13 +204,15 @@ def link_article_to_markets(
     for candidate in candidates:
         profile = candidate.profile
         result = hybrid_news_relevance(article, profile)
-        if result.score < min_relevance:
+        relevance_score, source_quality = apply_source_quality(result.score, article)
+        if relevance_score < min_relevance:
             continue
         components = components_with_market_direction(
             article,
             profile,
             result.components,
         )
+        components["source_quality"] = source_quality
         components["candidate_generation"] = candidate.as_score_component()
         if score_context:
             components.update(score_context)
@@ -212,7 +220,7 @@ def link_article_to_markets(
             db,
             article_id=article_id,
             market_pk=profile.market_pk,
-            relevance_score=result.score,
+            relevance_score=relevance_score,
             score_components=components,
         )
         linked += 1
@@ -241,7 +249,7 @@ def ingest_global_news(
     provider_status = "injected" if articles is not None else ""
     fetch_errors: list[str] = []
     rss_feed_list = tuple(rss_feeds or DEFAULT_RSS_FEEDS)
-    source_counts: dict[str, int] = {}
+    source_counts: dict[str, Any] = {}
 
     if fetched is None:
         fetched = []
@@ -273,12 +281,13 @@ def ingest_global_news(
             rss_articles_seen = 0
             rss_errors = 0
             rss_feed_counts: dict[str, int] = {}
-            for result in fetch_rss_articles(
+            rss_results = fetch_rss_articles(
                 rss_feed_list,
                 since=since,
                 until=until,
                 limit_per_feed=limit_per_rss_feed,
-            ):
+            )
+            for result in rss_results:
                 fetched.extend(result.articles)
                 rss_articles_seen += len(result.articles)
                 rss_feed_counts[result.source_name] = len(result.articles)
@@ -288,8 +297,40 @@ def ingest_global_news(
             source_counts["rss"] = rss_articles_seen
             source_counts["rss_feeds"] = len(rss_feed_list)
             source_counts["rss_feed_counts"] = rss_feed_counts
+            source_counts["rss_feed_details"] = [
+                {
+                    "source": result.source_name,
+                    "key": result.source_key,
+                    "label": result.source_label,
+                    "count": len(result.articles),
+                    "error": result.error,
+                    "source_tier": result.source_tier,
+                    "authority_tier": result.authority_tier,
+                    "topic_tags": list(result.topic_tags),
+                }
+                for result in rss_results
+            ]
             if rss_errors:
                 source_counts["rss_errors"] = rss_errors
+
+        congress_key = os.getenv("CONGRESS_API_KEY")
+        if congress_key:
+            try:
+                congress_articles = fetch_congress_articles(
+                    api_key=congress_key,
+                    since=since,
+                    until=until,
+                    limit=limit,
+                )
+                fetched.extend(congress_articles)
+                source_counts["congress_api"] = len(congress_articles)
+            except (httpx.HTTPError, ValueError) as exc:
+                source_counts["congress_api_errors"] = 1
+                fetch_errors.append(
+                    f"congress_api: {type(exc).__name__}: {exc}"
+                )
+        else:
+            source_counts["congress_api_disabled"] = 1
 
         fetched = dedupe_articles_by_url(fetched)
         active_sources = []
@@ -297,6 +338,8 @@ def ingest_global_news(
             active_sources.append("gdelt")
         if rss_feed_list:
             active_sources.append("rss")
+        if "congress_api" in source_counts:
+            active_sources.append("congress")
         if active_sources:
             provider_status = "+".join(active_sources)
         if not fetched and fetch_errors:
@@ -338,5 +381,6 @@ def ingest_global_news(
         "provider_status": provider_status or "none",
         "fetch_error": "; ".join(fetch_errors) if fetch_errors else None,
         "source_counts": source_counts,
+        "source_registry": source_registry_diagnostics(),
         "query": query,
     }

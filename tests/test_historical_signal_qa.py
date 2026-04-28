@@ -1,4 +1,4 @@
-from scripts.qa_historical_signals import _label_case
+from app.services.historical_signal_qa import _label_case
 
 
 def test_historical_signal_qa_labels_pre_news_trade_review() -> None:
