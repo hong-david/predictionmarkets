@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     redis_host: str = "127.0.0.1"
     redis_port: int = 6379
 
+    rate_limit_enabled: bool = True
+    rate_limit_window_seconds: int = 60
+    rate_limit_default_per_minute: int = 120
+    rate_limit_expensive_per_minute: int = 30
+    rate_limit_health_per_minute: int = 600
+
     clickhouse_url: str = "http://127.0.0.1:8123"
     clickhouse_user: str = "default"
     clickhouse_password: str = ""

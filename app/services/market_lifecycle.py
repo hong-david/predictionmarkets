@@ -42,13 +42,15 @@ SPORTS_EVENT_PREFIXES = (
     "KXGOLF",
     "KXPGA",
     "KXMASTERS",
-    "KXIPLGAME",
+    "KXIPL",
+    "KXPSL",
+    "KXCRICKET",
 )
 EVENT_DATE_TOKEN_PATTERN = (
     r"\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}"
 )
 EVENT_DATE_TOKEN_RE = re.compile(EVENT_DATE_TOKEN_PATTERN)
-EVENT_DATE_STALE_AFTER = timedelta(hours=36)
+EVENT_DATE_STALE_AFTER = timedelta(hours=30)
 
 
 def normalize_market_scope(market_scope: str | None) -> str:
@@ -69,9 +71,8 @@ def sports_event_stale_expr():
             for prefix in SPORTS_EVENT_PREFIXES
         ],
     )
-    stale_cutoff = (
-        func.to_timestamp(event_token, "YYMONDD")
-        + text("interval '36 hours'")
+    stale_cutoff = func.to_timestamp(event_token, "YYMONDD") + text(
+        "interval '30 hours'"
     )
     return and_(
         sports_market,

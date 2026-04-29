@@ -32,6 +32,7 @@ _RSS_NAMESPACES = {
     "dc": "http://purl.org/dc/elements/1.1/",
 }
 _TAG_RE = re.compile(r"<[^>]+>")
+_BARE_AMPERSAND_RE = re.compile(r"&(?!#?[a-zA-Z0-9]+;)")
 
 
 @dataclass(frozen=True)
@@ -128,7 +129,10 @@ def parse_feed_articles(
 ) -> list[NormalizedArticle]:
     """Parse RSS/Atom XML into normalized headline/summary records."""
 
-    root = ET.fromstring(xml_text)
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        root = ET.fromstring(_BARE_AMPERSAND_RE.sub("&amp;", xml_text))
     if root.tag.endswith("feed"):
         entries = root.findall("atom:entry", _RSS_NAMESPACES) or root.findall("entry")
         parsed = [_normalize_atom_entry(e, feed_url=feed_url, source_tier=source_tier) for e in entries]
@@ -267,6 +271,76 @@ def fetch_rss_articles(
                 )
             )
     return results
+
+
+def fetch_federal_register_articles(
+    *,
+    since: datetime | None,
+    until: datetime | None,
+    limit: int,
+    timeout: float = 10.0,
+) -> list[NormalizedArticle]:
+    """Fetch recent Federal Register documents through the official JSON API."""
+
+    params: dict[str, object] = {
+        "per_page": max(1, min(int(limit), 1000)),
+        "order": "newest",
+    }
+    if since is not None:
+        params["conditions[publication_date][gte]"] = since.date().isoformat()
+    if until is not None:
+        params["conditions[publication_date][lte]"] = until.date().isoformat()
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        response = client.get(
+            "https://www.federalregister.gov/api/v1/documents.json",
+            params=params,
+            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return []
+
+    articles: list[NormalizedArticle] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title = _clean_text(str(item.get("title") or ""))
+        url = str(item.get("html_url") or item.get("pdf_url") or "").strip()
+        if not title or not url:
+            continue
+        summary = _clean_text(
+            str(item.get("abstract") or item.get("action") or "")
+        )
+        published = _parse_datetime(str(item.get("publication_date") or ""))
+        agency_terms: list[str] = []
+        agencies = item.get("agencies")
+        if isinstance(agencies, list):
+            for agency in agencies[:5]:
+                if isinstance(agency, dict) and agency.get("name"):
+                    agency_terms.extend(str(agency["name"]).split())
+        keywords = tuple(
+            dict.fromkeys(
+                list(_article_keywords(title, summary))
+                + agency_terms
+                + [str(item.get("type") or "")]
+            )
+        )
+        article = NormalizedArticle(
+            canonical_url=url,
+            title=title,
+            published_at=published,
+            first_seen_at=published,
+            summary=summary,
+            keywords=keywords,
+            source_tier="official",
+        )
+        if _within_window(article, since=since, until=until):
+            articles.append(article)
+    return articles
 
 
 def fetch_congress_articles(

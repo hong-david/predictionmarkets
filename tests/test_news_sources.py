@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from app.services.news_source_registry import (
+    DEFAULT_NEWS_SOURCES,
     apply_source_quality,
     default_rss_feed_urls,
 )
@@ -58,6 +59,25 @@ def test_parse_atom_feed_articles_extracts_href_link():
     assert articles[0].published_at == datetime(2026, 4, 26, 13, tzinfo=timezone.utc)
 
 
+def test_parse_feed_articles_recovers_from_bare_ampersand_in_link():
+    xml = """
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Agency publishes merger notice</title>
+          <link>https://example.gov/document?agency=ftc&type=notice</link>
+          <pubDate>Sun, 26 Apr 2026 12:30:00 GMT</pubDate>
+        </item>
+      </channel>
+    </rss>
+    """
+
+    articles = parse_feed_articles(xml, feed_url="https://example.gov/rss")
+
+    assert len(articles) == 1
+    assert articles[0].canonical_url == "https://example.gov/document?agency=ftc&type=notice"
+
+
 def test_feed_window_filter_skips_old_items():
     xml = """
     <rss version="2.0"><channel>
@@ -95,7 +115,11 @@ def test_dedupe_articles_by_url_keeps_first_copy():
 def test_default_source_registry_includes_official_feeds():
     feeds = default_rss_feed_urls()
 
-    assert any("federalregister.gov/documents/search.rss" in feed for feed in feeds)
+    assert any(
+        source.key == "federal_register_recent"
+        and source.adapter == "federal_register_api"
+        for source in DEFAULT_NEWS_SOURCES
+    )
     assert any("browse-edgar" in feed and "output=atom" in feed for feed in feeds)
     assert any("medwatch/rss.xml" in feed.lower() for feed in feeds)
 

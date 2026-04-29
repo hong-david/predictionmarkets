@@ -22,7 +22,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from app.api.routes.anomalies import router as anomalies_router
 from app.api.routes.dashboard import router as dashboard_router
@@ -30,8 +31,38 @@ from app.api.routes.features import router as features_router
 from app.api.routes.health import router as health_router
 from app.api.routes.markets import router as markets_router
 from app.core.config import settings
+from app.core.rate_limit import RateLimiter
 
 app = FastAPI(title=settings.app_name)
+_rate_limiter = RateLimiter.from_settings(settings)
+
+
+@app.middleware("http")
+async def rate_limit_api_requests(request, call_next):
+    decision = await run_in_threadpool(_rate_limiter.check_request, request)
+    if decision is not None and not decision.allowed:
+        return JSONResponse(
+            {
+                "detail": "Rate limit exceeded",
+                "limit": decision.rule.requests,
+                "window_seconds": decision.rule.window_seconds,
+                "rule": decision.rule.name,
+            },
+            status_code=429,
+            headers={
+                "Retry-After": str(decision.reset_seconds),
+                "X-RateLimit-Limit": str(decision.rule.requests),
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(decision.reset_seconds),
+            },
+        )
+
+    response = await call_next(request)
+    if decision is not None:
+        response.headers["X-RateLimit-Limit"] = str(decision.rule.requests)
+        response.headers["X-RateLimit-Remaining"] = str(decision.remaining)
+        response.headers["X-RateLimit-Reset"] = str(decision.reset_seconds)
+    return response
 
 # The React app’s canonical read API is /api/dashboard/* (see dashboard_router).
 # Other routers below stay on /api/* for scripts and old tests; they are

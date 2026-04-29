@@ -1,0 +1,12 @@
+yourdomain.com {
+    log {
+        output file /var/log/caddy/predictionmarkets-access.log {
+            roll_size 50mb
+            roll_keep 10
+            roll_keep_for 720h
+        }
+    }
+
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8000
+}

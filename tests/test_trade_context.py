@@ -166,3 +166,102 @@ def test_cross_market_coherence_reason() -> None:
     flagged = out[1]
     assert flagged is not None
     assert "coherent_event_move" in flagged["reasons"]
+
+
+def test_low_notional_trade_context_is_capped() -> None:
+    trades = [
+        {
+            "ts": "2026-01-01T10:00:00+00:00",
+            "yes_price": 0.50,
+            "count": 1,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:01:00+00:00",
+            "yes_price": 0.80,
+            "count": 1,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:06:00+00:00",
+            "yes_price": 0.84,
+            "count": 1,
+            "taker_side": "yes",
+        },
+    ]
+    local = [
+        None,
+        {
+            "score": 9.0,
+            "features": {"cluster": 0.0, "trade_dollar_amount": 0.80},
+            "reasons": ["large_size_vs_recent"],
+        },
+        None,
+    ]
+
+    out = explain_trades_with_context(
+        trades,
+        market=_market(),
+        local_explanations=local,
+    )
+
+    flagged = out[1]
+    assert flagged is not None
+    assert flagged["score"] <= 1.5
+    assert "low_notional_context_cap" in flagged["reasons"]
+    assert flagged["features"]["trade_dollar_amount"] == 0.8
+
+
+def test_recent_linked_news_discounts_post_news_move() -> None:
+    trades = [
+        {
+            "ts": "2026-01-01T10:00:00+00:00",
+            "yes_price": 0.50,
+            "count": 10,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:02:00+00:00",
+            "yes_price": 0.57,
+            "count": 120,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:07:00+00:00",
+            "yes_price": 0.62,
+            "count": 10,
+            "taker_side": "yes",
+        },
+    ]
+    snapshots = [
+        {
+            "ts": "2026-01-01T10:01:30+00:00",
+            "yes_bid": 0.50,
+            "yes_ask": 0.58,
+            "last_price": 0.51,
+            "volume_24h": 400,
+            "open_interest": 500,
+        }
+    ]
+
+    baseline = explain_trades_with_context(
+        trades,
+        market=_market(),
+        snapshots=snapshots,
+    )[1]
+    with_news = explain_trades_with_context(
+        trades,
+        market=_market(),
+        snapshots=snapshots,
+        news_events=[
+            {
+                "first_seen_at": "2026-01-01T09:45:00+00:00",
+                "relevance_score": 0.9,
+            }
+        ],
+    )[1]
+
+    assert baseline is not None and with_news is not None
+    assert with_news["score"] < baseline["score"]
+    assert "post_news_move_discount" in with_news["reasons"]
+    assert with_news["features"]["post_news_discount_multiplier"] == 0.65

@@ -30,7 +30,7 @@ from app.services.trade_baselines import latest_baseline_for_market
 from app.services.trade_context import MarketContext, explain_trades_with_context
 from app.services.trade_suspicion import explain_trades_against_window
 
-TRADE_SCORER_VERSION = 1
+TRADE_SCORER_VERSION = 2
 TRADE_FLAG_MIN_SCORE = 3.0
 TRADE_FLAG_TRIGGERED_SCORE = 7.0
 TRADE_FLAG_CASE_SCORE = 8.5
@@ -46,6 +46,27 @@ def severity_for_score(score: float) -> str:
     return "low"
 
 
+def final_trade_flag_score(
+    local_score: float,
+    context_score: float,
+    context_exp: dict | None,
+) -> float:
+    score = max(local_score, context_score)
+    features = (
+        context_exp.get("features", {})
+        if isinstance(context_exp, dict)
+        else {}
+    )
+    discount = features.get("post_news_discount_multiplier")
+    try:
+        discount_value = float(discount)
+    except (TypeError, ValueError):
+        discount_value = None
+    if discount_value is not None and 0 < discount_value < 1:
+        score = max(context_score, local_score * discount_value)
+    return round(min(10.0, max(0.0, score)), 3)
+
+
 def _market_context(market: Market) -> MarketContext:
     return MarketContext(
         market_pk=market.id,
@@ -59,6 +80,16 @@ def _market_context(market: Market) -> MarketContext:
 
 
 def _trade_payload(trade: Trade) -> dict:
+    trade_price = (
+        trade.no_price_dollars
+        if (trade.taker_side or "").lower() == "no"
+        else trade.yes_price_dollars
+    )
+    trade_dollars = (
+        float(trade.count_fp) * float(trade_price)
+        if trade.count_fp is not None and trade_price is not None
+        else None
+    )
     return {
         "ts": trade.ts.isoformat() if trade.ts else None,
         "yes_price": float(trade.yes_price_dollars)
@@ -68,6 +99,7 @@ def _trade_payload(trade: Trade) -> dict:
         if trade.no_price_dollars is not None
         else None,
         "count": float(trade.count_fp) if trade.count_fp is not None else None,
+        "trade_dollar_amount": trade_dollars,
         "taker_side": trade.taker_side,
     }
 
@@ -366,7 +398,7 @@ def materialize_trade_flags(
         for trade, local_exp, context_exp in zip(trades, local, context):
             local_score = float(local_exp["score"]) if local_exp else 0.0
             context_score = float(context_exp["score"]) if context_exp else 0.0
-            score = max(local_score, context_score)
+            score = final_trade_flag_score(local_score, context_score, context_exp)
             if score < min_score:
                 continue
 

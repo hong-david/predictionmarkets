@@ -13,11 +13,12 @@ import { categoryDisplay, priorHelp, priorShort } from "@/lib/labels";
 import { cn, fmtInt, fmtPrice } from "@/lib/utils";
 
 const SORT_OPTIONS = [
+  { value: "news_linked_trade_flag", label: "News-linked trade flags" },
+  { value: "top_trade_flag", label: "Highest trade flag" },
   {
     value: "surveillance_urgency",
     label: "Activity alerts first",
   },
-  { value: "top_trade_flag", label: "Highest trade flag" },
   { value: "priority", label: "Watch priority, then trades" },
   { value: "trades_desc", label: "Most trades" },
   { value: "trades_asc", label: "Fewest trades" },
@@ -54,7 +55,7 @@ export default function MarketsBrowserPage() {
     prior: searchParams.get("prior") || undefined,
     confidence: searchParams.get("confidence") || undefined,
     market_scope: parseMarketScope(searchParams.get("market_scope")),
-    sort: searchParams.get("sort") || "surveillance_urgency",
+    sort: searchParams.get("sort") || "news_linked_trade_flag",
     offset: Number(searchParams.get("offset") || 0),
     limit: PAGE_SIZE,
   };

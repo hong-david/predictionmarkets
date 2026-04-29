@@ -23,8 +23,9 @@ Why a static dict and not YAML / DB:
 
 How to read the priors:
 
-  - "high":         insider trading is plausible AND the market is liquid
-                    enough that informed flow could move price. The active
+  - "high":         insider trading is plausible, the information set is
+                    narrow or single-actor, and the market is liquid enough
+                    that informed flow could move price. The active
                     surveillance set.
   - "medium_high":  liquid, but the underlying is not easily insider-leaked
                     (sports outcomes — public events with private prep).
@@ -49,25 +50,24 @@ from app.services.classifier.types import ManipulabilityPrior
 # default applied when a more specific (category, subcategory) is missing.
 PRIOR_MAP: dict[tuple[str, str], ManipulabilityPrior] = {
     # ----- Macro / scheduled-announcement markets -------------------------
-    # Highest priority surveillance class. Government data releases (CPI,
-    # NFP, FOMC) are the canonical leakage scenario: a small number of
-    # people know the number ~30 minutes early, the underlying is binary
-    # over a tight time window, and informed flow is unmistakable on the
-    # tape. These markets should always be on the watchlist.
+    # Government data releases are surveillance-relevant, but broad scheduled
+    # macro buckets create thousands of active contracts. Keep most of them
+    # just below "high" so that bucket stays small enough to review. Fed
+    # decision and press-conference markets are narrow enough to sit in high.
     ("macro", "fed_decision"): "high",
-    ("macro", "cpi"): "high",
-    ("macro", "jobs"): "high",
-    ("macro", "gdp"): "high",
-    ("macro", "*"): "high",
+    ("macro", "cpi"): "medium_high",
+    ("macro", "jobs"): "medium_high",
+    ("macro", "gdp"): "medium_high",
+    ("macro", "*"): "medium_high",
 
     # ----- Corporate / event-driven --------------------------------------
-    # Mergers, earnings, FDA approvals, bankruptcy filings. Same shape as
-    # macro: small set of insiders, scheduled or event-driven announcement,
-    # the trade tape is where leakage shows up.
+    # Mergers, earnings, FDA approvals, bankruptcy filings. Mergers and FDA
+    # stay high because the information set is narrower and the binary event
+    # edge is cleaner; broad scheduled earnings remains just below high.
     ("corporate", "merger"): "high",
-    ("corporate", "earnings"): "high",
+    ("corporate", "earnings"): "medium_high",
     ("corporate", "fda"): "high",
-    ("corporate", "*"): "high",
+    ("corporate", "*"): "medium_high",
 
     # ----- Judicial -------------------------------------------------------
     # SCOTUS / federal-court rulings have the same insider-leakage shape:
@@ -101,8 +101,8 @@ PRIOR_MAP: dict[tuple[str, str], ManipulabilityPrior] = {
     # First-basket / first-goal / over-under-on-player-X. Single-actor
     # leverage: one player can entirely determine the outcome of their own
     # market. Higher manipulability ceiling than the team outcome.
-    ("sports_prop", "player_points"): "medium_high",
-    ("sports_prop", "first_event"): "medium_high",
+    ("sports_prop", "player_points"): "high",
+    ("sports_prop", "first_event"): "high",
     ("sports_prop", "*"): "medium_high",
 
     # ----- Crypto strikes -------------------------------------------------

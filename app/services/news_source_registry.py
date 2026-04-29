@@ -58,7 +58,8 @@ DEFAULT_NEWS_SOURCES: tuple[NewsSource, ...] = (
     NewsSource(
         "federal_register_recent",
         "Federal Register recent documents",
-        "https://www.federalregister.gov/documents/search.rss?conditions%5Bpublication_date%5D%5Bis%5D=recent",
+        "https://www.federalregister.gov/api/v1/documents.json",
+        adapter="federal_register_api",
         source_tier="official",
         authority_tier="official",
         topic_tags=("regulation", "government"),

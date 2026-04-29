@@ -26,16 +26,20 @@ from app.services.news_clustering import (
 )
 from app.services.news_candidates import news_market_candidates
 from app.services.news_gdelt import tokenize_for_gdelt
-from app.services.news_direction import components_with_market_direction
-from app.services.news_relevance import hybrid_news_relevance
+from app.services.news_link_scoring import score_article_market_link
+from app.services.news_profile_index import (
+    build_news_profile_index,
+    candidate_pool_for_article,
+)
 from app.services.news_sources import (
     DEFAULT_RSS_FEEDS,
     dedupe_articles_by_url,
     fetch_congress_articles,
+    fetch_federal_register_articles,
     fetch_rss_articles,
 )
 from app.services.news_source_registry import (
-    apply_source_quality,
+    DEFAULT_NEWS_SOURCES,
     source_registry_diagnostics,
 )
 
@@ -187,14 +191,16 @@ def link_article_to_markets(
     max_profiles: int,
     max_candidates: int | None = None,
     score_context: dict | None = None,
+    profiles: list[MarketNewsProfile] | None = None,
 ) -> int:
     article = db.query(NewsArticle).filter(NewsArticle.id == article_id).one()
-    profiles = (
-        db.query(MarketNewsProfile)
-        .order_by(MarketNewsProfile.updated_at.desc())
-        .limit(max_profiles)
-        .all()
-    )
+    if profiles is None:
+        profiles = (
+            db.query(MarketNewsProfile)
+            .order_by(MarketNewsProfile.updated_at.desc())
+            .limit(max_profiles)
+            .all()
+        )
     linked = 0
     candidates = news_market_candidates(
         article,
@@ -203,25 +209,21 @@ def link_article_to_markets(
     )
     for candidate in candidates:
         profile = candidate.profile
-        result = hybrid_news_relevance(article, profile)
-        relevance_score, source_quality = apply_source_quality(result.score, article)
-        if relevance_score < min_relevance:
-            continue
-        components = components_with_market_direction(
+        link_score = score_article_market_link(
             article,
             profile,
-            result.components,
+            min_relevance=min_relevance,
+            candidate_component=candidate.as_score_component(),
+            score_context=score_context,
         )
-        components["source_quality"] = source_quality
-        components["candidate_generation"] = candidate.as_score_component()
-        if score_context:
-            components.update(score_context)
+        if link_score is None:
+            continue
         record_news_market_candidate(
             db,
             article_id=article_id,
             market_pk=profile.market_pk,
-            relevance_score=relevance_score,
-            score_components=components,
+            relevance_score=link_score.relevance_score,
+            score_components=link_score.components,
         )
         linked += 1
     return linked
@@ -313,6 +315,62 @@ def ingest_global_news(
             if rss_errors:
                 source_counts["rss_errors"] = rss_errors
 
+        federal_register_sources = [
+            source
+            for source in DEFAULT_NEWS_SOURCES
+            if source.adapter == "federal_register_api" and source.available
+        ]
+        if federal_register_sources:
+            federal_register_seen = 0
+            federal_register_errors = 0
+            federal_register_details: list[dict[str, object]] = []
+            for source in federal_register_sources:
+                try:
+                    federal_register_articles = fetch_federal_register_articles(
+                        since=since,
+                        until=until,
+                        limit=limit_per_rss_feed,
+                    )
+                    fetched.extend(federal_register_articles)
+                    federal_register_seen += len(federal_register_articles)
+                    federal_register_details.append(
+                        {
+                            "source": source.url,
+                            "key": source.key,
+                            "label": source.label,
+                            "count": len(federal_register_articles),
+                            "error": None,
+                            "source_tier": source.source_tier,
+                            "authority_tier": source.authority_tier,
+                            "topic_tags": list(source.topic_tags),
+                        }
+                    )
+                except (httpx.HTTPError, ValueError) as exc:
+                    federal_register_errors += 1
+                    error = f"{type(exc).__name__}: {exc}"
+                    fetch_errors.append(f"federal_register_api {source.url}: {error}")
+                    federal_register_details.append(
+                        {
+                            "source": source.url,
+                            "key": source.key,
+                            "label": source.label,
+                            "count": 0,
+                            "error": error,
+                            "source_tier": source.source_tier,
+                            "authority_tier": source.authority_tier,
+                            "topic_tags": list(source.topic_tags),
+                        }
+                    )
+            source_counts["federal_register_api"] = federal_register_seen
+            source_counts["federal_register_api_sources"] = len(
+                federal_register_sources
+            )
+            source_counts["federal_register_api_details"] = federal_register_details
+            if federal_register_errors:
+                source_counts["federal_register_api_errors"] = (
+                    federal_register_errors
+                )
+
         congress_key = os.getenv("CONGRESS_API_KEY")
         if congress_key:
             try:
@@ -338,6 +396,8 @@ def ingest_global_news(
             active_sources.append("gdelt")
         if rss_feed_list:
             active_sources.append("rss")
+        if "federal_register_api" in source_counts:
+            active_sources.append("federal_register")
         if "congress_api" in source_counts:
             active_sources.append("congress")
         if active_sources:
@@ -346,6 +406,15 @@ def ingest_global_news(
             provider_status = "unavailable"
 
     clusters = cluster_normalized_articles(fetched)
+    profile_rows = (
+        db.query(MarketNewsProfile)
+        .order_by(MarketNewsProfile.updated_at.desc())
+        .limit(max_profiles)
+        .all()
+        if clusters
+        else []
+    )
+    profile_index = build_news_profile_index(profile_rows)
 
     upserted = 0
     linked = 0
@@ -364,6 +433,10 @@ def ingest_global_news(
         if representative_id is None:
             continue
 
+        representative = (
+            db.query(NewsArticle).filter(NewsArticle.id == representative_id).one()
+        )
+        profile_pool = candidate_pool_for_article(representative, profile_index)
         linked += link_article_to_markets(
             db,
             article_id=representative_id,
@@ -371,9 +444,11 @@ def ingest_global_news(
             max_profiles=max_profiles,
             max_candidates=max_candidates_per_article,
             score_context=score_components_for_cluster(cluster),
+            profiles=profile_pool,
         )
     return {
         "profiles_refreshed": refreshed,
+        "profiles_loaded": len(profile_rows),
         "articles_seen": len(fetched),
         "article_clusters_seen": len(clusters),
         "articles_upserted": upserted,

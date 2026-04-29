@@ -78,6 +78,7 @@ export const api = {
       | "priority"
       | "surveillance_urgency"
       | "top_trade_flag"
+      | "news_linked_trade_flag"
       | "recent"
       | "title"
       | "anomalies"

@@ -43,7 +43,7 @@ import httpx
 import orjson
 import redis
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, case, desc, func, or_, select, text
+from sqlalchemy import and_, case, desc, exists, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -63,9 +63,8 @@ from app.db.models import (
 )
 from app.services.historical_signal_qa import historical_signal_report
 from app.services.news_correlation import market_news_search_query, profile_for_market
-from app.services.news_direction import components_with_market_direction
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
-from app.services.news_relevance import hybrid_news_relevance
+from app.services.news_link_scoring import score_article_market_link
 from app.services.news_source_registry import source_registry_diagnostics
 from app.services.market_lifecycle import (
     market_lifecycle as _market_lifecycle,
@@ -87,6 +86,10 @@ from app.services.trade_context import (
     MarketContext,
     build_peer_baselines,
     explain_trades_with_context,
+)
+from app.services.trade_flag_materializer import (
+    TRADE_SCORER_VERSION,
+    final_trade_flag_score,
 )
 from app.services.trade_suspicion import explain_trades_against_window
 
@@ -1113,7 +1116,7 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
     markets_high_prior = (
         db.query(func.count(Market.id))
         .filter(*scoped)
-        .filter(Market.manipulability_prior.in_(("high", "medium_high")))
+        .filter(Market.manipulability_prior == "high")
         .scalar()
         or 0
     )
@@ -1716,15 +1719,12 @@ def _current_news_link_for_market(
 
     try:
         profile = MarketNewsProfile(**profile_for_market(market))
-        relevance = hybrid_news_relevance(article, profile)
-        if relevance.score < min_relevance:
-            return None
-        components = components_with_market_direction(
-            article,
-            profile,
-            relevance.components,
+        link_score = score_article_market_link(
+            article, profile, min_relevance=min_relevance
         )
-        return relevance.score, components
+        if link_score is None:
+            return None
+        return link_score.relevance_score, link_score.components
     except Exception as exc:  # pragma: no cover - defensive read-path fallback
         logger.info(
             "current news relevance check failed for %s: %s",
@@ -1849,6 +1849,7 @@ def _suspicious_trades_payload(
         .join(Trade, Trade.id == TradeFlag.trade_pk)
         .join(Market, Market.id == TradeFlag.market_pk)
         .filter(*(_hydrated_market_filters() + scope_filters))
+        .filter(TradeFlag.scorer_version == TRADE_SCORER_VERSION)
         .order_by(TradeFlag.score.desc(), TradeFlag.ts.desc())
         .limit(limit)
         .all()
@@ -1967,7 +1968,7 @@ def _suspicious_trades_payload(
                 continue
             local_score = float(explanation["score"]) if explanation else 0.0
             context_score = float(context["score"]) if context else 0.0
-            score = max(local_score, context_score)
+            score = final_trade_flag_score(local_score, context_score, context)
             if score <= 0:
                 continue
             candidates.append(
@@ -2036,7 +2037,8 @@ def get_dashboard_overview(
             "news_signals": _news_signals_payload(
                 db,
                 limit=8,
-                min_score=0.0,
+                min_score=4.0,
+                include_ambiguous=True,
                 market_scope=market_scope,
             ),
         },
@@ -2055,6 +2057,7 @@ _SORT_OPTIONS = {
     # on `updated_at` (not on prior) within that tier.
     "surveillance_urgency": ("surveillance_urgency", "desc"),
     "top_trade_flag": ("top_trade_flag_score", "desc"),
+    "news_linked_trade_flag": ("top_trade_flag_score", "desc"),
     "recent": ("created_at", "desc"),
     "title": ("title", "asc"),
     "anomalies": ("anomaly_count", "desc"),
@@ -2075,11 +2078,17 @@ def list_markets(
         default=False,
         description="Include lazy WS-created rows whose exchange metadata/title has not been hydrated yet.",
     ),
+    data_only: bool = Query(
+        default=True,
+        description="Only include markets with retained trade data.",
+    ),
     sort: str = Query(
-        default="surveillance_urgency",
+        default="news_linked_trade_flag",
         description=(
             "trades_desc | trades_asc | priority | surveillance_urgency | "
-            "top_trade_flag | recent | title | anomalies — "
+            "top_trade_flag | news_linked_trade_flag | recent | title | anomalies — "
+            "`news_linked_trade_flag`: current trade flag score among markets "
+            "with retained related news; "
             "`surveillance_urgency`: zero `anomaly_count` → flat floor; else "
             "`(8+0.4*(prior_rank+1))*ln(1+count)` so evidence count dominates watch priority."
         ),
@@ -2101,7 +2110,8 @@ def list_markets(
         f"q={q or ''}:category={category or ''}:prior={prior or ''}:"
         f"confidence={confidence or ''}:status={status or ''}:"
         f"market_scope={market_scope}:"
-        f"include_unhydrated={int(include_unhydrated)}:sort={sort}:"
+        f"include_unhydrated={int(include_unhydrated)}:"
+        f"data_only={int(data_only)}:sort={sort}:"
         f"limit={limit}:offset={offset}"
     )
     return _cached_dashboard_payload(
@@ -2114,6 +2124,7 @@ def list_markets(
             status=status,
             market_scope=market_scope,
             include_unhydrated=include_unhydrated,
+            data_only=data_only,
             sort=sort,
             limit=limit,
             offset=offset,
@@ -2131,6 +2142,7 @@ def _list_markets_uncached(
     status: str | None,
     market_scope: str,
     include_unhydrated: bool,
+    data_only: bool,
     sort: str,
     limit: int,
     offset: int,
@@ -2166,9 +2178,30 @@ def _list_markets_uncached(
         filters.append(Market.classifier_confidence == confidence)
     if status:
         filters.append(Market.status == status)
+    if data_only:
+        filters.append(exists().where(Trade.market_pk == Market.id))
+    if sort == "news_linked_trade_flag":
+        filters.extend(
+            [
+                exists().where(
+                    and_(
+                        TradeFlag.market_pk == Market.id,
+                        TradeFlag.scorer_version == TRADE_SCORER_VERSION,
+                    )
+                ),
+                exists().where(
+                    and_(
+                        NewsEvent.market_pk == Market.id,
+                        NewsEvent.relevance_score >= 0.35,
+                    )
+                ),
+            ]
+        )
 
     total_filters = [] if include_unhydrated else _hydrated_market_filters()
     total_filters.extend(_market_scope_filters(market_scope))
+    if data_only:
+        total_filters.append(exists().where(Trade.market_pk == Market.id))
     total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
     filtered = (
         db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
@@ -2203,6 +2236,7 @@ def _list_markets_uncached(
     top_trade_flag_sq = (
         select(TradeFlag.market_pk, func.max(TradeFlag.score).label("top_score"))
         .join(candidate_sq, candidate_sq.c.id == TradeFlag.market_pk)
+        .where(TradeFlag.scorer_version == TRADE_SCORER_VERSION)
         .group_by(TradeFlag.market_pk)
         .subquery()
     )
@@ -2221,7 +2255,7 @@ def _list_markets_uncached(
         .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
     )
 
-    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["surveillance_urgency"])
+    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["top_trade_flag"])
     if sort_key == "trade_count":
         # NULLs (markets with no trades yet) become 0 so they sort last
         # in DESC and first in ASC. The COALESCE must wrap the column
@@ -2328,6 +2362,7 @@ def _list_markets_from_metric_projection(
     top_trade_flag_sq = (
         select(TradeFlag.market_pk, func.max(TradeFlag.score).label("top_score"))
         .join(candidate_sq, candidate_sq.c.id == TradeFlag.market_pk)
+        .where(TradeFlag.scorer_version == TRADE_SCORER_VERSION)
         .group_by(TradeFlag.market_pk)
         .subquery()
     )
@@ -2351,7 +2386,7 @@ def _list_markets_from_metric_projection(
         .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
     )
 
-    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["surveillance_urgency"])
+    sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["top_trade_flag"])
     if sort_key == "trade_count":
         base = base.order_by(
             trade_count_col.asc() if sort_dir == "asc" else trade_count_col.desc()
@@ -2836,7 +2871,7 @@ def get_news_signals(
     limit: int = Query(default=25, ge=1, le=100),
     min_score: float = Query(default=4.0, ge=0.0, le=10.0),
     status: str | None = Query(default=None),
-    include_ambiguous: bool = Query(default=False),
+    include_ambiguous: bool = Query(default=True),
     market_scope: str = Query(default="active", description="active | historical | all"),
     db: Session = Depends(get_db),
 ) -> dict:

@@ -93,6 +93,7 @@ def test_low_dollar_outlier_is_discounted_against_same_size_trade() -> None:
     assert low["features"]["trade_dollar_amount"] == 10.0
     assert "low_notional_discount" in low["reasons"]
     assert high["score"] > low["score"]
+    assert low["score"] < high["score"] * 0.25
 
 
 def test_cluster_of_small_bets_still_surfaces() -> None:
@@ -120,5 +121,6 @@ def test_cluster_of_small_bets_still_surfaces() -> None:
 
     assert latest is not None
     assert latest["score"] > 0
+    assert latest["score"] < 2
     assert "same_side_cluster" in latest["reasons"]
     assert "small_bet_cluster" in latest["reasons"]

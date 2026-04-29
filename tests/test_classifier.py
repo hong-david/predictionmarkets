@@ -36,14 +36,18 @@ from app.services.classifier.types import (
 class TestPriorityMap:
     def test_exact_match_wins(self):
         assert prior_for("macro", "fed_decision") == "high"
+        assert prior_for("corporate", "merger") == "high"
+        assert prior_for("corporate", "fda") == "high"
+        assert prior_for("sports_outcome", "fight_winner") == "high"
+        assert prior_for("sports_prop", "player_points") == "high"
         assert prior_for("crypto_strike", "short_window") == "low"
         assert prior_for("weather", "temperature") == "very_low"
 
     def test_per_category_wildcard_fallback(self):
         # No (macro, "made_up_subcat") rule exists, so the per-category
-        # default (macro, "*") = high should fire.
+        # default (macro, "*") = medium_high should fire.
         assert ("macro", "made_up_subcat") not in PRIOR_MAP
-        assert prior_for("macro", "made_up_subcat") == "high"
+        assert prior_for("macro", "made_up_subcat") == "medium_high"
 
     def test_global_fallback_for_unknown_category(self):
         # No (foo, *) rule at all → falls through to other.unclassified.

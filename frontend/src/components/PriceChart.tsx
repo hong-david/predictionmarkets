@@ -29,6 +29,8 @@ export interface ChartNewsEvent {
   score?: number | null;
 }
 
+const MARKET_ALERT_MARKER_MIN_SCORE = 5.0;
+
 /**
  * Price + volume chart, with anomaly markers overlaid on the price
  * series.  Uses TradingView's `lightweight-charts` — same library that
@@ -213,9 +215,9 @@ export function PriceChart({
       const byTime = new Map<number, { score: number; text: string; severity: string }>();
       for (const a of anomalies ?? []) {
         if (!a.created_at) continue;
-        if (a.severity === "none" || a.score <= 0) continue;
-        // Suppress pre-threshold / legacy weak rows; matches materializer `MIN_SCORE_TO_PERSIST`.
-        if (a.score < 3) continue;
+        if (a.severity === "none" || a.severity === "low" || a.score <= 0) continue;
+        // Suppress low-signal historical rows so arrows mark only review-worthy moves.
+        if (a.score < MARKET_ALERT_MARKER_MIN_SCORE) continue;
         const target = Math.floor(new Date(a.created_at).getTime() / 1000);
         const t = nearestTime(sortedTimes, target);
         if (t == null) continue;

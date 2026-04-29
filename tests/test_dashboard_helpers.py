@@ -53,6 +53,37 @@ def test_sports_ticker_prefix_overrides_bad_category_for_lifecycle() -> None:
     )
 
 
+def test_cricket_prefix_overrides_bad_category_for_lifecycle() -> None:
+    market = _market(
+        market_id="KXPSLGAME-26APR26RAWHYD-HYD",
+        category="macro",
+        close_time=datetime(2026, 5, 10, tzinfo=timezone.utc),
+    )
+
+    assert (
+        market_lifecycle(
+            market,
+            now=datetime(2026, 4, 28, 18, tzinfo=timezone.utc),
+        )
+        == "historical"
+    )
+
+
+def test_prior_day_scheduled_sports_market_is_historical_after_short_grace() -> None:
+    market = _market(
+        market_id="KXUCLGAME-26APR28PSGBMU-BMU",
+        close_time=datetime(2026, 5, 12, tzinfo=timezone.utc),
+    )
+
+    assert (
+        market_lifecycle(
+            market,
+            now=datetime(2026, 4, 29, 8, tzinfo=timezone.utc),
+        )
+        == "historical"
+    )
+
+
 def test_same_day_scheduled_sports_market_can_still_be_active() -> None:
     market = _market(
         market_id="KXATPMATCH-26APR28TSIRUU-RUU",

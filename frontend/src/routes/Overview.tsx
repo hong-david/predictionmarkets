@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Info } from "lucide-react";
 import {
   Bar,
   BarChart,
@@ -54,7 +54,7 @@ const PRIOR_COLOR: Record<string, string> = {
 function buildMarketsQuery(kind: "category" | "prior", key: string): string {
   const p = new URLSearchParams();
   p.set(kind, key);
-  p.set("sort", "surveillance_urgency");
+  p.set("sort", "news_linked_trade_flag");
   return `/markets?${p.toString()}`;
 }
 
@@ -102,7 +102,7 @@ export default function OverviewPage() {
   const [marketScope, setMarketScope] = useState<MarketScope>("active");
   const overview = useQuery({
     queryKey: ["overview", marketScope],
-    queryFn: () => api.overview({ top: 15, anomalies: 15, market_scope: marketScope }),
+    queryFn: () => api.overview({ top: 10, anomalies: 10, market_scope: marketScope }),
     refetchInterval: 8_000,
   });
   const st = overview.data?.stats;
@@ -213,7 +213,7 @@ export default function OverviewPage() {
             <StatTile
               label="High watch-priority"
               value={fmtInt(st.markets_high_prior)}
-              sub="High plus elevated classifier buckets. Priority means this contract type is worth watching; it is not a suspicious-trade verdict."
+              sub="Strict high-priority bucket only. Broad macro data, earnings, and team outcomes stay medium-high so the top watchlist remains reviewable."
               tone="primary"
             />
             <StatTile
@@ -302,13 +302,13 @@ export default function OverviewPage() {
         </Card>
       </section>
 
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card>
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
+        <Card className="h-[32rem] overflow-hidden flex flex-col">
           <CardHeader
             title="Most traded markets"
             subtitle="Active/open markets with the most retained execution prints in the recent trade sample, plus estimated dollars paid for those contracts."
           />
-          <div>
+          <div className="flex-1 overflow-x-auto">
             {overview.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
@@ -347,7 +347,7 @@ export default function OverviewPage() {
           </div>
         </Card>
 
-        <Card>
+        <Card className="h-[32rem] overflow-hidden flex flex-col">
           <CardHeader
             title="Market activity alerts"
             subtitle="Active/open markets with saved quote, volume, spread, and order-book alert history. These are market alerts, not individual trade accusations."
@@ -357,7 +357,7 @@ export default function OverviewPage() {
                 : undefined
             }
           />
-          <div>
+          <div className="flex-1 overflow-x-auto">
             {overview.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
@@ -419,12 +419,12 @@ export default function OverviewPage() {
       <Card>
         <CardHeader
           title="News-linked signals"
-          subtitle="Vetted market/news links, with trade-aligned rows ranked first. Scores combine relevance, YES/NO direction, timing, and market tape behavior when available."
+          subtitle="Vetted market/news links, with trade-aligned rows ranked first. Directional links are strongest; ambiguous rows are included when timing and relevance make them worth review."
           right={
             newsSignals
               ? newsSignals.min_score > 0
                 ? `${fmtInt(newsSignals.count)} at score ${newsSignals.min_score.toFixed(1)}+`
-                : `${fmtInt(newsSignals.count)} directional links`
+                : `${fmtInt(newsSignals.count)} links`
               : undefined
           }
         />
@@ -436,7 +436,7 @@ export default function OverviewPage() {
           ) : !newsSignals?.signals.length ? (
             <EmptyState>
               No news-linked signals to show yet. Stored articles may exist, but none
-              currently pass the market-link, direction, and trade-timing filters.
+              currently pass the market-link relevance and trade-timing filters.
             </EmptyState>
           ) : (
             <table className="w-full">
@@ -459,7 +459,7 @@ export default function OverviewPage() {
         </div>
       </Card>
 
-      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <section className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
         <NewsDiagnosticsCard
           data={newsDiagnostics.data}
           loading={newsDiagnostics.isPending}
@@ -475,7 +475,7 @@ export default function OverviewPage() {
       <Card>
         <CardHeader
           title="Top trade flags"
-          subtitle="Individual trade candidates ranked by the stronger of local outlier score and context score. Context can include liquidity impact, sector baselines, linked news timing, sibling-market movement, and market priority."
+          subtitle="Individual trade candidates ranked by the stronger of local outlier score and context score. Low-dollar one-offs are heavily discounted unless they arrive in a strong immediate cluster."
           right={
             suspiciousTrades
               ? `${fmtInt(suspiciousTrades.count)} shown from latest ${fmtInt(suspiciousTrades.sample)} prints`
@@ -747,10 +747,26 @@ function NewsDiagnosticsCard({
         ) : (
           <div className="space-y-3">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-              <MiniMetric label="stored" value={fmtInt(data.summary.articles_stored)} />
-              <MiniMetric label="seen run" value={fmtInt(data.summary.articles_seen_last_run)} />
-              <MiniMetric label="linked" value={fmtInt(data.summary.news_events_linked)} />
-              <MiniMetric label="correlated" value={fmtInt(data.summary.positive_correlations)} />
+              <MiniMetric
+                label="stored"
+                value={fmtInt(data.summary.articles_stored)}
+                help="Total deduped article records currently saved after ingest."
+              />
+              <MiniMetric
+                label="seen run"
+                value={fmtInt(data.summary.articles_seen_last_run)}
+                help="Articles fetched or seen during the latest news sweep before dedupe and market-link filtering."
+              />
+              <MiniMetric
+                label="linked"
+                value={fmtInt(data.summary.news_events_linked)}
+                help="Article-to-market links kept after relevance scoring, market-direction scoring, and category precision gates."
+              />
+              <MiniMetric
+                label="correlated"
+                value={fmtInt(data.summary.positive_correlations)}
+                help="Linked news rows with a positive pre-news trade correlation score."
+              />
             </div>
             <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
               <span>latest {fmtAgo(data.latest_at)}</span>
@@ -852,10 +868,27 @@ function HistoricalSignalQaCard({
   );
 }
 
-function MiniMetric({ label, value }: { label: string; value: string }) {
+function MiniMetric({
+  label,
+  value,
+  help,
+}: {
+  label: string;
+  value: string;
+  help: string;
+}) {
   return (
     <div className="rounded-md border border-border bg-secondary/30 px-2 py-1.5">
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</div>
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+        <span>{label}</span>
+        <span
+          title={help}
+          aria-label={help}
+          className="inline-flex h-3.5 w-3.5 items-center justify-center rounded-full text-muted-foreground hover:text-foreground"
+        >
+          <Info className="h-3 w-3" aria-hidden="true" />
+        </span>
+      </div>
       <div className="mt-0.5 num text-sm font-semibold">{value}</div>
     </div>
   );
@@ -905,7 +938,7 @@ function NewsSignalRow({ signal }: { signal: NewsSignal }) {
             {signal.pre_news_trade_score.toFixed(2)}
           </div>
         ) : (
-          <div>
+          <div className="flex-1 overflow-x-auto">
             <div className="num font-semibold text-foreground">
               {signal.relevance_score.toFixed(2)}
             </div>
@@ -976,19 +1009,25 @@ function SuspiciousTradeRow({ trade }: { trade: SuspiciousTrade }) {
   );
 }
 
+type BreakdownChartDatum = BreakdownEntry & {
+  color?: string;
+  label?: string;
+  displayKey?: string;
+};
+
+type BreakdownBarChartProps = {
+  data: BreakdownChartDatum[];
+  loading?: boolean;
+  yTick: (key: string) => string;
+  onBarClick: (row: BreakdownEntry) => void;
+};
+
 function BreakdownBarChart({
   data,
   loading,
   yTick,
   onBarClick,
-}: {
-  data: Array<
-    BreakdownEntry & { color?: string; label?: string; displayKey?: string }
-  >;
-  loading?: boolean;
-  yTick: (key: string) => string;
-  onBarClick: (row: BreakdownEntry) => void;
-}) {
+}: BreakdownBarChartProps) {
   if (loading) return <Skeleton className="h-[200px]" />;
   if (!data.length) return <EmptyState>No data.</EmptyState>;
   return (
@@ -998,6 +1037,11 @@ function BreakdownBarChart({
           data={data}
           layout="vertical"
           margin={{ left: 4, right: 56, top: 4, bottom: 4 }}
+          className="cursor-pointer"
+          onClick={(state: { activePayload?: Array<{ payload?: typeof data[0] }> }) => {
+            const row = state?.activePayload?.[0]?.payload;
+            if (row) onBarClick(row);
+          }}
         >
           <XAxis
             type="number"
@@ -1008,10 +1052,15 @@ function BreakdownBarChart({
           <YAxis
             type="category"
             dataKey="key"
-            tickFormatter={yTick as (v: string) => string}
             width={200}
             interval={0}
-            tick={{ fill: "hsl(var(--muted-foreground))", fontSize: 10 }}
+            tick={
+              <BreakdownYAxisTick
+                data={data}
+                yTick={yTick}
+                onBarClick={onBarClick}
+              />
+            }
             axisLine={false}
             tickLine={false}
           />
@@ -1054,5 +1103,44 @@ function BreakdownBarChart({
         </BarChart>
       </ResponsiveContainer>
     </div>
+  );
+}
+
+function BreakdownYAxisTick({
+  x,
+  y,
+  payload,
+  data,
+  yTick,
+  onBarClick,
+}: {
+  x?: number;
+  y?: number;
+  payload?: { value?: string };
+  data: BreakdownBarChartProps["data"];
+  yTick: (key: string) => string;
+  onBarClick: (row: BreakdownEntry) => void;
+}) {
+  const key = String(payload?.value ?? "");
+  const row = data.find((d) => d.key === key);
+  return (
+    <g
+      transform={`translate(${x ?? 0},${y ?? 0})`}
+      className={row ? "cursor-pointer" : undefined}
+      onClick={() => {
+        if (row) onBarClick(row);
+      }}
+    >
+      <text
+        x={0}
+        y={0}
+        dy={4}
+        textAnchor="end"
+        fill="hsl(var(--muted-foreground))"
+        fontSize={10}
+      >
+        {yTick(key)}
+      </text>
+    </g>
   );
 }

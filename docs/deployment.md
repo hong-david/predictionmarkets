@@ -109,6 +109,42 @@ docker compose -f docker-compose.budget.yml up -d app pipeline
 /api/dashboard/storage-health
 ```
 
+## Public Edge Defaults
+
+The budget compose file binds the app to `127.0.0.1:8000` on the host. Public
+traffic should enter through Caddy on ports `80`/`443`; keep port `8000` closed
+in the EC2 security group.
+
+Copy `deploy/Caddyfile.example` to `/etc/caddy/Caddyfile`, replace
+`yourdomain.com`, and reload Caddy:
+
+```bash
+sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile
+sudo nano /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+The example enables gzip/zstd compression, proxies to the local app, and writes
+rotated access logs to:
+
+```text
+/var/log/caddy/predictionmarkets-access.log
+```
+
+API rate limiting is enabled by default and uses Redis when available. Tune it
+from `.env`:
+
+```text
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_DEFAULT_PER_MINUTE=120
+RATE_LIMIT_EXPENSIVE_PER_MINUTE=30
+RATE_LIMIT_HEALTH_PER_MINUTE=600
+```
+
+Static frontend assets are not app-rate-limited. The lower "expensive" bucket
+applies to search and news endpoints, which can fan out into heavier database or
+provider work.
+
 ## Storage Guardrails
 
 The current local data shape can grow faster than the budget host can store if

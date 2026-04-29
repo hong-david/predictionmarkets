@@ -20,7 +20,7 @@ from typing import Literal
 # Do NOT bump for cosmetic refactors (rename, comment) — that would force a
 # full reclassify across hundreds of thousands of rows for no behaviour
 # change.
-CLASSIFIER_VERSION: int = 1
+CLASSIFIER_VERSION: int = 5
 
 
 # Manipulability prior. The mapping from category/subcategory to one of

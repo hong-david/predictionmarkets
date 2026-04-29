@@ -155,6 +155,62 @@ def _linked_news_after_trade(
     return best
 
 
+def _linked_news_before_trade(
+    news_events: list[dict[str, Any]],
+    trade_ts: datetime,
+) -> tuple[dict[str, Any] | None, float | None]:
+    best: tuple[dict[str, Any], float] | None = None
+    for ev in news_events:
+        first_seen = _parse_ts(ev.get("first_seen_at"))
+        relevance = _f(ev.get("relevance_score")) or 0.0
+        if first_seen is None or first_seen > trade_ts or relevance < 0.55:
+            continue
+        hours = (trade_ts - first_seen).total_seconds() / 3600.0
+        if hours < 0 or hours > 24:
+            continue
+        if best is None or hours < best[1]:
+            best = (ev, hours)
+    if best is None:
+        return None, None
+    return best
+
+
+def _trade_notional_dollars(row: dict[str, Any]) -> float | None:
+    explicit = _f(row.get("trade_dollar_amount"))
+    if explicit is not None:
+        return max(0.0, explicit)
+    count = _f(row.get("count"))
+    if count is None:
+        return None
+    side = str(row.get("taker_side") or "").lower()
+    price = _f(row.get("no_price")) if side == "no" else _f(row.get("yes_price"))
+    if price is None:
+        price = _f(row.get("yes_price"))
+    if price is None:
+        price = _f(row.get("no_price"))
+    if price is None:
+        return None
+    return max(0.0, count * price)
+
+
+def _low_notional_context_cap(
+    dollars: float | None,
+    *,
+    cluster: float,
+) -> float | None:
+    if dollars is None:
+        return None
+    if dollars < 10:
+        return 2.5 if cluster >= 3.0 else 1.5
+    if dollars < 25:
+        return 3.0 if cluster >= 3.0 else 2.0
+    if dollars < 100:
+        return 4.5 if cluster >= 3.0 else 3.5
+    if dollars < 250:
+        return 6.0 if cluster >= 3.0 else None
+    return None
+
+
 def _sibling_abs_moves(
     sibling_snapshots: list[dict[str, Any]],
     trade_ts: datetime,
@@ -247,11 +303,19 @@ def explain_trades_with_context(
             else None
         )
 
-        local_score = (
-            float(local_explanations[i]["score"])
+        local_exp = (
+            local_explanations[i]
             if i < len(local_explanations) and local_explanations[i] is not None
-            else 0.0
+            else None
         )
+        local_score = float(local_exp["score"]) if local_exp is not None else 0.0
+        local_features = (
+            local_exp.get("features", {})
+            if isinstance(local_exp, dict)
+            else {}
+        )
+        local_cluster = _f(local_features.get("cluster")) or 0.0
+        trade_dollars = _trade_notional_dollars(row)
         components = {
             "local_outlier": round(min(2.5, local_score * 0.25), 3),
             "liquidity_impact": 0.0,
@@ -269,7 +333,14 @@ def explain_trades_with_context(
         if size_vs_24h is not None and size_vs_24h >= 0.08:
             components["liquidity_impact"] += min(0.8, size_vs_24h * 4.0)
             reasons.append("large_size_vs_24h_volume")
-        if impact_cents_per_100 is not None and impact_cents_per_100 >= 1.5:
+        meaningful_impact_print = (
+            trade_dollars is None or trade_dollars >= 25.0 or local_cluster >= 3.0
+        )
+        if (
+            impact_cents_per_100 is not None
+            and impact_cents_per_100 >= 1.5
+            and meaningful_impact_print
+        ):
             components["liquidity_impact"] += min(0.8, impact_cents_per_100 / 4.0)
             reasons.append("high_impact_per_contract")
         if spread is not None and spread >= 0.08 and abs_delta >= 0.03:
@@ -310,6 +381,7 @@ def explain_trades_with_context(
             )
 
         linked_news, hours_to_news = _linked_news_after_trade(news_events, ts)
+        prior_news, hours_since_news = _linked_news_before_trade(news_events, ts)
         if (
             linked_news is not None
             and hours_to_news is not None
@@ -349,7 +421,23 @@ def explain_trades_with_context(
             components["priority_context"] = max(components["priority_context"], 0.4)
             reasons.append("near_resolution")
 
-        score = round(min(10.0, sum(components.values())), 3)
+        score = min(10.0, sum(components.values()))
+        context_cap = _low_notional_context_cap(
+            trade_dollars,
+            cluster=local_cluster,
+        )
+        if context_cap is not None and score > context_cap:
+            score = context_cap
+            reasons.append("low_notional_context_cap")
+
+        post_news_discount_multiplier: float | None = None
+        if prior_news is not None and linked_news is None and hours_since_news is not None:
+            post_news_discount_multiplier = 0.65 if hours_since_news <= 6 else 0.8
+            if score > 0:
+                score *= post_news_discount_multiplier
+                reasons.append("post_news_move_discount")
+
+        score = round(min(10.0, score), 3)
         out.append(
             {
                 "score": score,
@@ -369,11 +457,20 @@ def explain_trades_with_context(
                     "impact_cents_per_100_contracts": round(impact_cents_per_100, 4)
                     if impact_cents_per_100 is not None
                     else None,
+                    "trade_dollar_amount": round(trade_dollars, 2)
+                    if trade_dollars is not None
+                    else None,
+                    "local_cluster": round(local_cluster, 3),
+                    "context_score_cap": context_cap,
+                    "post_news_discount_multiplier": post_news_discount_multiplier,
                     "peer_sample_size": peer_baseline.sample_size
                     if peer_baseline
                     else 0,
                     "hours_to_linked_news": round(hours_to_news, 3)
                     if hours_to_news is not None
+                    else None,
+                    "hours_since_linked_news": round(hours_since_news, 3)
+                    if hours_since_news is not None
                     else None,
                     "sibling_abs_move_median_10m": round(sibling_median, 4)
                     if sibling_median is not None

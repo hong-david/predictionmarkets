@@ -122,6 +122,7 @@ def _notional_multiplier(
     dollars: float | None,
     *,
     cluster: float,
+    cluster_is_sudden: bool,
 ) -> tuple[float, list[str]]:
     """Scale single-print unusualness by dollars at risk.
 
@@ -132,14 +133,17 @@ def _notional_multiplier(
         return 1.0, []
 
     reasons: list[str] = []
-    if dollars < 25:
-        multiplier = 0.2
+    if dollars < 10:
+        multiplier = 0.03
+        reasons.append("low_notional_discount")
+    elif dollars < 25:
+        multiplier = 0.05
         reasons.append("low_notional_discount")
     elif dollars < 100:
-        multiplier = 0.45
+        multiplier = 0.20
         reasons.append("low_notional_discount")
     elif dollars < 250:
-        multiplier = 0.7
+        multiplier = 0.45
         reasons.append("modest_notional_discount")
     elif dollars < 1_000:
         multiplier = 1.0
@@ -150,11 +154,14 @@ def _notional_multiplier(
         multiplier = 1.3
         reasons.append("large_notional")
 
-    if dollars < 100 and cluster >= 1.5:
-        multiplier = max(multiplier, 0.8)
+    if cluster_is_sudden and dollars < 25 and cluster >= 3.0:
+        multiplier = max(multiplier, 0.35)
         reasons.append("small_bet_cluster")
-    if dollars < 250 and cluster >= 2.5:
-        multiplier = max(multiplier, 1.0)
+    elif cluster_is_sudden and dollars < 100 and cluster >= 3.0:
+        multiplier = max(multiplier, 0.55)
+        reasons.append("small_bet_cluster")
+    elif cluster_is_sudden and dollars < 250 and cluster >= 3.0:
+        multiplier = max(multiplier, 0.75)
         if "small_bet_cluster" not in reasons:
             reasons.append("small_bet_cluster")
 
@@ -235,6 +242,7 @@ def explain_trades_against_window(
         notional_multiplier, notional_reasons = _notional_multiplier(
             dollars,
             cluster=cluster,
+            cluster_is_sudden=sudden_cluster,
         )
         weighted_raw = raw * notional_multiplier
         score = round(min(10.0, (weighted_raw / 4.5) * 10.0), 3)
