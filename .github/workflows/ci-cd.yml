@@ -114,6 +114,11 @@ jobs:
         run: |
           set -euo pipefail
           cd ~/predictionmarkets
+          if [ -e docker-compose.tunnel.yml ] && ! git ls-files --error-unmatch docker-compose.tunnel.yml >/dev/null 2>&1; then
+            backup="$HOME/docker-compose.tunnel.yml.ec2-untracked.$(date -u +%Y%m%d%H%M%S)"
+            mv docker-compose.tunnel.yml "$backup"
+            echo "Backed up untracked docker-compose.tunnel.yml to $backup"
+          fi
           git pull --ff-only origin main
           docker compose -f docker-compose.budget.yml build app pipeline
           docker compose -f docker-compose.budget.yml run --rm app python -m alembic upgrade head
