@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -97,7 +98,7 @@ router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
-_DASHBOARD_CACHE_TTL_SEC = 30.0
+_DASHBOARD_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_CACHE_TTL_SEC", "300"))
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
@@ -202,6 +203,31 @@ def _probability_float(value: object) -> float | None:
     return min(1.0, max(0.0, out))
 
 
+def _metric_probability_float(
+    *,
+    last_price_cents: int | None,
+    yes_bid_cents: int | None,
+    yes_ask_cents: int | None,
+) -> float | None:
+    if last_price_cents is not None:
+        return _probability_float(float(last_price_cents) / 100.0)
+    if yes_bid_cents is not None and yes_ask_cents is not None:
+        return _probability_float((float(yes_bid_cents) + float(yes_ask_cents)) / 200.0)
+    if yes_bid_cents is not None:
+        return _probability_float(float(yes_bid_cents) / 100.0)
+    if yes_ask_cents is not None:
+        return _probability_float(float(yes_ask_cents) / 100.0)
+    return None
+
+
+def _metric_notional_estimate(
+    *, price: float | None, volume_24h_contracts: int | None
+) -> float | None:
+    if price is None or volume_24h_contracts is None:
+        return None
+    return max(0.0, float(price) * float(volume_24h_contracts))
+
+
 def _reason_codes_for_market_pks(
     db: Session, market_pks: list[int]
 ) -> dict[int, list[str]]:
@@ -233,6 +259,7 @@ def _serialize_market_row(
     evidence_score: float | None = None,
     urgency_score: float | None = None,
     top_trade_flag_score: float | None = None,
+    top_news_trade_score: float | None = None,
     storage_tier: str | None = None,
     retention_score: int | None = None,
 ) -> dict:
@@ -271,6 +298,9 @@ def _serialize_market_row(
         else urgency_score_0_100(prior_rank=prk, anomaly_count=ac),
         "top_trade_flag_score": float(top_trade_flag_score)
         if top_trade_flag_score is not None
+        else None,
+        "top_news_trade_score": float(top_news_trade_score)
+        if top_news_trade_score is not None
         else None,
         "reasons": list(reason_codes or []),
         "event_market_count": event_market_count,
@@ -1461,32 +1491,6 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
             .limit(limit)
             .all()
         )
-        pks = [int(market.id) for market, _metric in rows]
-        latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
-        trade_dollars: dict[int, float] = {}
-        if pks:
-            trade_price = case(
-                (
-                    func.lower(func.coalesce(Trade.taker_side, "")) == "no",
-                    Trade.no_price_dollars,
-                ),
-                else_=Trade.yes_price_dollars,
-            )
-            trade_dollars = {
-                int(market_pk): float(dollars or 0.0)
-                for market_pk, dollars in (
-                    db.query(
-                        Trade.market_pk,
-                        func.sum(
-                            func.coalesce(Trade.count_fp, 0)
-                            * func.coalesce(trade_price, 0)
-                        ).label("trade_dollar_volume"),
-                    )
-                    .filter(Trade.market_pk.in_(pks))
-                    .group_by(Trade.market_pk)
-                    .all()
-                )
-            }
         return {
             "count": len(rows),
             "markets": [
@@ -1495,16 +1499,17 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                     trade_count=int(metric.trade_count or 0),
                     anomaly_count=int(metric.anomaly_count or 0),
                     last_price=(
-                        float(metric.last_price_cents) / 100.0
-                        if metric.last_price_cents is not None
-                        else latest_by_pk.get(market.id, {}).get("last_price")
+                        price := _metric_probability_float(
+                            last_price_cents=metric.last_price_cents,
+                            yes_bid_cents=metric.yes_bid_cents,
+                            yes_ask_cents=metric.yes_ask_cents,
+                        )
                     ),
-                    volume_24h=(
-                        float(metric.volume_24h_contracts)
-                        if metric.volume_24h_contracts is not None
-                        else latest_by_pk.get(market.id, {}).get("volume_24h")
+                    volume_24h=metric.volume_24h_contracts,
+                    trade_dollar_volume=_metric_notional_estimate(
+                        price=price,
+                        volume_24h_contracts=metric.volume_24h_contracts,
                     ),
-                    trade_dollar_volume=trade_dollars.get(market.id),
                     evidence_score=float(metric.evidence_score or 0.0),
                     urgency_score=float(metric.urgency_score or 0.0),
                     storage_tier=metric.storage_tier,
@@ -2091,10 +2096,10 @@ def list_markets(
         default="news_linked_trade_flag",
         description=(
             "trades_desc | trades_asc | priority | surveillance_urgency | "
-            "top_trade_flag | news_linked_trade_flag | recent | title | anomalies — "
-            "`news_linked_trade_flag`: current trade flag score among markets "
-            "with retained related news; "
-            "`surveillance_urgency`: zero `anomaly_count` → flat floor; else "
+            "top_trade_flag | news_linked_trade_flag | recent | title | anomalies - "
+            "`news_linked_trade_flag`: news/trade signal score first, then "
+            "current trade flag score; "
+            "`surveillance_urgency`: zero `anomaly_count` -> flat floor; else "
             "`(8+0.4*(prior_rank+1))*ln(1+count)` so evidence count dominates watch priority."
         ),
     ),
@@ -2185,23 +2190,6 @@ def _list_markets_uncached(
         filters.append(Market.status == status)
     if data_only:
         filters.append(exists().where(Trade.market_pk == Market.id))
-    if sort == "news_linked_trade_flag":
-        filters.extend(
-            [
-                exists().where(
-                    and_(
-                        TradeFlag.market_pk == Market.id,
-                        TradeFlag.scorer_version == TRADE_SCORER_VERSION,
-                    )
-                ),
-                exists().where(
-                    and_(
-                        NewsEvent.market_pk == Market.id,
-                        NewsEvent.relevance_score >= 0.35,
-                    )
-                ),
-            ]
-        )
 
     total_filters = [] if include_unhydrated else _hydrated_market_filters()
     total_filters.extend(_market_scope_filters(market_scope))
@@ -2245,6 +2233,16 @@ def _list_markets_uncached(
         .group_by(TradeFlag.market_pk)
         .subquery()
     )
+    top_news_trade_sq = (
+        select(
+            NewsEvent.market_pk,
+            func.max(NewsEvent.pre_news_trade_score).label("top_news_trade_score"),
+        )
+        .join(candidate_sq, candidate_sq.c.id == NewsEvent.market_pk)
+        .where(NewsEvent.relevance_score >= 0.35)
+        .group_by(NewsEvent.market_pk)
+        .subquery()
+    )
     base = (
         db.query(
             Market,
@@ -2253,11 +2251,15 @@ def _list_markets_uncached(
             func.coalesce(top_trade_flag_sq.c.top_score, 0.0).label(
                 "top_trade_flag_score"
             ),
+            func.coalesce(top_news_trade_sq.c.top_news_trade_score, 0.0).label(
+                "top_news_trade_score"
+            ),
         )
         .join(candidate_sq, candidate_sq.c.id == Market.id)
         .outerjoin(trade_count_sq, trade_count_sq.c.market_pk == Market.id)
         .outerjoin(anomaly_count_sq, anomaly_count_sq.c.market_pk == Market.id)
         .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
+        .outerjoin(top_news_trade_sq, top_news_trade_sq.c.market_pk == Market.id)
     )
 
     sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["top_trade_flag"])
@@ -2270,6 +2272,12 @@ def _list_markets_uncached(
         base = base.order_by(coalesced.asc() if sort_dir == "asc" else coalesced.desc())
     elif sort_key == "anomaly_count":
         base = base.order_by(func.coalesce(anomaly_count_sq.c.c, 0).desc())
+    elif sort == "news_linked_trade_flag":
+        base = base.order_by(
+            func.coalesce(top_news_trade_sq.c.top_news_trade_score, 0.0).desc(),
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
+            Market.updated_at.desc(),
+        )
     elif sort_key == "top_trade_flag_score":
         base = base.order_by(
             func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
@@ -2326,6 +2334,7 @@ def _list_markets_uncached(
             last_price=latest_by_pk.get(r[0].id, {}).get("last_price"),
             volume_24h=latest_by_pk.get(r[0].id, {}).get("volume_24h"),
             top_trade_flag_score=r.top_trade_flag_score,
+            top_news_trade_score=r.top_news_trade_score,
             event_market_count=event_counts.get(r[0].event_id)
             if r[0].event_id
             else None,
@@ -2371,6 +2380,16 @@ def _list_markets_from_metric_projection(
         .group_by(TradeFlag.market_pk)
         .subquery()
     )
+    top_news_trade_sq = (
+        select(
+            NewsEvent.market_pk,
+            func.max(NewsEvent.pre_news_trade_score).label("top_news_trade_score"),
+        )
+        .join(candidate_sq, candidate_sq.c.id == NewsEvent.market_pk)
+        .where(NewsEvent.relevance_score >= 0.35)
+        .group_by(NewsEvent.market_pk)
+        .subquery()
+    )
     base = (
         db.query(
             Market,
@@ -2381,7 +2400,12 @@ def _list_markets_from_metric_projection(
             func.coalesce(top_trade_flag_sq.c.top_score, 0.0).label(
                 "top_trade_flag_score"
             ),
+            func.coalesce(top_news_trade_sq.c.top_news_trade_score, 0.0).label(
+                "top_news_trade_score"
+            ),
             MarketMetric.last_price_cents,
+            MarketMetric.yes_bid_cents,
+            MarketMetric.yes_ask_cents,
             MarketMetric.volume_24h_contracts,
             MarketMetric.storage_tier,
             MarketMetric.retention_score,
@@ -2389,6 +2413,7 @@ def _list_markets_from_metric_projection(
         .join(candidate_sq, candidate_sq.c.id == Market.id)
         .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
         .outerjoin(top_trade_flag_sq, top_trade_flag_sq.c.market_pk == Market.id)
+        .outerjoin(top_news_trade_sq, top_news_trade_sq.c.market_pk == Market.id)
     )
 
     sort_key, sort_dir = _SORT_OPTIONS.get(sort, _SORT_OPTIONS["top_trade_flag"])
@@ -2398,6 +2423,12 @@ def _list_markets_from_metric_projection(
         )
     elif sort_key == "anomaly_count":
         base = base.order_by(anomaly_count_col.desc())
+    elif sort == "news_linked_trade_flag":
+        base = base.order_by(
+            func.coalesce(top_news_trade_sq.c.top_news_trade_score, 0.0).desc(),
+            func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
+            Market.updated_at.desc(),
+        )
     elif sort_key == "top_trade_flag_score":
         base = base.order_by(
             func.coalesce(top_trade_flag_sq.c.top_score, 0.0).desc(),
@@ -2413,9 +2444,6 @@ def _list_markets_from_metric_projection(
         base = base.order_by(_prior_rank().desc(), trade_count_col.desc())
 
     rows = base.offset(offset).limit(limit).all()
-    pks = [int(row[0].id) for row in rows]
-    latest_fallback = _latest_snapshot_values_for_market_pks(db, pks)
-
     event_ids = [row[0].event_id for row in rows if row[0].event_id]
     event_counts = {}
     if event_ids:
@@ -2433,34 +2461,30 @@ def _list_markets_from_metric_projection(
     items = []
     for row in rows:
         market = row[0]
-        metric_last_price = (
-            float(row.last_price_cents) / 100.0
-            if row.last_price_cents is not None
-            else None
+        metric_last_price = _metric_probability_float(
+            last_price_cents=row.last_price_cents,
+            yes_bid_cents=row.yes_bid_cents,
+            yes_ask_cents=row.yes_ask_cents,
         )
         metric_volume = (
             float(row.volume_24h_contracts)
             if row.volume_24h_contracts is not None
             else None
         )
-        fallback = latest_fallback.get(market.id, {})
         items.append(
             _serialize_market_row(
                 market,
                 trade_count=int(row.trade_count or 0),
                 anomaly_count=int(row.anomaly_count or 0),
-                last_price=metric_last_price
-                if metric_last_price is not None
-                else fallback.get("last_price"),
-                volume_24h=metric_volume
-                if metric_volume is not None
-                else fallback.get("volume_24h"),
+                last_price=metric_last_price,
+                volume_24h=metric_volume,
                 event_market_count=event_counts.get(market.event_id)
                 if market.event_id
                 else None,
                 evidence_score=float(row.metric_evidence_score or 0.0),
                 urgency_score=float(row.metric_urgency_score or 0.0),
                 top_trade_flag_score=float(row.top_trade_flag_score or 0.0),
+                top_news_trade_score=float(row.top_news_trade_score or 0.0),
                 storage_tier=row.storage_tier,
                 retention_score=int(row.retention_score or 0)
                 if row.retention_score is not None

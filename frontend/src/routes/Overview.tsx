@@ -306,7 +306,7 @@ export default function OverviewPage() {
         <Card className="h-[32rem] overflow-hidden flex flex-col">
           <CardHeader
             title="Most traded markets"
-            subtitle="Active/open markets with the most retained execution prints in the recent trade sample, plus estimated dollars paid for those contracts."
+            subtitle="Active/open markets with the most retained execution prints, plus a fast 24h dollar estimate from latest price and recent volume."
           />
           <div className="flex-1 overflow-x-auto">
             {overview.isPending ? (
@@ -321,7 +321,7 @@ export default function OverviewPage() {
                   <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
                     <th className="text-left px-4 py-2 font-medium">Market</th>
                     <th className="text-right px-4 py-2 font-medium">Trades</th>
-                    <th className="text-right px-4 py-2 font-medium">Total $ volume</th>
+                    <th className="text-right px-4 py-2 font-medium">24h $ est.</th>
                   </tr>
                 </thead>
                 <tbody>

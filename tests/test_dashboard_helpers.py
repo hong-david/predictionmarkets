@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from app.api.routes.dashboard import _probability_float
+from app.api.routes.dashboard import _metric_probability_float, _probability_float
 from app.services.market_lifecycle import market_lifecycle
 
 
@@ -104,3 +104,22 @@ def test_probability_values_are_clamped_for_chart_payloads() -> None:
     assert _probability_float(1.4) == 1.0
     assert _probability_float(0.42) == 0.42
     assert _probability_float(None) is None
+
+
+def test_metric_probability_uses_latest_or_bid_ask_midpoint() -> None:
+    assert (
+        _metric_probability_float(
+            last_price_cents=42,
+            yes_bid_cents=30,
+            yes_ask_cents=40,
+        )
+        == 0.42
+    )
+    assert (
+        _metric_probability_float(
+            last_price_cents=None,
+            yes_bid_cents=30,
+            yes_ask_cents=40,
+        )
+        == 0.35
+    )

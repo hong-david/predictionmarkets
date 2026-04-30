@@ -13,7 +13,7 @@ import { categoryDisplay, priorHelp, priorShort } from "@/lib/labels";
 import { cn, fmtInt, fmtPrice } from "@/lib/utils";
 
 const SORT_OPTIONS = [
-  { value: "news_linked_trade_flag", label: "News-linked trade flags" },
+  { value: "news_linked_trade_flag", label: "News/trade signals first" },
   { value: "top_trade_flag", label: "Highest trade flag" },
   {
     value: "surveillance_urgency",

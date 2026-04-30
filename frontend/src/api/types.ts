@@ -85,6 +85,8 @@ export interface MarketRow {
   urgency_score: number;
   /** Highest durable per-trade flag score seen for this market, if any. */
   top_trade_flag_score?: number | null;
+  /** Highest retained news/trade timing score linked to this market, if any. */
+  top_news_trade_score?: number | null;
   /** Deduped snake_case slugs from materialized `reasons[]` on alert history rows. */
   reasons: string[];
   /** Number of hydrated contracts sharing the same Kalshi event_ticker. */
