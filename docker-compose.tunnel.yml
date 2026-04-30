@@ -1,0 +1,7 @@
+# Optional local-dev override for SSH tunneling to EC2 Postgres.
+# Use with:
+# docker compose -f docker-compose.budget.yml -f docker-compose.tunnel.yml up -d postgres
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
