@@ -68,6 +68,7 @@ services:
       - -m
       - scripts.run_pipeline
       - --skip-api
+      - --no-gdelt
       - --poll-interval-seconds
       - "900"
       - --poll-batch-size

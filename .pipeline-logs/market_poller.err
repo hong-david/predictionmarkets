@@ -1010,3 +1010,227 @@ Traceback (most recent call last):
   File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
     raise mapped_exc(message) from exc
 httpx.ConnectError: [WinError 10065] A socket operation was attempted to an unreachable host
+Traceback (most recent call last):
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
+    self.dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        cursor, str_statement, effective_parameters, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 952, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\psycopg\cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UniqueViolation: duplicate key value violates unique constraint "ix_markets_market_id"
+DETAIL:  Key (market_id)=(KXEREDIVISIEGAME-26MAY03SPAGAE-TIE) already exists.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 236, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 216, in main
+    run_cycle(
+    ~~~~~~~~~^
+        status=status,
+        ^^^^^^^^^^^^^^
+    ...<5 lines>...
+        hydrate_unknown_sleep=args.hydrate_unknown_sleep,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 93, in run_cycle
+    result = ingest_markets_payload(db, {"markets": batch})
+  File "C:\Users\david\workspace\predictionmarkets\app\services\market_ingestor.py", line 163, in ingest_markets_payload
+    db.flush()
+    ~~~~~~~~^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4331, in flush
+    self._flush(objects)
+    ~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4466, in _flush
+    with util.safe_reraise():
+         ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\util\langhelpers.py", line 121, in __exit__
+    raise exc_value.with_traceback(exc_tb)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4427, in _flush
+    flush_context.execute()
+    ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py", line 466, in execute
+    rec.execute(self)
+    ~~~~~~~~~~~^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py", line 642, in execute
+    util.preloaded.orm_persistence.save_obj(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self.mapper,
+        ^^^^^^^^^^^^
+        uow.states_for_mapper_hierarchy(self.mapper, False, False),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        uow,
+        ^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\persistence.py", line 93, in save_obj
+    _emit_insert_statements(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        base_mapper,
+        ^^^^^^^^^^^^
+    ...<3 lines>...
+        insert,
+        ^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\orm\persistence.py", line 1233, in _emit_insert_statements
+    result = connection.execute(
+        statement,
+        params,
+        execution_options=execution_options,
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1419, in execute
+    return meth(
+        self,
+        distilled_parameters,
+        execution_options or NO_OPTIONS,
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 527, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self, distilled_params, execution_options
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1641, in _execute_clauseelement
+    ret = self._execute_context(
+        dialect,
+    ...<8 lines>...
+        cache_hit=cache_hit,
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1846, in _execute_context
+    return self._exec_single_context(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        dialect, context, statement, parameters
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1986, in _exec_single_context
+    self._handle_dbapi_exception(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        e, str_statement, effective_parameters, cursor, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2363, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1967, in _exec_single_context
+    self.dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        cursor, str_statement, effective_parameters, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\sqlalchemy\engine\default.py", line 952, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\psycopg\cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+sqlalchemy.exc.IntegrityError: (psycopg.errors.UniqueViolation) duplicate key value violates unique constraint "ix_markets_market_id"
+DETAIL:  Key (market_id)=(KXEREDIVISIEGAME-26MAY03SPAGAE-TIE) already exists.
+[SQL: INSERT INTO markets (platform, market_id, event_id, ticker, title, subtitle, status, open_time, close_time, category, subcategory, manipulability_prior, classifier_layer, classifier_rule, classifier_confidence, classifier_version) VALUES (%(platform)s::VARCHAR, %(market_id)s::VARCHAR, %(event_id)s::VARCHAR, %(ticker)s::VARCHAR, %(title)s::VARCHAR, %(subtitle)s::VARCHAR, %(status)s::VARCHAR, %(open_time)s::TIMESTAMP WITH TIME ZONE, %(close_time)s::TIMESTAMP WITH TIME ZONE, %(category)s::VARCHAR, %(subcategory)s::VARCHAR, %(manipulability_prior)s::VARCHAR, %(classifier_layer)s::VARCHAR, %(classifier_rule)s::VARCHAR, %(classifier_confidence)s::VARCHAR, %(classifier_version)s::INTEGER) RETURNING markets.id, markets.created_at, markets.updated_at]
+[parameters: {'platform': 'kalshi', 'market_id': 'KXEREDIVISIEGAME-26MAY03SPAGAE-TIE', 'event_id': 'KXEREDIVISIEGAME-26MAY03SPAGAE', 'ticker': 'KXEREDIVISIEGAME-26MAY03SPAGAE-TIE', 'title': 'Sparta vs GA Eagles Winner?', 'subtitle': 'Tie', 'status': 'active', 'open_time': datetime.datetime(2026, 4, 30, 0, 40, tzinfo=datetime.timezone.utc), 'close_time': datetime.datetime(2026, 5, 17, 14, 45, tzinfo=datetime.timezone.utc), 'category': None, 'subcategory': None, 'manipulability_prior': None, 'classifier_layer': None, 'classifier_rule': None, 'classifier_confidence': None, 'classifier_version': None}]
+(Background on this error at: https://sqlalche.me/e/20/gkpj)
+Traceback (most recent call last):
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_transports\default.py", line 101, in map_httpcore_exceptions
+    yield
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_transports\default.py", line 250, in handle_request
+    resp = self._pool.handle_request(req)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 256, in handle_request
+    raise exc from None
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_sync\connection_pool.py", line 236, in handle_request
+    response = connection.handle_request(
+        pool_request.request
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_sync\connection.py", line 101, in handle_request
+    raise exc
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_sync\connection.py", line 78, in handle_request
+    stream = self._connect(request)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_sync\connection.py", line 156, in _connect
+    stream = stream.start_tls(**kwargs)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_backends\sync.py", line 154, in start_tls
+    with map_exceptions(exc_map):
+         ~~~~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\david\AppData\Local\Python\pythoncore-3.14-64\Lib\contextlib.py", line 162, in __exit__
+    self.gen.throw(value)
+    ~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpcore\_exceptions.py", line 14, in map_exceptions
+    raise to_exc(exc) from exc
+httpcore.ConnectError: [WinError 10054] An existing connection was forcibly closed by the remote host
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 236, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 216, in main
+    run_cycle(
+    ~~~~~~~~~^
+        status=status,
+        ^^^^^^^^^^^^^^
+    ...<5 lines>...
+        hydrate_unknown_sleep=args.hydrate_unknown_sleep,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\scripts\poll_markets.py", line 91, in run_cycle
+    for batch in chunked(stream, batch_size):
+                 ~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\app\services\market_ingestor.py", line 62, in chunked
+    batch = list(islice(it, size))
+  File "C:\Users\david\workspace\predictionmarkets\app\services\kalshi_rest.py", line 99, in iter_markets
+    page = self.get_markets(limit=limit, cursor=cursor, status=status)
+  File "C:\Users\david\workspace\predictionmarkets\app\services\kalshi_rest.py", line 75, in get_markets
+    response = client.get(url, params=params)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 1053, in get
+    return self.request(
+           ~~~~~~~~~~~~^
+        "GET",
+        ^^^^^^
+    ...<7 lines>...
+        extensions=extensions,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 825, in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 914, in send
+    response = self._send_handling_auth(
+        request,
+    ...<2 lines>...
+        history=[],
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 942, in _send_handling_auth
+    response = self._send_handling_redirects(
+        request,
+        follow_redirects=follow_redirects,
+        history=history,
+    )
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 979, in _send_handling_redirects
+    response = self._send_single_request(request)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_client.py", line 1014, in _send_single_request
+    response = transport.handle_request(request)
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_transports\default.py", line 249, in handle_request
+    with map_httpcore_exceptions():
+         ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\david\AppData\Local\Python\pythoncore-3.14-64\Lib\contextlib.py", line 162, in __exit__
+    self.gen.throw(value)
+    ~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\david\workspace\predictionmarkets\.venv\Lib\site-packages\httpx\_transports\default.py", line 118, in map_httpcore_exceptions
+    raise mapped_exc(message) from exc
+httpx.ConnectError: [WinError 10054] An existing connection was forcibly closed by the remote host

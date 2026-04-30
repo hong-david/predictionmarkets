@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     opensearch_index_prefix: str = "predictionmarkets"
     opensearch_timeout_sec: float = 2.0
     search_postgres_profile_limit: int = 12000
+    news_user_agent: str = (
+        "InformedPredictions/1.0 "
+        "(public prediction-market surveillance; contact: admin@informedpredictions.com)"
+    )
 
     # Hot raw retention defaults. These are intentionally short because the
     # durable artifact is a promoted evidence bundle, not every Kalshi tick.

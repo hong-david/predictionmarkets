@@ -145,6 +145,11 @@ Static frontend assets are not app-rate-limited. The lower "expensive" bucket
 applies to search and news endpoints, which can fan out into heavier database or
 provider work.
 
+The budget pipeline disables GDELT by default (`--no-gdelt`) and leans on
+RSS/official APIs. GDELT's public endpoint can rate-limit broad unattended
+sweeps from cloud hosts. Set a descriptive `NEWS_USER_AGENT` in `.env` so
+official feeds such as SEC/BLS can identify the project and contact owner.
+
 ## Storage Guardrails
 
 The current local data shape can grow faster than the budget host can store if

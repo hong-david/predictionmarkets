@@ -11,6 +11,7 @@ import httpx
 from sqlalchemy import case, or_
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.models import Market, MarketNewsProfile, NewsArticle
 from app.services.news_correlation import (
     NEWS_PROFILE_EXCLUDED_CATEGORIES,
@@ -119,7 +120,7 @@ def fetch_gdelt_articles(
         response = client.get(
             GDELT_DOC_URL,
             params=params,
-            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+            headers={"User-Agent": settings.news_user_agent},
         )
         response.raise_for_status()
         data = response.json()

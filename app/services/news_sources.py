@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 
+from app.core.config import settings
 from app.services.news_correlation import NormalizedArticle
 from app.services.news_gdelt import tokenize_for_gdelt
 from app.services.news_source_registry import (
@@ -25,6 +26,10 @@ from app.services.news_source_registry import (
 
 
 DEFAULT_RSS_FEEDS: tuple[str, ...] = default_rss_feed_urls()
+NEWS_HEADERS = {
+    "User-Agent": settings.news_user_agent,
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+}
 
 _RSS_NAMESPACES = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -210,7 +215,7 @@ def fetch_rss_feed_articles(
     """Fetch one RSS/Atom feed and normalize headline/summary metadata."""
 
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        response = client.get(feed_url, headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"})
+        response = client.get(feed_url, headers=NEWS_HEADERS)
         response.raise_for_status()
     return parse_feed_articles(
         response.text,
@@ -295,7 +300,7 @@ def fetch_federal_register_articles(
         response = client.get(
             "https://www.federalregister.gov/api/v1/documents.json",
             params=params,
-            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+            headers=NEWS_HEADERS,
         )
         response.raise_for_status()
         data = response.json()
@@ -363,7 +368,7 @@ def fetch_congress_articles(
         response = client.get(
             "https://api.congress.gov/v3/bill",
             params=params,
-            headers={"User-Agent": "predictionmarkets-news-ingestor/1.0"},
+            headers=NEWS_HEADERS,
         )
         response.raise_for_status()
         data = response.json()
