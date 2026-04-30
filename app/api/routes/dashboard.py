@@ -2158,6 +2158,7 @@ def _list_markets_uncached(
     offset: int,
     db: Session,
 ) -> dict:
+    metrics_available = _market_metrics_available(db)
     filters = []
     if not include_unhydrated:
         filters.extend(_hydrated_market_filters())
@@ -2189,12 +2190,32 @@ def _list_markets_uncached(
     if status:
         filters.append(Market.status == status)
     if data_only:
-        filters.append(exists().where(Trade.market_pk == Market.id))
+        if metrics_available:
+            filters.append(
+                exists().where(
+                    and_(
+                        MarketMetric.market_pk == Market.id,
+                        MarketMetric.trade_count > 0,
+                    )
+                )
+            )
+        else:
+            filters.append(exists().where(Trade.market_pk == Market.id))
 
     total_filters = [] if include_unhydrated else _hydrated_market_filters()
     total_filters.extend(_market_scope_filters(market_scope))
     if data_only:
-        total_filters.append(exists().where(Trade.market_pk == Market.id))
+        if metrics_available:
+            total_filters.append(
+                exists().where(
+                    and_(
+                        MarketMetric.market_pk == Market.id,
+                        MarketMetric.trade_count > 0,
+                    )
+                )
+            )
+        else:
+            total_filters.append(exists().where(Trade.market_pk == Market.id))
     total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
     filtered = (
         db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
@@ -2202,7 +2223,7 @@ def _list_markets_uncached(
         else total
     )
 
-    if _market_metrics_available(db):
+    if metrics_available:
         return _list_markets_from_metric_projection(
             db=db,
             filters=filters,
