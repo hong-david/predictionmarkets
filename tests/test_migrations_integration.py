@@ -36,6 +36,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _hot_storage_decision():
+    from app.services.retention import StorageDecision
+
+    return StorageDecision(
+        tier="hot",
+        score=50,
+        process_realtime=True,
+        store_raw_hot=True,
+        raw_ttl_hours=168,
+        store_features=True,
+        store_case_evidence=False,
+        sample_rate=1.0,
+        reasons=("test_override",),
+    )
+
+
 @pytest.fixture(scope="module")
 def engine():
     eng = create_engine(settings.database_url, future=True)
@@ -165,7 +181,8 @@ def test_lazy_upsert_creates_stub_market(engine):
     }
 
     with patch(
-        "app.services.kalshi_ws._raw_tape_allowed", return_value=True
+        "app.services.kalshi_ws._raw_tape_decision",
+        return_value=_hot_storage_decision(),
     ):
         handle_trade_message(payload)
 
@@ -195,7 +212,8 @@ def test_lazy_upsert_is_idempotent_under_repeated_calls(engine):
 
     for i in range(2):
         with patch(
-            "app.services.kalshi_ws._raw_tape_allowed", return_value=True
+            "app.services.kalshi_ws._raw_tape_decision",
+            return_value=_hot_storage_decision(),
         ):
             handle_trade_message(
                 {
