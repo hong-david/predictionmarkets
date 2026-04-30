@@ -425,9 +425,9 @@ alerts, trade flags, local trade outlier scores, and news timing.
 
 The highest priority bucket is intentionally narrow. It includes markets such as
 Fed decision windows, judicial rulings, mergers, FDA-style corporate events,
-combat-sports winners, and explicit player/first-event props. Broad macro data,
-scheduled earnings, and team outcomes generally sit one level lower so the top
-watchlist stays reviewable.
+and combat-sports winners. Broad macro data, scheduled earnings, player props,
+and major sports outcomes generally sit lower so the top watchlist stays
+reviewable.
 
 Scores are also separated:
 

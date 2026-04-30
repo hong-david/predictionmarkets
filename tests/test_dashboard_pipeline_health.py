@@ -122,3 +122,35 @@ def test_component_from_heartbeat_prefers_recent_heartbeat() -> None:
     assert payload["source"] == "heartbeat"
     assert payload["count"] == 12
     assert payload["detail"] == "Last batch wrote 12 flags."
+
+
+def test_component_from_heartbeat_can_treat_zero_success_as_healthy() -> None:
+    now = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    heartbeat = PipelineHeartbeat(
+        key="quote_book_anomalies",
+        label="Quote/book alerts",
+        component_type="materializer",
+        status="healthy",
+        detail="Scanned 50 markets; created 0.",
+        count=0,
+        last_heartbeat_at=now - timedelta(minutes=2),
+        last_success_at=now - timedelta(minutes=2),
+        last_error="old transient error",
+    )
+
+    payload = _component_from_heartbeat(
+        heartbeat,
+        key="quote_book_anomalies",
+        label="Quote/book alerts",
+        description="Quote/book alerts",
+        db_latest_at=None,
+        db_count=0,
+        db_detail="No alert rows.",
+        stale_after=timedelta(hours=24),
+        now=now,
+        zero_count_is_healthy=True,
+    )
+
+    assert payload["status"] == "healthy"
+    assert payload["count"] == 0
+    assert payload["last_error"] is None

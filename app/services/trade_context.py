@@ -43,6 +43,15 @@ class PeerBaseline:
     sample_size: int
 
 
+_PUBLIC_SPORTS_MARKETS: set[tuple[str, str]] = {
+    ("sports_outcome", "major_league_game"),
+    ("sports_outcome", "tennis_match"),
+    ("sports_outcome", "soccer_match"),
+    ("sports_derivative", "spread"),
+    ("sports_derivative", "total"),
+}
+
+
 def _aware(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
@@ -191,6 +200,11 @@ def _trade_notional_dollars(row: dict[str, Any]) -> float | None:
     if price is None:
         return None
     return max(0.0, count * price)
+
+
+def _is_public_sports_market(market: MarketContext) -> bool:
+    key = (str(market.category or ""), str(market.subcategory or ""))
+    return key in _PUBLIC_SPORTS_MARKETS
 
 
 def _low_notional_context_cap(
@@ -422,6 +436,9 @@ def explain_trades_with_context(
             reasons.append("near_resolution")
 
         score = min(10.0, sum(components.values()))
+        if _is_public_sports_market(market) and score > 0:
+            score *= 0.75
+            reasons.append("public_sports_market_discount")
         context_cap = _low_notional_context_cap(
             trade_dollars,
             cluster=local_cluster,

@@ -11,6 +11,7 @@ import { humanizeAnomalyReason } from "@/lib/reasonPhrases";
 import { Card, CardBody, CardHeader } from "@/components/Card";
 import { type ChartNewsEvent, PriceChart } from "@/components/PriceChart";
 import { EmptyState, Skeleton } from "@/components/StatusBits";
+import { kalshiMarketUrl } from "@/lib/kalshi";
 import {
   fmtAgo,
   fmtDollars,
@@ -103,6 +104,7 @@ export default function MarketDetailPage() {
     () => buildChartNewsEvents(news.data?.articles ?? [], relatedSearchNews),
     [news.data?.articles, relatedSearchNews],
   );
+  const kalshiHref = kalshiMarketUrl(m?.market_id);
   const { tradeHighlights, topSuspiciousTrades } = useMemo(() => {
     const trades = series.data?.trades;
     if (!trades?.length) {
@@ -159,9 +161,23 @@ export default function MarketDetailPage() {
             <>
               <div className="flex items-start justify-between gap-4 flex-wrap">
                 <div className="min-w-0">
-                  <h1 className="text-xl font-semibold tracking-tight">
-                    {m.title || m.market_id}
-                  </h1>
+                  {kalshiHref ? (
+                    <a
+                      href={kalshiHref}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="group inline-flex max-w-full items-start gap-1.5 text-xl font-semibold tracking-tight hover:text-primary"
+                    >
+                      <span className="min-w-0 break-words">
+                        {m.title || m.market_id}
+                      </span>
+                      <ExternalLink className="mt-1 h-4 w-4 flex-shrink-0 text-muted-foreground group-hover:text-primary" />
+                    </a>
+                  ) : (
+                    <h1 className="text-xl font-semibold tracking-tight">
+                      {m.title || m.market_id}
+                    </h1>
+                  )}
                   {m.subtitle ? (
                     <div className="text-sm text-primary mt-0.5">
                       {m.subtitle}

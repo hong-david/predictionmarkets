@@ -682,6 +682,7 @@ def _component_from_heartbeat(
     db_detail: str,
     stale_after: timedelta,
     now: datetime,
+    zero_count_is_healthy: bool = False,
 ) -> dict:
     hb_latest = (
         _latest_datetime(heartbeat.last_heartbeat_at, heartbeat.last_success_at)
@@ -690,19 +691,20 @@ def _component_from_heartbeat(
     )
     latest_at = _latest_datetime(hb_latest, db_latest_at)
     count = heartbeat.count if heartbeat is not None and heartbeat.count is not None else db_count
+    status_count = None if zero_count_is_healthy and count == 0 else count
     if heartbeat is not None and heartbeat.status == "error":
         status = "error"
     elif hb_latest is not None:
         status = _freshness_status(
             latest_at=hb_latest,
-            count=count,
+            count=status_count,
             stale_after=stale_after,
             now=now,
         )
     else:
         status = _freshness_status(
             latest_at=db_latest_at,
-            count=db_count,
+            count=None if zero_count_is_healthy and db_count == 0 else db_count,
             stale_after=stale_after,
             now=now,
         )
@@ -721,7 +723,9 @@ def _component_from_heartbeat(
         heartbeat_at=heartbeat.last_heartbeat_at if heartbeat is not None else None,
         last_success_at=heartbeat.last_success_at if heartbeat is not None else None,
         last_error_at=heartbeat.last_error_at if heartbeat is not None else None,
-        last_error=heartbeat.last_error if heartbeat is not None else None,
+        last_error=heartbeat.last_error
+        if heartbeat is not None and heartbeat.status == "error"
+        else None,
         component_type=heartbeat.component_type if heartbeat is not None else None,
         source="heartbeat" if hb_latest is not None else "db",
         run_id=heartbeat.run_id if heartbeat is not None else None,
@@ -869,6 +873,7 @@ def _pipeline_health_payload(db: Session) -> dict:
             db_detail=f"{int(count or 0):,} stored quote/book alert rows.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
+            zero_count_is_healthy=True,
         )
 
     def retention_projection_component() -> dict:

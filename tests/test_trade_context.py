@@ -265,3 +265,57 @@ def test_recent_linked_news_discounts_post_news_move() -> None:
     assert with_news["score"] < baseline["score"]
     assert "post_news_move_discount" in with_news["reasons"]
     assert with_news["features"]["post_news_discount_multiplier"] == 0.65
+
+
+def test_public_sports_market_discount_reduces_context_score() -> None:
+    trades = [
+        {
+            "ts": "2026-01-01T10:00:00+00:00",
+            "yes_price": 0.50,
+            "count": 10,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:02:00+00:00",
+            "yes_price": 0.57,
+            "count": 120,
+            "taker_side": "yes",
+        },
+        {
+            "ts": "2026-01-01T10:07:00+00:00",
+            "yes_price": 0.62,
+            "count": 10,
+            "taker_side": "yes",
+        },
+    ]
+    snapshots = [
+        {
+            "ts": "2026-01-01T10:01:30+00:00",
+            "yes_bid": 0.50,
+            "yes_ask": 0.58,
+            "last_price": 0.51,
+            "volume_24h": 400,
+            "open_interest": 500,
+        }
+    ]
+
+    macro = explain_trades_with_context(
+        trades,
+        market=_market(),
+        snapshots=snapshots,
+    )[1]
+    sports = explain_trades_with_context(
+        trades,
+        market=MarketContext(
+            market_pk=2,
+            market_id="KXNBAGAME-LAL-HOU",
+            category="sports_outcome",
+            subcategory="major_league_game",
+            manipulability_prior="medium",
+        ),
+        snapshots=snapshots,
+    )[1]
+
+    assert macro is not None and sports is not None
+    assert sports["score"] < macro["score"]
+    assert "public_sports_market_discount" in sports["reasons"]

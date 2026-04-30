@@ -77,33 +77,32 @@ PRIOR_MAP: dict[tuple[str, str], ManipulabilityPrior] = {
     ("judicial", "*"): "high",
 
     # ----- Sports outcomes -----------------------------------------------
-    # Game winners and combat-sports fight winners. Manipulation in
-    # mainstream pro leagues requires multi-actor coordination (referees,
-    # players, coaches), which is rare and low-prior individually. Combat
-    # sports are higher: a single fighter throwing a fight is a known
-    # historical pattern.
+    # Mainstream game winners are public, closely watched, many-actor events:
+    # a few thousand dollars of informed flow should not make Lakers/Rockets
+    # look like a macro leak. Combat sports stay higher because one fighter
+    # can more directly determine their own outcome.
     ("sports_outcome", "fight_winner"): "high",
-    ("sports_outcome", "tennis_match"): "medium_high",
-    ("sports_outcome", "soccer_match"): "medium_high",
+    ("sports_outcome", "tennis_match"): "medium",
+    ("sports_outcome", "soccer_match"): "medium",
     ("sports_outcome", "major_league_game"): "medium",
     ("sports_outcome", "*"): "medium",
 
     # ----- Sports derivatives (spreads, totals) --------------------------
     # Spreads and totals can be moved by intentional poor play without
-    # changing the game outcome ("shaving points") — historically the
-    # canonical sports-manipulation pattern. Higher prior than the
-    # underlying game-winner market.
-    ("sports_derivative", "spread"): "medium_high",
-    ("sports_derivative", "total"): "medium_high",
-    ("sports_derivative", "*"): "medium_high",
+    # changing the game outcome ("shaving points"). Still, major-league lines
+    # are heavily watched and betting-liquidity-rich, so keep them at medium
+    # unless other evidence appears.
+    ("sports_derivative", "spread"): "medium",
+    ("sports_derivative", "total"): "medium",
+    ("sports_derivative", "*"): "medium",
 
     # ----- Sports props (single-player outcomes) -------------------------
-    # First-basket / first-goal / over-under-on-player-X. Single-actor
-    # leverage: one player can entirely determine the outcome of their own
-    # market. Higher manipulability ceiling than the team outcome.
-    ("sports_prop", "player_points"): "high",
-    ("sports_prop", "first_event"): "high",
-    ("sports_prop", "*"): "medium_high",
+    # First-basket / first-goal / over-under-on-player-X. More direct than a
+    # team winner, but still not as narrow as a boardroom, court, or agency
+    # decision. Treat as medium-high, then let news/injury/tape evidence lift it.
+    ("sports_prop", "player_points"): "medium_high",
+    ("sports_prop", "first_event"): "medium_high",
+    ("sports_prop", "*"): "medium",
 
     # ----- Crypto strikes -------------------------------------------------
     # 15-minute / hourly / daily BTC / ETH strikes. The underlying is a

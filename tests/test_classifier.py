@@ -39,7 +39,9 @@ class TestPriorityMap:
         assert prior_for("corporate", "merger") == "high"
         assert prior_for("corporate", "fda") == "high"
         assert prior_for("sports_outcome", "fight_winner") == "high"
-        assert prior_for("sports_prop", "player_points") == "high"
+        assert prior_for("sports_outcome", "tennis_match") == "medium"
+        assert prior_for("sports_derivative", "spread") == "medium"
+        assert prior_for("sports_prop", "player_points") == "medium_high"
         assert prior_for("crypto_strike", "short_window") == "low"
         assert prior_for("weather", "temperature") == "very_low"
 
