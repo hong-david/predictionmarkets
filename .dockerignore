@@ -5,9 +5,12 @@ __pycache__
 .env
 *.key
 *.pem
+*.dump
 *.log
 *.err
 *.out
+.pipeline-logs
+.codex-*
 .mypy_cache
 .pytest_cache
 .ruff_cache

@@ -5,7 +5,11 @@ __pycache__/
 *.key
 *.pem
 *.log
+*.dump
 .codex-*.err
+.codex-*.log
+.codex-*.out
+.pipeline-logs/
 
 # Frontend
 frontend/node_modules/
