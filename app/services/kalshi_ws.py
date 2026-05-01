@@ -11,7 +11,15 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import settings
-from app.db.models import Anomaly, BookEvent, Market, MarketSnapshot, Trade, TradeFlag
+from app.db.models import (
+    Anomaly,
+    BookEvent,
+    Market,
+    MarketMetric,
+    MarketSnapshot,
+    Trade,
+    TradeFlag,
+)
 from app.db.session import SessionLocal
 from app.services.anomaly_materializer import materialize_market_anomaly
 from app.services.classifier import CLASSIFIER_VERSION
@@ -716,12 +724,9 @@ def resolve_book_market_tickers() -> list[str]:
 
     Order of precedence:
       1. Explicit `kalshi_book_market_tickers` from settings (operator override).
-      2. The most actively-trading markets, ranked by `volume_fp` (lifetime
-         cumulative volume) from each market's most recent snapshot. We use
-         lifetime rather than 24h volume because the Kalshi WS ticker
-         payload does not include `volume_24h_fp` -- only `volume_fp` -- so
-         a 24h ranker would silently drop every market we have only seen
-         via WS, which is exactly the actively-trading set.
+      2. The most actively-trading markets from the compact `market_metrics`
+         projection. This avoids scanning the multi-million-row snapshot table
+         during websocket startup.
       3. Cold-start fallback: most-recently-updated markets, used only when
          no snapshots with positive volume exist yet (e.g. brand-new DB).
 
@@ -732,34 +737,30 @@ def resolve_book_market_tickers() -> list[str]:
     minute against live Kalshi. Volume-ranking fixes that even when the
     bootstrap is biased.
 
-    The DISTINCT ON (market_pk) ... ORDER BY market_pk, ts DESC pattern is
-    Postgres-native and yields one (latest) snapshot per market in a single
-    index pass. We treat 'active', 'open', and 'unknown' as tradeable since
-    'unknown' is the sentinel set by the lazy-upsert path for markets we've
-    only seen via the WS feed.
+    We treat 'active', 'open', and 'unknown' as tradeable since 'unknown' is
+    the sentinel set by the lazy-upsert path for markets we've only seen via
+    the WS feed.
     """
     if settings.kalshi_book_market_tickers:
         return list(settings.kalshi_book_market_tickers)
 
     db = SessionLocal()
     try:
-        latest_per_market = (
-            select(
-                MarketSnapshot.market_pk.label("market_pk"),
-                MarketSnapshot.volume_fp.label("vol"),
-            )
-            .order_by(MarketSnapshot.market_pk, MarketSnapshot.ts.desc())
-            .distinct(MarketSnapshot.market_pk)
-            .subquery()
-        )
-
         ranked = db.execute(
             select(Market.market_id)
-            .join(latest_per_market, latest_per_market.c.market_pk == Market.id)
+            .join(MarketMetric, MarketMetric.market_pk == Market.id)
             .where(Market.status.in_(["active", "open", "unknown"]))
-            .where(latest_per_market.c.vol.is_not(None))
-            .where(latest_per_market.c.vol > 0)
-            .order_by(latest_per_market.c.vol.desc())
+            .where(
+                (MarketMetric.volume_24h_contracts > 0)
+                | (MarketMetric.trade_count > 0)
+                | (MarketMetric.latest_snapshot_ts.is_not(None))
+            )
+            .order_by(
+                MarketMetric.volume_24h_contracts.desc().nullslast(),
+                MarketMetric.trade_count.desc(),
+                MarketMetric.latest_snapshot_ts.desc().nullslast(),
+                MarketMetric.updated_at.desc(),
+            )
             .limit(settings.kalshi_book_market_limit)
         ).all()
 

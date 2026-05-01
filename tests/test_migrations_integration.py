@@ -237,11 +237,11 @@ def test_lazy_upsert_is_idempotent_under_repeated_calls(engine):
 
 
 def test_resolve_book_market_tickers_falls_back_when_no_snapshots(engine):
-    """Cold-start path: when no snapshots have positive volume, the resolver
+    """Cold-start path: when no metrics have positive activity, the resolver
     falls back to `updated_at desc` so we still subscribe to *something*.
 
     NOTE: Module-scoped engine fixture means earlier tests can leak state.
-    We explicitly clear `market_snapshots` here to assert the cold-start
+    We explicitly clear `market_metrics` here to assert the cold-start
     branch in isolation. Run order matters: the volume-ranking test below
     relies on this clear having happened.
     """
@@ -250,7 +250,7 @@ def test_resolve_book_market_tickers_falls_back_when_no_snapshots(engine):
     from app.services import kalshi_ws
 
     with Session(engine) as db:
-        db.execute(text("DELETE FROM market_snapshots"))
+        db.execute(text("DELETE FROM market_metrics"))
         db.commit()
 
     suffix = uuid.uuid4().hex[:6]
@@ -273,11 +273,11 @@ def test_resolve_book_market_tickers_falls_back_when_no_snapshots(engine):
 
 def test_resolve_book_market_tickers_ranks_by_volume(engine):
     """Volume-ranked path: the resolver picks the markets whose latest
-    snapshot has the highest 24h volume, regardless of `Market.updated_at`.
+    metric row has the highest 24h volume, regardless of `Market.updated_at`.
     This is the smoke-test war-story scenario in test form."""
     from unittest.mock import patch
 
-    from app.db.models import MarketSnapshot
+    from app.db.models import MarketMetric
     from app.services import kalshi_ws
 
     suffix = uuid.uuid4().hex[:6]
@@ -291,10 +291,10 @@ def test_resolve_book_market_tickers_ranks_by_volume(engine):
         db.flush()
         db.add_all(
             [
-                MarketSnapshot(market_pk=high.id, volume_fp=Decimal("9999.00")),
-                MarketSnapshot(market_pk=mid.id, volume_fp=Decimal("500.00")),
-                MarketSnapshot(market_pk=low.id, volume_fp=Decimal("1.00")),
-                MarketSnapshot(market_pk=dead.id, volume_fp=None),
+                MarketMetric(market_pk=high.id, volume_24h_contracts=9999),
+                MarketMetric(market_pk=mid.id, volume_24h_contracts=500),
+                MarketMetric(market_pk=low.id, volume_24h_contracts=1),
+                MarketMetric(market_pk=dead.id, volume_24h_contracts=None),
             ]
         )
         db.commit()
