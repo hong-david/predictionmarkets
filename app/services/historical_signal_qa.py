@@ -19,7 +19,6 @@ from app.db.models import (
     MarketMetric,
     NewsArticle,
     NewsEvent,
-    Trade,
     TradeFlag,
 )
 from app.services.market_lifecycle import ACTIVE_MARKET_STATUSES, market_lifecycle
@@ -143,8 +142,10 @@ def historical_signal_report(
     ]
     q = (
         db.query(Market, MarketMetric)
-        .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
+        .select_from(MarketMetric)
+        .join(Market, Market.id == MarketMetric.market_pk)
         .filter(*historical_filters)
+        .filter(MarketMetric.urgency_score > 0)
         .filter(Market.status != "unknown")
         .filter(Market.title != Market.market_id)
     )
@@ -155,7 +156,6 @@ def historical_signal_report(
     rows = (
         q.order_by(
             MarketMetric.urgency_score.desc().nullslast(),
-            Market.close_time.desc().nullslast(),
             Market.id.desc(),
         )
         .limit(limit)
@@ -166,14 +166,7 @@ def historical_signal_report(
         flags = _flag_summary(db, market, min_flag_score=min_flag_score)
         news = _news_summary(db, market)
         anomalies = _anomaly_summary(db, market)
-        trade_count = int(metric.trade_count or 0) if metric else 0
-        if trade_count == 0:
-            trade_count = int(
-                db.query(func.count(Trade.id))
-                .filter(Trade.market_pk == market.id)
-                .scalar()
-                or 0
-            )
+        trade_count = int(metric.trade_count or 0)
         markets.append(
             {
                 "market_id": market.market_id,
@@ -184,9 +177,7 @@ def historical_signal_report(
                 "close_time": _iso(market.close_time),
                 "market_lifecycle": market_lifecycle(market, now=now),
                 "trade_count": trade_count,
-                "metric_urgency_score": float(metric.urgency_score or 0.0)
-                if metric
-                else 0.0,
+                "metric_urgency_score": float(metric.urgency_score or 0.0),
                 "flags": flags,
                 "pre_news": news,
                 "quote_book_anomalies": anomalies,
