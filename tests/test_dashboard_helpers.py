@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from app.api.routes.dashboard import _metric_probability_float, _probability_float
+from app.api.routes import dashboard
+from app.api.routes.dashboard import (
+    _clickhouse_table_count,
+    _metric_probability_float,
+    _probability_float,
+)
 from app.services.market_lifecycle import market_lifecycle
 
 
@@ -123,3 +128,43 @@ def test_metric_probability_uses_latest_or_bid_ask_midpoint() -> None:
         )
         == 0.35
     )
+
+
+def test_clickhouse_table_count_reads_supported_table(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeResponse:
+        text = "42\n"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, *, timeout, auth) -> None:
+            calls.append({"timeout": timeout, "auth": auth})
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url, *, params):
+            calls.append({"url": url, "params": params})
+            return FakeResponse()
+
+    monkeypatch.setattr(dashboard.httpx, "Client", FakeClient)
+    monkeypatch.setattr(dashboard, "clickhouse_http_auth", lambda: ("user", "pass"))
+
+    assert _clickhouse_table_count("kalshi_l2_events_raw") == 42
+    assert calls[0]["auth"] == ("user", "pass")
+    assert calls[1]["params"]["query"] == "SELECT count() FROM kalshi_l2_events_raw"
+
+
+def test_clickhouse_table_count_rejects_unknown_table() -> None:
+    try:
+        _clickhouse_table_count("not_a_table")
+    except ValueError as exc:
+        assert "unsupported ClickHouse count table" in str(exc)
+    else:
+        raise AssertionError("expected unsupported table to raise")

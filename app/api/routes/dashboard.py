@@ -67,6 +67,7 @@ from app.services.news_correlation import market_news_search_query, profile_for_
 from app.services.news_gdelt import build_gdelt_query, choose_news_window
 from app.services.news_link_scoring import score_article_market_link
 from app.services.news_source_registry import source_registry_diagnostics
+from app.services.clickhouse_writer import clickhouse_http_auth
 from app.services.market_lifecycle import (
     market_lifecycle as _market_lifecycle,
     market_scope_filters as _market_scope_filters,
@@ -104,9 +105,13 @@ _SUSPICIOUS_TRADE_SAMPLE = 20_000
 _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
 _PIPELINE_MARKET_POLLER_STALE_AFTER = timedelta(hours=6)
 _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
+_CLICKHOUSE_COUNT_TIMEOUT_SEC = float(os.getenv("CLICKHOUSE_COUNT_TIMEOUT_SEC", "0.75"))
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
+_CLICKHOUSE_COUNT_TABLES = {
+    "kalshi_l2_events_raw",
+}
 
 def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
     now = time.monotonic()
@@ -1077,6 +1082,25 @@ def _estimated_table_count(db: Session, table_name: str) -> int:
     return max(0, int(estimate or 0))
 
 
+def _clickhouse_table_count(table_name: str) -> int | None:
+    """Best-effort raw-row count for data stored outside Postgres."""
+    if table_name not in _CLICKHOUSE_COUNT_TABLES:
+        raise ValueError(f"unsupported ClickHouse count table: {table_name}")
+    try:
+        auth = clickhouse_http_auth()
+        query = f"SELECT count() FROM {table_name}"
+        with httpx.Client(timeout=_CLICKHOUSE_COUNT_TIMEOUT_SEC, auth=auth) as client:
+            response = client.post(
+                f"{settings.clickhouse_url}/",
+                params={"database": settings.clickhouse_database, "query": query},
+            )
+            response.raise_for_status()
+        return max(0, int(response.text.strip() or "0"))
+    except Exception as exc:
+        logger.debug("clickhouse count failed table=%s: %s", table_name, exc)
+        return None
+
+
 def _market_metrics_available(db: Session) -> bool:
     """True when the compact market read model has been populated."""
     return bool(db.query(MarketMetric.market_pk).limit(1).scalar() is not None)
@@ -1182,6 +1206,11 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
     )
     snapshots = _estimated_table_count(db, "market_snapshots")
     book_events = _estimated_table_count(db, "book_events")
+    raw_backend = settings.kalshi_raw_backend.lower().strip()
+    if book_events == 0 or raw_backend in {"clickhouse", "dual"}:
+        clickhouse_book_events = _clickhouse_table_count("kalshi_l2_events_raw")
+        if clickhouse_book_events is not None:
+            book_events = max(book_events, clickhouse_book_events)
     anomalies = (
         int(metric_counts.anomalies)
         if metric_counts is not None and int(metric_counts.anomalies or 0) > 0

@@ -20,7 +20,7 @@ export function fmtPrice(n: number | null | undefined, digits = 3): string {
 
 /** Approximate dollars paid, rounded for compact table display. */
 export function fmtDollars(n: number | null | undefined): string {
-  if (n == null) return "â€”";
+  if (n == null) return "—";
   return `$${Math.round(n).toLocaleString()}`;
 }
 
