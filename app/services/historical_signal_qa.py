@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import case, func
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -22,7 +22,7 @@ from app.db.models import (
     Trade,
     TradeFlag,
 )
-from app.services.market_lifecycle import market_lifecycle, market_scope_filters
+from app.services.market_lifecycle import ACTIVE_MARKET_STATUSES, market_lifecycle
 
 
 def _now() -> datetime:
@@ -134,10 +134,17 @@ def historical_signal_report(
     market_id: str | None = None,
 ) -> dict[str, Any]:
     now = _now()
+    historical_filters = [
+        or_(
+            Market.status.is_(None),
+            Market.status.notin_(tuple(ACTIVE_MARKET_STATUSES)),
+            Market.close_time <= func.now(),
+        )
+    ]
     q = (
         db.query(Market, MarketMetric)
         .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
-        .filter(*market_scope_filters("historical"))
+        .filter(*historical_filters)
         .filter(Market.status != "unknown")
         .filter(Market.title != Market.market_id)
     )
