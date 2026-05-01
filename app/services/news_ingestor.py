@@ -447,6 +447,11 @@ def ingest_global_news(
             score_context=score_components_for_cluster(cluster),
             profiles=profile_pool,
         )
+    fatal_fetch_error = (
+        "; ".join(fetch_errors)
+        if provider_status == "unavailable" and fetch_errors
+        else None
+    )
     return {
         "profiles_refreshed": refreshed,
         "profiles_loaded": len(profile_rows),
@@ -455,7 +460,7 @@ def ingest_global_news(
         "articles_upserted": upserted,
         "news_events_linked": linked,
         "provider_status": provider_status or "none",
-        "fetch_error": "; ".join(fetch_errors) if fetch_errors else None,
+        "fetch_error": fatal_fetch_error,
         "source_counts": source_counts,
         "source_registry": source_registry_diagnostics(),
         "query": query,

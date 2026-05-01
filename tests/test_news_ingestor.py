@@ -4,11 +4,13 @@ import httpx
 
 from app.db.models import Market
 from app.services.news_correlation import (
+    NormalizedArticle,
     is_news_profile_candidate,
     market_news_search_query,
     profile_for_market,
 )
 from app.services.news_ingestor import ingest_global_news, normalize_gdelt_article
+from app.services.news_sources import SourceFetchResult
 
 
 def test_normalize_gdelt_article_extracts_core_fields() -> None:
@@ -60,6 +62,47 @@ def test_ingest_global_news_fails_open_when_gdelt_unavailable(monkeypatch) -> No
     assert result["news_events_linked"] == 0
     assert result["provider_status"] == "unavailable"
     assert "ConnectTimeout" in result["fetch_error"]
+
+
+def test_ingest_global_news_keeps_partial_rss_errors_in_source_counts(
+    monkeypatch,
+) -> None:
+    article = NormalizedArticle(
+        canonical_url="https://example.com/story",
+        title="Fed announces a rate decision",
+        published_at=datetime(2026, 4, 27, 12, 30, tzinfo=timezone.utc),
+    )
+
+    monkeypatch.setattr(
+        "app.services.news_ingestor.refresh_market_news_profiles",
+        lambda _db, *, max_markets: 0,
+    )
+    monkeypatch.setattr(
+        "app.services.news_ingestor.fetch_rss_articles",
+        lambda *a, **k: [
+            SourceFetchResult(source_name="good", articles=(article,)),
+            SourceFetchResult(source_name="npr", articles=(), error="ReadTimeout"),
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.news_ingestor.cluster_normalized_articles",
+        lambda _articles: [],
+    )
+    monkeypatch.setattr("app.services.news_ingestor.DEFAULT_NEWS_SOURCES", ())
+
+    result = ingest_global_news(
+        object(),
+        include_gdelt=False,
+        rss_feeds=("good", "npr"),
+        max_markets=10,
+        max_profiles=10,
+        limit=5,
+    )
+
+    assert result["articles_seen"] == 1
+    assert result["provider_status"] == "rss"
+    assert result["fetch_error"] is None
+    assert result["source_counts"]["rss_errors"] == 1
 
 
 def test_news_profile_scope_includes_retention_excluded_news_markets() -> None:
