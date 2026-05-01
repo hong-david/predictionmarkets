@@ -89,6 +89,22 @@ def test_prior_day_scheduled_sports_market_is_historical_after_short_grace() -> 
     )
 
 
+def test_prior_day_scheduled_non_sports_market_is_historical_after_short_grace() -> None:
+    market = _market(
+        market_id="KXKINGMENTION-26APR28C-QUEEN",
+        category="politics",
+        close_time=datetime(2026, 5, 12, tzinfo=timezone.utc),
+    )
+
+    assert (
+        market_lifecycle(
+            market,
+            now=datetime(2026, 4, 30, 8, tzinfo=timezone.utc),
+        )
+        == "historical"
+    )
+
+
 def test_same_day_scheduled_sports_market_can_still_be_active() -> None:
     market = _market(
         market_id="KXATPMATCH-26APR28TSIRUU-RUU",

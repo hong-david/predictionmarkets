@@ -108,6 +108,11 @@ services:
       - "14"
       - --retention-batch-size
       - "5000"
+      - --with-dashboard-cache-warmer
+      - --dashboard-cache-warm-interval-seconds
+      - "200"
+      - --dashboard-cache-warm-market-scopes
+      - active
     depends_on:
       postgres:
         condition: service_healthy

@@ -32,6 +32,7 @@ COMPONENTS: dict[str, tuple[str, str]] = {
     "storage_guardrails": ("Storage guardrails", "projection"),
     "retention_maintenance": ("Retention maintenance", "job"),
     "clickhouse_retention": ("ClickHouse TTL verification", "job"),
+    "dashboard_cache_warmer": ("Dashboard cache warmer", "process"),
     "pipeline_supervisor": ("Pipeline supervisor", "process"),
 }
 

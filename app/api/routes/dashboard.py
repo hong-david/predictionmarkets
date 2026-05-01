@@ -1379,7 +1379,11 @@ def get_pipeline_health(db: Session = Depends(get_db)) -> dict:
     These are not all standalone services: some are long-running processes,
     while others are jobs, materializers, or compact DB projections.
     """
-    return _pipeline_health_payload(db)
+    return _cached_dashboard_payload(
+        "pipeline_health",
+        lambda: _pipeline_health_payload(db),
+        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
+    )
 
 
 def _news_diagnostics_payload(db: Session) -> dict:
@@ -1504,7 +1508,11 @@ def _news_diagnostics_payload(db: Session) -> dict:
 @router.get("/news-diagnostics")
 def get_news_diagnostics(db: Session = Depends(get_db)) -> dict:
     """Latest news ingest diagnostics from DB counts and heartbeat metadata."""
-    return _news_diagnostics_payload(db)
+    return _cached_dashboard_payload(
+        "news_diagnostics",
+        lambda: _news_diagnostics_payload(db),
+        ttl_sec=_DASHBOARD_LIST_CACHE_TTL_SEC,
+    )
 
 
 @router.get("/historical-signal-qa")
@@ -1516,12 +1524,19 @@ def get_historical_signal_qa(
     db: Session = Depends(get_db),
 ) -> dict:
     """Historical post-mortem sample for checking whether flags look useful."""
-    return historical_signal_report(
-        db,
-        limit=limit,
-        min_flag_score=min_flag_score,
-        category=category,
-        market_id=market_id,
+    return _cached_dashboard_payload(
+        (
+            "historical_signal_qa:"
+            f"{limit}:{min_flag_score}:{category or ''}:{market_id or ''}"
+        ),
+        lambda: historical_signal_report(
+            db,
+            limit=limit,
+            min_flag_score=min_flag_score,
+            category=category,
+            market_id=market_id,
+        ),
+        ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
 
 
@@ -1581,12 +1596,10 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                     market,
                     trade_count=int(metric.trade_count or 0),
                     anomaly_count=int(metric.anomaly_count or 0),
-                    last_price=(
-                        price := _metric_probability_float(
-                            last_price_cents=metric.last_price_cents,
-                            yes_bid_cents=metric.yes_bid_cents,
-                            yes_ask_cents=metric.yes_ask_cents,
-                        )
+                    last_price=_metric_probability_float(
+                        last_price_cents=metric.last_price_cents,
+                        yes_bid_cents=metric.yes_bid_cents,
+                        yes_ask_cents=metric.yes_ask_cents,
                     ),
                     volume_24h=metric.volume_24h_contracts,
                     volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
@@ -1872,6 +1885,7 @@ def _news_signals_payload(
     status: str | None = None,
     include_ambiguous: bool = False,
     market_scope: str = "active",
+    validate_current: bool = False,
 ) -> dict:
     q = (
         db.query(NewsEvent, NewsArticle, Market)
@@ -1897,17 +1911,20 @@ def _news_signals_payload(
     for event, article, market in rows:
         if _is_weak_factor_only_news_event(event):
             continue
-        current_link = _current_news_link_for_market(article, market)
-        if current_link is None:
-            continue
-        current_relevance, current_components = current_link
-        payload = _news_signal_payload(
-            event,
-            article,
-            market,
-            components_override=current_components,
-            relevance_score_override=current_relevance,
-        )
+        if validate_current:
+            current_link = _current_news_link_for_market(article, market)
+            if current_link is None:
+                continue
+            current_relevance, current_components = current_link
+            payload = _news_signal_payload(
+                event,
+                article,
+                market,
+                components_override=current_components,
+                relevance_score_override=current_relevance,
+            )
+        else:
+            payload = _news_signal_payload(event, article, market)
         if (
             not include_ambiguous
             and payload["direction_label"] not in {"supports_yes", "supports_no"}
@@ -2157,6 +2174,32 @@ _SORT_OPTIONS = {
 }
 
 
+def _markets_cache_key(
+    *,
+    q: str | None,
+    category: str | None,
+    prior: str | None,
+    confidence: str | None,
+    status: str | None,
+    market_scope: str,
+    include_unhydrated: bool,
+    data_only: bool,
+    include_counts: bool,
+    sort: str,
+    limit: int,
+    offset: int,
+) -> str:
+    return (
+        "markets:"
+        f"q={q or ''}:category={category or ''}:prior={prior or ''}:"
+        f"confidence={confidence or ''}:status={status or ''}:"
+        f"market_scope={market_scope}:"
+        f"include_unhydrated={int(include_unhydrated)}:"
+        f"data_only={int(data_only)}:include_counts={int(include_counts)}:sort={sort}:"
+        f"limit={limit}:offset={offset}"
+    )
+
+
 @router.get("/markets")
 def list_markets(
     q: str | None = Query(
@@ -2202,14 +2245,19 @@ def list_markets(
     Both subqueries hit indexed FK columns and return at most one row
     per market, so they're cheap.
     """
-    cache_key = (
-        "markets:"
-        f"q={q or ''}:category={category or ''}:prior={prior or ''}:"
-        f"confidence={confidence or ''}:status={status or ''}:"
-        f"market_scope={market_scope}:"
-        f"include_unhydrated={int(include_unhydrated)}:"
-        f"data_only={int(data_only)}:include_counts={int(include_counts)}:sort={sort}:"
-        f"limit={limit}:offset={offset}"
+    cache_key = _markets_cache_key(
+        q=q,
+        category=category,
+        prior=prior,
+        confidence=confidence,
+        status=status,
+        market_scope=market_scope,
+        include_unhydrated=include_unhydrated,
+        data_only=data_only,
+        include_counts=include_counts,
+        sort=sort,
+        limit=limit,
+        offset=offset,
     )
     return _cached_dashboard_payload(
         cache_key,
@@ -3062,11 +3110,18 @@ def get_news_signals(
     status: str | None = Query(default=None),
     include_ambiguous: bool = Query(default=True),
     market_scope: str = Query(default="active", description="active | historical | all"),
+    validate_current: bool = Query(
+        default=False,
+        description=(
+            "Re-score article/market relevance at request time. Off by default "
+            "because the home page should read materialized links."
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     return _cached_dashboard_payload(
         f"news_signals:{limit}:{min_score}:{status or ''}:"
-        f"{int(include_ambiguous)}:{market_scope}",
+        f"{int(include_ambiguous)}:{market_scope}:{int(validate_current)}",
         lambda: _news_signals_payload(
             db,
             limit=limit,
@@ -3074,6 +3129,7 @@ def get_news_signals(
             status=status,
             include_ambiguous=include_ambiguous,
             market_scope=market_scope,
+            validate_current=validate_current,
         ),
         ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
@@ -3240,3 +3296,142 @@ async def get_market_news(
 
     payload["articles"] = articles
     return payload
+
+
+def warm_dashboard_cache_once(
+    db: Session,
+    *,
+    market_scopes: tuple[str, ...] = ("active",),
+) -> dict:
+    """Populate Redis/in-process cache for dashboard reads used on first paint."""
+
+    warmed: list[dict] = []
+    errors: list[dict] = []
+
+    def warm(name: str, key: str, build: Callable[[], object], ttl: float) -> None:
+        started = time.monotonic()
+        try:
+            _cached_dashboard_payload(key, build, ttl_sec=ttl)
+        except Exception as exc:  # pragma: no cover - operational best effort
+            logger.warning("dashboard cache warm failed for %s: %s", name, exc)
+            errors.append({"name": name, "error": str(exc)})
+            return
+        warmed.append(
+            {
+                "name": name,
+                "key": key,
+                "took_ms": round((time.monotonic() - started) * 1000, 2),
+            }
+        )
+
+    scopes = tuple(_normalize_market_scope(scope) for scope in market_scopes) or (
+        "active",
+    )
+    for scope in scopes:
+        warm(
+            f"stats:{scope}",
+            f"stats:{scope}",
+            lambda scope=scope: _stats_payload(db, market_scope=scope),
+            _DASHBOARD_STATS_CACHE_TTL_SEC,
+        )
+        warm(
+            f"breakdown:{scope}",
+            f"breakdown:{scope}",
+            lambda scope=scope: _breakdown_payload(db, market_scope=scope),
+            _DASHBOARD_STATIC_CACHE_TTL_SEC,
+        )
+        warm(
+            f"top_markets:{scope}",
+            f"top_markets:10:{scope}",
+            lambda scope=scope: _top_markets_payload(db, 10, market_scope=scope),
+            _DASHBOARD_STATS_CACHE_TTL_SEC,
+        )
+        warm(
+            f"recent_anomalies:{scope}",
+            f"recent_anomalies:10::{scope}",
+            lambda scope=scope: _recent_anomalies_payload(
+                db, 10, None, market_scope=scope
+            ),
+            _DASHBOARD_STATS_CACHE_TTL_SEC,
+        )
+        warm(
+            f"suspicious_trades:{scope}",
+            f"suspicious_trades:12:{scope}",
+            lambda scope=scope: _suspicious_trades_payload(
+                db, limit=12, market_scope=scope
+            ),
+            _DASHBOARD_STATS_CACHE_TTL_SEC,
+        )
+        warm(
+            f"news_signals:{scope}",
+            f"news_signals:8:4.0::1:{scope}:0",
+            lambda scope=scope: _news_signals_payload(
+                db,
+                limit=8,
+                min_score=4.0,
+                include_ambiguous=True,
+                market_scope=scope,
+                validate_current=False,
+            ),
+            _DASHBOARD_STATIC_CACHE_TTL_SEC,
+        )
+        markets_key = _markets_cache_key(
+            q=None,
+            category=None,
+            prior=None,
+            confidence=None,
+            status=None,
+            market_scope=scope,
+            include_unhydrated=False,
+            data_only=True,
+            include_counts=False,
+            sort="news_linked_trade_flag",
+            limit=50,
+            offset=0,
+        )
+        warm(
+            f"markets_default:{scope}",
+            markets_key,
+            lambda scope=scope: _list_markets_uncached(
+                q=None,
+                category=None,
+                prior=None,
+                confidence=None,
+                status=None,
+                market_scope=scope,
+                include_unhydrated=False,
+                data_only=True,
+                include_counts=False,
+                sort="news_linked_trade_flag",
+                limit=50,
+                offset=0,
+                db=db,
+            ),
+            _DASHBOARD_LIST_CACHE_TTL_SEC,
+        )
+
+    warm(
+        "pipeline_health",
+        "pipeline_health",
+        lambda: _pipeline_health_payload(db),
+        _DASHBOARD_STATS_CACHE_TTL_SEC,
+    )
+    warm(
+        "news_diagnostics",
+        "news_diagnostics",
+        lambda: _news_diagnostics_payload(db),
+        _DASHBOARD_LIST_CACHE_TTL_SEC,
+    )
+    warm(
+        "historical_signal_qa",
+        "historical_signal_qa:6:5.0::",
+        lambda: historical_signal_report(db, limit=6, min_flag_score=5.0),
+        _DASHBOARD_STATIC_CACHE_TTL_SEC,
+    )
+
+    return {
+        "warmed": warmed,
+        "errors": errors,
+        "count": len(warmed),
+        "error_count": len(errors),
+    }

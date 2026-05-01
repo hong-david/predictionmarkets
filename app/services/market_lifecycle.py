@@ -60,35 +60,38 @@ def normalize_market_scope(market_scope: str | None) -> str:
     return scope
 
 
-def sports_event_stale_expr():
-    """SQL expression for scheduled sports markets whose ticker date has aged out."""
+def scheduled_event_stale_expr():
+    """SQL expression for dated scheduled markets whose ticker date has aged out.
+
+    Kalshi sometimes leaves event-like markets marked active after the scheduled
+    event has already happened, especially while final determination is pending.
+    The date token in tickers like ``KXKINGMENTION-26APR28C-QUEEN`` is the best
+    available fallback when exchange status/close_time lags.
+    """
 
     event_token = func.substring(func.upper(Market.market_id), EVENT_DATE_TOKEN_PATTERN)
-    sports_market = or_(
-        Market.category.in_(tuple(SPORTS_MARKET_CATEGORIES)),
-        *[
-            func.upper(Market.market_id).like(f"{prefix}%")
-            for prefix in SPORTS_EVENT_PREFIXES
-        ],
-    )
     stale_cutoff = func.to_timestamp(event_token, "YYMONDD") + text(
         "interval '30 hours'"
     )
     return and_(
-        sports_market,
         event_token.isnot(None),
         stale_cutoff <= func.now(),
     )
+
+
+def sports_event_stale_expr():
+    """Compatibility alias for older callers/tests."""
+
+    return scheduled_event_stale_expr()
 
 
 def market_scope_filters(market_scope: str | None) -> list:
     """SQLAlchemy filters for active/historical/all market scopes."""
 
     scope = normalize_market_scope(market_scope)
-    status = func.lower(func.coalesce(Market.status, ""))
-    stale_event = sports_event_stale_expr()
+    stale_event = scheduled_event_stale_expr()
     active = and_(
-        status.in_(tuple(ACTIVE_MARKET_STATUSES)),
+        Market.status.in_(tuple(ACTIVE_MARKET_STATUSES)),
         or_(Market.close_time.is_(None), Market.close_time > func.now()),
         ~stale_event,
     )
@@ -97,7 +100,8 @@ def market_scope_filters(market_scope: str | None) -> list:
     if scope == "historical":
         return [
             or_(
-                status.notin_(tuple(ACTIVE_MARKET_STATUSES)),
+                Market.status.is_(None),
+                Market.status.notin_(tuple(ACTIVE_MARKET_STATUSES)),
                 Market.close_time <= func.now(),
                 stale_event,
             )
@@ -130,8 +134,6 @@ def is_stale_scheduled_event_market(
     *,
     now: datetime,
 ) -> bool:
-    if not looks_like_scheduled_sports_market(market):
-        return False
     event_date = scheduled_event_date_from_market_id(market.market_id)
     if event_date is None:
         return False

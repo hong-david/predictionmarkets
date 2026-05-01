@@ -233,6 +233,25 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                 log_dir=log_dir,
             )
         )
+    if args.with_dashboard_cache_warmer:
+        processes.append(
+            ManagedProcess(
+                key="dashboard_cache_warmer",
+                label="Dashboard cache warmer",
+                command=[
+                    py,
+                    "-m",
+                    "scripts.warm_dashboard_cache",
+                    "--watch",
+                    "--interval-seconds",
+                    str(args.dashboard_cache_warm_interval_seconds),
+                    "--market-scopes",
+                    args.dashboard_cache_warm_market_scopes,
+                ],
+                cwd=root,
+                log_dir=log_dir,
+            )
+        )
     return processes
 
 
@@ -280,6 +299,9 @@ def main() -> None:
     parser.add_argument("--retention-sampled-snapshot-days", type=int, default=7)
     parser.add_argument("--retention-hot-snapshot-days", type=int, default=30)
     parser.add_argument("--retention-batch-size", type=int, default=5000)
+    parser.add_argument("--with-dashboard-cache-warmer", action="store_true")
+    parser.add_argument("--dashboard-cache-warm-interval-seconds", type=float, default=60.0)
+    parser.add_argument("--dashboard-cache-warm-market-scopes", default="active")
     args = parser.parse_args()
 
     run_id = new_run_id("supervisor")

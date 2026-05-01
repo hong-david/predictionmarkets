@@ -22,9 +22,11 @@ illegal conduct. It highlights patterns that deserve review.
 | **Active/open market** | A market still live enough to monitor. Resolved sports/event markets are aged out even if stale exchange metadata says they are active. |
 | **Watch priority** | A classifier bucket for how sensitive the market type is. It is not evidence by itself. |
 | **Snapshot** | A saved quote update: bid/ask, last price, volume, open interest, and liquidity when available. |
+| **Order-book event** | A saved visible depth change at one or more book levels. This is noisier and grows faster than snapshots. |
 | **Trade print** | One public trade: price, contract count, side, event time, and ingest time. |
 | **Estimated dollars** | `contracts * side price`. This is approximate money paid for that print, not profit or account exposure. |
 | **Market activity alert** | A saved quote, volume, spread, or order-book alert in `anomalies`. |
+| **Read model / projection** | A compact serving row, such as `market_metrics`, built from raw events so the dashboard does not scan huge raw tables. |
 | **Local trade outlier** | A score for one trade compared with nearby trades in the same market. |
 | **Trade flag** | A durable row in `trade_flags` that combines a local trade outlier with context such as liquidity, follow-through, peer baselines, and news timing. |
 | **News-linked signal** | A market/news link that passed relevance and timing checks. It suggests review context, not causality. |
@@ -189,6 +191,12 @@ to ClickHouse. Unknown market tickers are lazily inserted as stubs so live data
 is not dropped just because metadata has not arrived yet. A later REST hydration
 job fills in human-readable titles and classifier fields.
 
+Order-book subscriptions are deliberately narrow. `KALSHI_BOOK_MARKET_LIMIT`
+controls how many markets receive book updates, and the resolver chooses those
+markets from compact `market_metrics` rows instead of scanning the full
+`market_snapshots` history at startup. That keeps the WebSocket job responsive
+even when snapshots have grown into the millions of rows.
+
 The WebSocket path is intentionally defensive:
 
 - duplicate trades are ignored by a database uniqueness rule
@@ -196,6 +204,8 @@ The WebSocket path is intentionally defensive:
 - workers read from a bounded queue so a spike does not create unlimited memory
   growth
 - high-volume raw storage can be narrowed by retention settings
+- `book_events` is treated as the fastest-growing raw table and should stay on a
+  short retention window unless a specific investigation needs more depth
 
 ### 3. Market Activity Alerts
 
@@ -298,6 +308,12 @@ When a market has stronger evidence, its retention tier can rise. That lets the
 system keep more context around the markets that matter while being aggressive
 about low-value background noise.
 
+Retention affects what the app can show. Old low-value raw rows can disappear,
+but compact evidence rows should remain: latest market metrics, alerts, trade
+flags, news links, and promoted case windows. This is why the dashboard reads
+`market_metrics`, `anomalies`, `trade_flags`, and `news_events` first instead of
+depending on raw snapshots or book rows for every page load.
+
 ## Storage Model
 
 | Table | Purpose |
@@ -305,9 +321,9 @@ about low-value background noise.
 | `markets` | One row per Kalshi ticker, including status, event id, title, timing, and classifier output. |
 | `market_snapshots` | Quote and market-state updates over time. |
 | `trades` | Public trade tape: trade id, side, count, prices, event time, ingest time. |
-| `book_events` | Selected order-book snapshots and deltas. |
+| `book_events` | Selected order-book snapshots and deltas. This table can grow fastest and is retained for short-window book analysis. |
 | `anomalies` | Saved market activity alerts. |
-| `market_metrics` | Compact read model for lists, counters, latest quote hints, retention tier, and dashboard scores. |
+| `market_metrics` | Compact read model for lists, counters, latest quote hints, total volume, retention tier, and dashboard scores. |
 | `trade_baselines` | Peer baselines by category/subcategory. |
 | `trade_flags` | Durable trade-level review candidates with scores, reasons, and components. |
 | `news_articles` | Deduped article metadata. |
@@ -365,11 +381,18 @@ flowchart LR
 
 Important API surfaces:
 
-- `GET /api/dashboard/overview` bundles the home page payload into one request.
+- `GET /api/dashboard/overview` remains available, but the frontend now loads
+  the home page as smaller cached section requests so one slow section does not
+  block the first paint.
+- `GET /api/dashboard/stats`, `/breakdown`, `/top-markets`, `/anomalies`,
+  `/suspicious-trades`, and `/news-signals` serve the home page sections.
 - `GET /api/dashboard/markets` lists active or historical markets with filters.
+  It defaults to cheap pagination with `counts_exact=false` and `has_more`.
+  Exact counts are optional with `include_counts=true`.
 - `GET /api/dashboard/markets/{market_id}` returns detail data.
-- `GET /api/dashboard/markets/{market_id}/series` returns chart data and recent
-  trade inspection scores.
+- `GET /api/dashboard/markets/{market_id}/series` returns chart data. It
+  defaults to a bounded recent window, supports `since`, and only includes
+  context scoring when `include_context=true`.
 - `GET /api/dashboard/markets/{market_id}/news` returns stored and search-backed
   related news.
 - `GET /api/dashboard/search` searches markets and stored news.
@@ -383,12 +406,17 @@ The market detail chart clamps probability-like prices to `[0, 1]` both in the
 API payload and before rendering. Chart arrows are reserved for stronger saved
 market activity alerts, so low-level alert history does not crowd the chart.
 
+The dashboard favors small, cacheable reads. Home page sections are fetched
+independently, market lists read compact projections first, event pages batch
+latest snapshots for related contracts, and market detail pages poll less often.
+Historical market pages do not poll live endpoints.
+
 Dashboard pages:
 
 | Page | Purpose |
 | --- | --- |
 | **Overview** | High-level counts, active leaderboards, pipeline health, news diagnostics, top trade flags, and recent market activity alerts. |
-| **Markets** | Filterable market table with priority, evidence scores, trade counts, alert counts, and sort modes. |
+| **Markets** | Filterable market table with priority, evidence scores, trade counts, total volume, alert counts, and sort modes. |
 | **Event group** | Shows all contracts in one Kalshi event, useful for comparing related outcomes. |
 | **Market detail** | Price chart, recent trades, local outlier scores, alert history, related news, and classifier metadata. |
 
@@ -476,6 +504,17 @@ the lower "expensive" bucket.
 
 Detailed deployment notes live in `docs/deployment.md`.
 
+Alembic migrations include dashboard performance indexes for hot read paths such
+as latest snapshots, retained trades, anomalies, book events, market metrics,
+and market search filters. Production deploys run migrations automatically.
+Some indexes are created concurrently so large raw tables can stay usable while
+the migration is running.
+
+The budget pipeline can also run `scripts.warm_dashboard_cache` as a lightweight
+cache warmer. It pre-populates Redis for the home page sections, the default
+markets page, pipeline/news diagnostics, and historical QA so the first browser
+request does not pay the full query cost.
+
 ## Runtime Configuration
 
 Most configuration comes from `.env` through `app/core/config.py`.
@@ -488,6 +527,10 @@ Most configuration comes from `.env` through `app/core/config.py`.
 | `KALSHI_RAW_BACKEND` | Raw event target: `postgres`, `clickhouse`, or `dual`. |
 | `KALSHI_BOOK_MARKET_LIMIT` | How many markets get order-book subscriptions by default. |
 | `KALSHI_WS_WORKER_COUNT` | Number of worker tasks draining the WebSocket queue. |
+| `DASHBOARD_CACHE_TTL_SEC` | Default Redis cache TTL for dashboard API reads. |
+| `DASHBOARD_STATS_CACHE_TTL_SEC` | Short TTL for frequently refreshed counters and health-adjacent sections. |
+| `DASHBOARD_LIST_CACHE_TTL_SEC` | Medium TTL for list endpoints such as markets, top markets, alerts, and flags. |
+| `DASHBOARD_STATIC_CACHE_TTL_SEC` | Longer TTL for slower-moving sections and grouped detail reads. |
 | `RETENTION_*` | Raw event age limits and pruning batch size. |
 | `OPENSEARCH_URL` | Optional OpenSearch endpoint. Empty means Postgres fallback. |
 | `CLICKHOUSE_URL` | Optional ClickHouse endpoint. |
@@ -499,6 +542,9 @@ Budget defaults favor low storage growth:
 KALSHI_RAW_BACKEND=postgres
 KALSHI_BOOK_MARKET_LIMIT=5
 KALSHI_WS_WORKER_COUNT=1
+DASHBOARD_STATS_CACHE_TTL_SEC=20
+DASHBOARD_LIST_CACHE_TTL_SEC=60
+DASHBOARD_STATIC_CACHE_TTL_SEC=300
 RETENTION_BOOK_EVENTS_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_OBSERVE_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_SAMPLED_MAX_AGE_DAYS=3
@@ -523,6 +569,7 @@ RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS=14
 | `scripts.revalidate_news_links` | Update or remove older links using current guardrails. |
 | `scripts.rebuild_search_index` | Rebuild OpenSearch from Postgres. |
 | `scripts.run_retention_maintenance` | Prune or compact raw data according to retention policy. |
+| `scripts.warm_dashboard_cache` | Precompute and cache dashboard first-paint payloads in Redis. |
 
 ## Common Failure Modes
 
@@ -533,6 +580,9 @@ RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS=14
 | News panels are empty | News source failed, links were filtered, or no relevant news exists. | `/api/dashboard/news-diagnostics`, pipeline logs. |
 | Search is weak | OpenSearch is off or index is empty. | Run `scripts.rebuild_search_index`; Postgres fallback still works. |
 | Disk usage grows quickly | Raw retention is too loose or book market limit is too high. | `/api/dashboard/storage-health`, retention settings. |
+| Order-book event count is zero | Book subscriptions are disabled, resolver found no eligible markets, WebSocket auth failed, or retention pruned the short raw window. | `KALSHI_BOOK_MARKET_LIMIT`, `.pipeline-logs/ws_trade_feed.*`, `book_events`, and pipeline heartbeats. |
+| Markets total looks approximate | `/markets` defaults to cheap pagination for speed. | Check `counts_exact`; request `include_counts=true` only when an exact total is needed. |
+| Market chart only shows recent data | Series endpoints default to a bounded recent window. | Increase `limit`, pass `since`, or set `include_context=true` when trade context scoring is needed. |
 | Public API receives many requests | Crawler or refresh loop. | Rate-limit headers, Caddy access log. |
 | `WinError 10013` on local Uvicorn | Windows reserved port range. | Run Uvicorn on another port, such as `8001`. |
 

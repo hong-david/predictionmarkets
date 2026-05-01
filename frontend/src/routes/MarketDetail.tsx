@@ -108,7 +108,7 @@ export default function MarketDetailPage() {
     () => buildChartNewsEvents(news.data?.articles ?? [], relatedSearchNews),
     [news.data?.articles, relatedSearchNews],
   );
-  const kalshiHref = kalshiMarketUrl(m?.market_id);
+  const kalshiHref = kalshiMarketUrl(m?.market_id, m?.event_id);
   const { tradeHighlights, topSuspiciousTrades } = useMemo(() => {
     const trades = series.data?.trades;
     if (!trades?.length) {
