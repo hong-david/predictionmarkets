@@ -51,6 +51,8 @@ services:
   pipeline:
     build: .
     restart: unless-stopped
+    healthcheck:
+      disable: true
     env_file:
       - .env
     environment:
