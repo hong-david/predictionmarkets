@@ -9,7 +9,10 @@ from app.api.routes.dashboard import (
     _metric_probability_float,
     _probability_float,
 )
-from app.services.market_lifecycle import market_lifecycle
+from app.services.market_lifecycle import (
+    market_lifecycle,
+    scheduled_event_date_from_market_id,
+)
 
 
 def _market(
@@ -103,6 +106,10 @@ def test_prior_day_scheduled_non_sports_market_is_historical_after_short_grace()
         )
         == "historical"
     )
+
+
+def test_invalid_date_like_ticker_fragment_is_ignored_for_lifecycle() -> None:
+    assert scheduled_event_date_from_market_id("KXODD-26MAY47-YES") is None
 
 
 def test_same_day_scheduled_sports_market_can_still_be_active() -> None:

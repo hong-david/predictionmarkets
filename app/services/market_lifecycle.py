@@ -47,7 +47,11 @@ SPORTS_EVENT_PREFIXES = (
     "KXCRICKET",
 )
 EVENT_DATE_TOKEN_PATTERN = (
-    r"\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}"
+    r"\d{2}(?:"
+    r"(?:JAN|MAR|MAY|JUL|AUG|OCT|DEC)(?:0[1-9]|[12]\d|3[01])|"
+    r"(?:APR|JUN|SEP|NOV)(?:0[1-9]|[12]\d|30)|"
+    r"FEB(?:0[1-9]|1\d|2[0-9])"
+    r")"
 )
 EVENT_DATE_TOKEN_RE = re.compile(EVENT_DATE_TOKEN_PATTERN)
 EVENT_DATE_STALE_AFTER = timedelta(hours=30)
