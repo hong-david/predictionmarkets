@@ -233,6 +233,33 @@ def _metric_notional_estimate(
     return max(0.0, float(price) * float(volume_24h_contracts))
 
 
+def _trade_dollar_volume_by_market_since(
+    db: Session, market_pks: list[int], *, since: datetime
+) -> dict[int, float]:
+    if not market_pks:
+        return {}
+    trade_price = case(
+        (
+            func.lower(func.coalesce(Trade.taker_side, "")) == "no",
+            Trade.no_price_dollars,
+        ),
+        else_=Trade.yes_price_dollars,
+    )
+    rows = (
+        db.query(
+            Trade.market_pk,
+            func.sum(
+                func.coalesce(Trade.count_fp, 0) * func.coalesce(trade_price, 0)
+            ).label("trade_dollar_volume"),
+        )
+        .filter(Trade.market_pk.in_(market_pks))
+        .filter(Trade.ts >= since)
+        .group_by(Trade.market_pk)
+        .all()
+    )
+    return {int(row.market_pk): float(row.trade_dollar_volume or 0.0) for row in rows}
+
+
 def _reason_codes_for_market_pks(
     db: Session, market_pks: list[int]
 ) -> dict[int, list[str]]:
@@ -258,6 +285,7 @@ def _serialize_market_row(
     anomaly_count: int = 0,
     last_price: float | None = None,
     volume_24h: float | None = None,
+    volume_total: float | None = None,
     trade_dollar_volume: float | None = None,
     reason_codes: list[str] | None = None,
     event_market_count: int | None = None,
@@ -291,6 +319,7 @@ def _serialize_market_row(
         "anomaly_count": ac,
         "last_price": _probability_float(last_price),
         "volume_24h": float(volume_24h) if volume_24h is not None else None,
+        "volume_total": float(volume_total) if volume_total is not None else None,
         "trade_dollar_volume": float(trade_dollar_volume)
         if trade_dollar_volume is not None
         else None,
@@ -338,6 +367,7 @@ def _latest_snapshot_values_for_market_pks(
             MarketSnapshot.yes_bid_dollars.label("yes_bid"),
             MarketSnapshot.yes_ask_dollars.label("yes_ask"),
             MarketSnapshot.volume_24h_fp.label("volume_24h"),
+            MarketSnapshot.volume_fp.label("volume_total"),
             func.row_number()
             .over(
                 partition_by=MarketSnapshot.market_pk,
@@ -355,6 +385,7 @@ def _latest_snapshot_values_for_market_pks(
             ranked.c.yes_bid,
             ranked.c.yes_ask,
             ranked.c.volume_24h,
+            ranked.c.volume_total,
         ).where(ranked.c.rn == 1)
     ).all()
 
@@ -374,6 +405,9 @@ def _latest_snapshot_values_for_market_pks(
             "last_price": _display_price(row),
             "volume_24h": float(row.volume_24h)
             if row.volume_24h is not None
+            else None,
+            "volume_total": float(row.volume_total)
+            if row.volume_total is not None
             else None,
         }
         for row in rows
@@ -399,7 +433,8 @@ def _latest_snapshot_values_for_market_pks(
         )
         for row in metric_rows:
             current = values.setdefault(
-                int(row.market_pk), {"last_price": None, "volume_24h": None}
+                int(row.market_pk),
+                {"last_price": None, "volume_24h": None, "volume_total": None},
             )
             if current["last_price"] is None and row.last_price_cents is not None:
                 current["last_price"] = _probability_float(
@@ -434,7 +469,8 @@ def _latest_snapshot_values_for_market_pks(
             if row.yes_price is None:
                 continue
             current = values.setdefault(
-                int(row.market_pk), {"last_price": None, "volume_24h": None}
+                int(row.market_pk),
+                {"last_price": None, "volume_24h": None, "volume_total": None},
             )
             if current["last_price"] is None:
                 current["last_price"] = _probability_float(row.yes_price)
@@ -1520,6 +1556,13 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
             .limit(limit)
             .all()
         )
+        market_pks = [int(market.id) for market, _metric in rows]
+        latest_by_pk = _latest_snapshot_values_for_market_pks(db, market_pks)
+        trade_dollars_24h = _trade_dollar_volume_by_market_since(
+            db,
+            market_pks,
+            since=_utc_now() - timedelta(hours=24),
+        )
         return {
             "count": len(rows),
             "markets": [
@@ -1535,10 +1578,8 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                         )
                     ),
                     volume_24h=metric.volume_24h_contracts,
-                    trade_dollar_volume=_metric_notional_estimate(
-                        price=price,
-                        volume_24h_contracts=metric.volume_24h_contracts,
-                    ),
+                    volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
+                    trade_dollar_volume=trade_dollars_24h.get(market.id, 0.0),
                     evidence_score=float(metric.evidence_score or 0.0),
                     urgency_score=float(metric.urgency_score or 0.0),
                     storage_tier=metric.storage_tier,
@@ -1606,6 +1647,7 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                 trade_count=trade_counts.get(market.id, 0),
                 last_price=latest_by_pk.get(market.id, {}).get("last_price"),
                 volume_24h=latest_by_pk.get(market.id, {}).get("volume_24h"),
+                volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
                 trade_dollar_volume=trade_dollars.get(market.id),
             )
             for market in rows

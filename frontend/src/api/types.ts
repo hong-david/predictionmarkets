@@ -77,6 +77,8 @@ export interface MarketRow {
   anomaly_count: number;
   last_price: number | null;
   volume_24h: number | null;
+  /** Exchange-reported cumulative contract volume since market inception, when present. */
+  volume_total: number | null;
   /** Classifier `manipulability_prior` bucket; “unclassified” if unknown. */
   market_priority: string;
   /** 0–100 from stored `anomalies` row mass (not prior). */
