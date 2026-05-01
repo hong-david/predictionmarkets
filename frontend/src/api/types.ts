@@ -102,6 +102,8 @@ export interface MarketRow {
 export interface MarketsList {
   total: number;
   filtered: number;
+  counts_exact?: boolean;
+  has_more?: boolean;
   limit: number;
   offset: number;
   markets: MarketRow[];
@@ -198,6 +200,8 @@ export interface SnapshotPoint {
 
 export interface MarketSeries {
   market_id: string;
+  partial?: boolean;
+  limit?: number;
   /** Rolling burst detector on the same tape as `trades` (30s default window). */
   tape_cluster: TapeCluster;
   trades: TradePoint[];

@@ -100,13 +100,15 @@ export default function MarketsBrowserPage() {
   ]);
 
   const totalLabel = list.data
-    ? activeFilterCount > 0
+    ? list.data.counts_exact === false
+      ? `showing ${fmtInt(list.data.markets.length)} markets from this page`
+      : activeFilterCount > 0
       ? `${fmtInt(list.data.filtered)} of ${fmtInt(list.data.total)} markets`
       : `${fmtInt(list.data.total)} markets`
     : "—";
 
   const page = Math.floor(params.offset / PAGE_SIZE) + 1;
-  const totalPages = list.data
+  const totalPages = list.data && list.data.counts_exact !== false
     ? Math.max(1, Math.ceil(list.data.filtered / PAGE_SIZE))
     : 1;
 
@@ -261,7 +263,9 @@ export default function MarketsBrowserPage() {
         {list.data && list.data.filtered > 0 ? (
           <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-t border-border bg-card/40 text-xs text-muted-foreground">
             <div>
-              Page {page} of {fmtInt(totalPages)} · showing {list.data.markets.length} of {fmtInt(list.data.filtered)}
+              {list.data.counts_exact === false
+                ? `Page ${page} · showing ${list.data.markets.length}`
+                : `Page ${page} of ${fmtInt(totalPages)} · showing ${list.data.markets.length} of ${fmtInt(list.data.filtered)}`}
             </div>
             <div className="flex items-center gap-1">
               <button
@@ -280,7 +284,11 @@ export default function MarketsBrowserPage() {
                 onClick={() =>
                   setParam("offset", String(params.offset + PAGE_SIZE))
                 }
-                disabled={params.offset + PAGE_SIZE >= list.data.filtered}
+                disabled={
+                  list.data.counts_exact === false
+                    ? !list.data.has_more
+                    : params.offset + PAGE_SIZE >= list.data.filtered
+                }
                 className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Next <ChevronRight className="h-3.5 w-3.5" />

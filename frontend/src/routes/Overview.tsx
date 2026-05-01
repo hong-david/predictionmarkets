@@ -100,17 +100,46 @@ function StatTile({
 export default function OverviewPage() {
   const navigate = useNavigate();
   const [marketScope, setMarketScope] = useState<MarketScope>("active");
-  const overview = useQuery({
-    queryKey: ["overview", marketScope],
-    queryFn: () => api.overview({ top: 10, anomalies: 10, market_scope: marketScope }),
-    refetchInterval: 8_000,
+  const stats = useQuery({
+    queryKey: ["stats", marketScope],
+    queryFn: () => api.stats({ market_scope: marketScope }),
+    refetchInterval: 20_000,
+    staleTime: 10_000,
   });
-  const st = overview.data?.stats;
-  const br = overview.data?.breakdown;
-  const topM = overview.data?.top_markets;
-  const recentFlags = overview.data?.recent_anomalies;
-  const suspiciousTrades = overview.data?.suspicious_trades;
-  const newsSignals = overview.data?.news_signals;
+  const breakdown = useQuery({
+    queryKey: ["breakdown", marketScope],
+    queryFn: () => api.breakdown({ market_scope: marketScope }),
+    staleTime: 5 * 60_000,
+  });
+  const topMarkets = useQuery({
+    queryKey: ["top-markets", marketScope],
+    queryFn: () => api.topMarkets(10, marketScope),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const recentAnomalies = useQuery({
+    queryKey: ["recent-anomalies", marketScope],
+    queryFn: () => api.recentAnomalies(10, undefined, marketScope),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const suspiciousTradeQuery = useQuery({
+    queryKey: ["suspicious-trades", marketScope],
+    queryFn: () => api.suspiciousTrades(12, marketScope),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+  const newsSignalQuery = useQuery({
+    queryKey: ["news-signals", marketScope],
+    queryFn: () => api.newsSignals(8, 4, marketScope),
+    staleTime: 5 * 60_000,
+  });
+  const st = stats.data;
+  const br = breakdown.data;
+  const topM = topMarkets.data;
+  const recentFlags = recentAnomalies.data;
+  const suspiciousTrades = suspiciousTradeQuery.data;
+  const newsSignals = newsSignalQuery.data;
   const newsDiagnostics = useQuery({
     queryKey: ["news-diagnostics"],
     queryFn: () => api.newsDiagnostics(),
@@ -126,16 +155,41 @@ export default function OverviewPage() {
     retry: 1,
   });
 
-  const updated = overview.dataUpdatedAt
-    ? `updated ${fmtAgo(new Date(overview.dataUpdatedAt).toISOString())}`
-    : "connecting…";
-  const tone = overview.isError ? "error" : overview.isFetching ? "stale" : "live";
-  const errMsg =
-    overview.error instanceof Error
-      ? overview.error.message
-      : String(overview.error ?? "unknown error");
+  const pageUpdatedAt = Math.max(
+    stats.dataUpdatedAt,
+    topMarkets.dataUpdatedAt,
+    recentAnomalies.dataUpdatedAt,
+    suspiciousTradeQuery.dataUpdatedAt,
+    newsSignalQuery.dataUpdatedAt,
+  );
+  const pagePending =
+    stats.isPending || breakdown.isPending || topMarkets.isPending;
+  const pageError =
+    stats.error ||
+    breakdown.error ||
+    topMarkets.error ||
+    recentAnomalies.error ||
+    suspiciousTradeQuery.error ||
+    newsSignalQuery.error;
 
-  if (overview.isError) {
+  const updated = pageUpdatedAt
+    ? `updated ${fmtAgo(new Date(pageUpdatedAt).toISOString())}`
+    : "connecting…";
+  const tone = pageError
+    ? "error"
+    : stats.isFetching ||
+        topMarkets.isFetching ||
+        recentAnomalies.isFetching ||
+        suspiciousTradeQuery.isFetching ||
+        newsSignalQuery.isFetching
+      ? "stale"
+      : "live";
+  const errMsg =
+    pageError instanceof Error
+      ? pageError.message
+      : String(pageError ?? "unknown error");
+
+  if (pageError && !st && !br && !topM) {
     return (
       <div className="space-y-4">
         <section className="flex items-center justify-between">
@@ -166,7 +220,14 @@ export default function OverviewPage() {
                 </p>
                 <button
                   type="button"
-                  onClick={() => void overview.refetch()}
+                  onClick={() => {
+                    void stats.refetch();
+                    void breakdown.refetch();
+                    void topMarkets.refetch();
+                    void recentAnomalies.refetch();
+                    void suspiciousTradeQuery.refetch();
+                    void newsSignalQuery.refetch();
+                  }}
                   className="text-sm rounded-md border border-border bg-card px-3 py-1.5 hover:bg-secondary transition-colors"
                 >
                   Retry
@@ -199,7 +260,7 @@ export default function OverviewPage() {
       </section>
 
       <section className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-3 gap-3">
-        {overview.isPending ? (
+        {pagePending ? (
           Array.from({ length: 6 }).map((_, i) => (
             <Skeleton key={i} className="h-[88px]" />
           ))
@@ -262,7 +323,7 @@ export default function OverviewPage() {
                     color: PRIOR_COLOR[b.key] ?? "hsl(var(--primary))",
                   }))
               }
-              loading={overview.isPending}
+              loading={breakdown.isPending}
               yTick={(v: string) => priorShort(v)}
               onBarClick={(row) =>
                 navigate(
@@ -290,7 +351,7 @@ export default function OverviewPage() {
                     color: `hsl(var(--chart-${(i % 5) + 1}))`,
                   }))
               }
-              loading={overview.isPending}
+              loading={breakdown.isPending}
               yTick={(v: string) => categoryDisplay(v)}
               onBarClick={(row) =>
                 navigate(
@@ -309,7 +370,7 @@ export default function OverviewPage() {
             subtitle="Active/open markets with the most retained execution prints, 24h retained trade dollars, and exchange-reported lifetime volume."
           />
           <div className="flex-1 overflow-x-auto">
-            {overview.isPending ? (
+            {topMarkets.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
               </div>
@@ -362,7 +423,7 @@ export default function OverviewPage() {
             }
           />
           <div className="flex-1 overflow-x-auto">
-            {overview.isPending ? (
+            {recentAnomalies.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
               </div>
@@ -433,7 +494,7 @@ export default function OverviewPage() {
           }
         />
         <div className="overflow-x-auto">
-          {overview.isPending ? (
+          {newsSignalQuery.isPending ? (
             <div className="p-4">
               <Skeleton className="h-32" />
             </div>
@@ -487,7 +548,7 @@ export default function OverviewPage() {
           }
         />
         <div className="overflow-x-auto">
-          {overview.isPending ? (
+          {suspiciousTradeQuery.isPending ? (
             <div className="p-4">
               <Skeleton className="h-32" />
             </div>

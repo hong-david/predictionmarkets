@@ -31,19 +31,23 @@ export default function MarketDetailPage() {
     queryKey: ["marketDetail", marketId],
     queryFn: () => api.marketDetail(marketId),
     enabled: !!marketId,
-    refetchInterval: 5_000,
+    refetchInterval: 30_000,
+    staleTime: 10_000,
   });
+  const isActiveMarket = detail.data?.market_lifecycle === "active";
   const series = useQuery({
     queryKey: ["marketSeries", marketId],
-    queryFn: () => api.marketSeries(marketId, 2000),
+    queryFn: () => api.marketSeries(marketId, 600),
     enabled: !!marketId,
-    refetchInterval: 5_000,
+    refetchInterval: isActiveMarket ? 15_000 : false,
+    staleTime: 10_000,
   });
   const anomalies = useQuery({
     queryKey: ["marketAnomalies", marketId],
     queryFn: () => api.marketAnomalies(marketId, 50),
     enabled: !!marketId,
-    refetchInterval: 10_000,
+    refetchInterval: isActiveMarket ? 30_000 : false,
+    staleTime: 15_000,
   });
   const news = useQuery({
     queryKey: ["marketNews", marketId, newsAlign],

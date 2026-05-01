@@ -85,15 +85,22 @@ export const api = {
       | string;
     limit?: number;
     offset?: number;
+    include_counts?: boolean;
   }) => get<MarketsList>("/api/dashboard/markets", params),
   /** Kalshi `event_ticker` = `Market.event_id`: all leg contracts in one event. */
   eventGroup: (eventId: string) =>
     get<EventGroup>(`/api/dashboard/events/${encodeURIComponent(eventId)}`),
   marketDetail: (id: string) =>
     get<MarketDetail>(`/api/dashboard/markets/${encodeURIComponent(id)}`),
-  marketSeries: (id: string, limit = 2000) =>
+  marketSeries: (
+    id: string,
+    limit = 600,
+    opts?: { since?: string | null; includeContext?: boolean },
+  ) =>
     get<MarketSeries>(`/api/dashboard/markets/${encodeURIComponent(id)}/series`, {
       limit,
+      since: opts?.since,
+      include_context: opts?.includeContext,
     }),
   marketAnomalies: (id: string, limit = 50) =>
     get<MarketAnomalies>(
@@ -109,16 +116,27 @@ export const api = {
       limit,
       align: opts?.align,
     }),
-  topMarkets: (limit = 15) =>
-    get<TopMarketsList>("/api/dashboard/top-markets", { limit }),
-  recentAnomalies: (limit = 20, severity?: string) =>
-    get<RecentAnomaliesList>("/api/dashboard/anomalies", { limit, severity }),
-  suspiciousTrades: (limit = 25) =>
-    get<SuspiciousTradesList>("/api/dashboard/suspicious-trades", { limit }),
-  newsSignals: (limit = 25, minScore = 4) =>
+  topMarkets: (limit = 15, marketScope?: MarketScope) =>
+    get<TopMarketsList>("/api/dashboard/top-markets", {
+      limit,
+      market_scope: marketScope,
+    }),
+  recentAnomalies: (limit = 20, severity?: string, marketScope?: MarketScope) =>
+    get<RecentAnomaliesList>("/api/dashboard/anomalies", {
+      limit,
+      severity,
+      market_scope: marketScope,
+    }),
+  suspiciousTrades: (limit = 25, marketScope?: MarketScope) =>
+    get<SuspiciousTradesList>("/api/dashboard/suspicious-trades", {
+      limit,
+      market_scope: marketScope,
+    }),
+  newsSignals: (limit = 25, minScore = 4, marketScope?: MarketScope) =>
     get<NewsSignalsList>("/api/dashboard/news-signals", {
       limit,
       min_score: minScore,
+      market_scope: marketScope,
     }),
   newsDiagnostics: () => get<NewsDiagnostics>("/api/dashboard/news-diagnostics"),
   historicalSignalQa: (params?: {

@@ -100,6 +100,11 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _DASHBOARD_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_CACHE_TTL_SEC", "300"))
+_DASHBOARD_STATS_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_STATS_CACHE_TTL_SEC", "20"))
+_DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", "60"))
+_DASHBOARD_STATIC_CACHE_TTL_SEC = float(
+    os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
+)
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
@@ -113,8 +118,11 @@ _CLICKHOUSE_COUNT_TABLES = {
     "kalshi_l2_events_raw",
 }
 
-def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
+def _cached_dashboard_payload(
+    key: str, build: Callable[[], T], *, ttl_sec: float | None = None
+) -> T:
     now = time.monotonic()
+    ttl = _DASHBOARD_CACHE_TTL_SEC if ttl_sec is None else ttl_sec
     r = _dashboard_redis()
     redis_key = f"dashboard:{key}"
     if r is not None:
@@ -127,13 +135,13 @@ def _cached_dashboard_payload(key: str, build: Callable[[], T]) -> T:
 
     with _dashboard_cache_lock:
         cached = _dashboard_cache.get(key)
-        if cached and now - cached[0] < _DASHBOARD_CACHE_TTL_SEC:
+        if cached and now - cached[0] < ttl:
             return cached[1]  # type: ignore[return-value]
 
     payload = build()
     if r is not None:
         try:
-            r.setex(redis_key, int(_DASHBOARD_CACHE_TTL_SEC), orjson.dumps(payload))
+            r.setex(redis_key, max(1, int(ttl)), orjson.dumps(payload))
         except Exception as exc:
             logger.debug("dashboard redis cache write failed: %s", exc)
     with _dashboard_cache_lock:
@@ -1337,7 +1345,9 @@ def get_stats(
 ) -> dict:
     """Coarse system-wide counts. Drives the overview header."""
     return _cached_dashboard_payload(
-        f"stats:{market_scope}", lambda: _stats_payload(db, market_scope=market_scope)
+        f"stats:{market_scope}",
+        lambda: _stats_payload(db, market_scope=market_scope),
+        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
     )
 
 
@@ -1358,6 +1368,7 @@ def get_breakdown(
     return _cached_dashboard_payload(
         f"breakdown:{market_scope}",
         lambda: _breakdown_payload(db, market_scope=market_scope),
+        ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
 
 
@@ -2123,6 +2134,7 @@ def get_dashboard_overview(
                 market_scope=market_scope,
             ),
         },
+        ttl_sec=_DASHBOARD_LIST_CACHE_TTL_SEC,
     )
 
 
@@ -2163,6 +2175,10 @@ def list_markets(
         default=True,
         description="Only include markets with retained trade data.",
     ),
+    include_counts: bool = Query(
+        default=False,
+        description="When false, skip exact count(*) totals and return has_more instead.",
+    ),
     sort: str = Query(
         default="news_linked_trade_flag",
         description=(
@@ -2192,7 +2208,7 @@ def list_markets(
         f"confidence={confidence or ''}:status={status or ''}:"
         f"market_scope={market_scope}:"
         f"include_unhydrated={int(include_unhydrated)}:"
-        f"data_only={int(data_only)}:sort={sort}:"
+        f"data_only={int(data_only)}:include_counts={int(include_counts)}:sort={sort}:"
         f"limit={limit}:offset={offset}"
     )
     return _cached_dashboard_payload(
@@ -2206,11 +2222,13 @@ def list_markets(
             market_scope=market_scope,
             include_unhydrated=include_unhydrated,
             data_only=data_only,
+            include_counts=include_counts,
             sort=sort,
             limit=limit,
             offset=offset,
             db=db,
         ),
+        ttl_sec=_DASHBOARD_LIST_CACHE_TTL_SEC,
     )
 
 
@@ -2224,6 +2242,7 @@ def _list_markets_uncached(
     market_scope: str,
     include_unhydrated: bool,
     data_only: bool,
+    include_counts: bool,
     sort: str,
     limit: int,
     offset: int,
@@ -2273,33 +2292,37 @@ def _list_markets_uncached(
         else:
             filters.append(exists().where(Trade.market_pk == Market.id))
 
-    total_filters = [] if include_unhydrated else _hydrated_market_filters()
-    total_filters.extend(_market_scope_filters(market_scope))
-    if data_only:
-        if metrics_available:
-            total_filters.append(
-                exists().where(
-                    and_(
-                        MarketMetric.market_pk == Market.id,
-                        MarketMetric.trade_count > 0,
+    total: int | None = None
+    filtered: int | None = None
+    if include_counts:
+        total_filters = [] if include_unhydrated else _hydrated_market_filters()
+        total_filters.extend(_market_scope_filters(market_scope))
+        if data_only:
+            if metrics_available:
+                total_filters.append(
+                    exists().where(
+                        and_(
+                            MarketMetric.market_pk == Market.id,
+                            MarketMetric.trade_count > 0,
+                        )
                     )
                 )
-            )
-        else:
-            total_filters.append(exists().where(Trade.market_pk == Market.id))
-    total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
-    filtered = (
-        db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
-        if filters
-        else total
-    )
+            else:
+                total_filters.append(exists().where(Trade.market_pk == Market.id))
+        total = db.query(func.count(Market.id)).filter(*total_filters).scalar() or 0
+        filtered = (
+            db.query(func.count(Market.id)).filter(and_(*filters)).scalar()
+            if filters
+            else total
+        )
 
     if metrics_available:
         return _list_markets_from_metric_projection(
             db=db,
             filters=filters,
-            total=int(total),
-            filtered=int(filtered),
+            total=int(total) if total is not None else None,
+            filtered=int(filtered) if filtered is not None else None,
+            counts_exact=include_counts,
             sort=sort,
             limit=limit,
             offset=offset,
@@ -2399,7 +2422,10 @@ def _list_markets_uncached(
             func.coalesce(trade_count_sq.c.c, 0).desc(),
         )
 
-    rows = base.offset(offset).limit(limit).all()
+    query_limit = limit if include_counts else limit + 1
+    rows = base.offset(offset).limit(query_limit).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     latest_by_pk = _latest_snapshot_values_for_market_pks(
         db, [int(r[0].id) for r in rows]
     )
@@ -2435,8 +2461,14 @@ def _list_markets_uncached(
     ]
 
     return {
-        "total": int(total),
-        "filtered": int(filtered),
+        "total": int(total)
+        if total is not None
+        else offset + len(items) + (1 if has_more else 0),
+        "filtered": int(filtered)
+        if filtered is not None
+        else offset + len(items) + (1 if has_more else 0),
+        "counts_exact": include_counts,
+        "has_more": has_more if not include_counts else offset + limit < int(filtered or 0),
         "limit": limit,
         "offset": offset,
         "markets": items,
@@ -2447,8 +2479,9 @@ def _list_markets_from_metric_projection(
     *,
     db: Session,
     filters: list,
-    total: int,
-    filtered: int,
+    total: int | None,
+    filtered: int | None,
+    counts_exact: bool,
     sort: str,
     limit: int,
     offset: int,
@@ -2535,7 +2568,10 @@ def _list_markets_from_metric_projection(
     else:
         base = base.order_by(_prior_rank().desc(), trade_count_col.desc())
 
-    rows = base.offset(offset).limit(limit).all()
+    query_limit = limit if counts_exact else limit + 1
+    rows = base.offset(offset).limit(query_limit).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
     event_ids = [row[0].event_id for row in rows if row[0].event_id]
     event_counts = {}
     if event_ids:
@@ -2585,8 +2621,12 @@ def _list_markets_from_metric_projection(
         )
 
     return {
-        "total": total,
-        "filtered": filtered,
+        "total": int(total) if total is not None else offset + len(items) + (1 if has_more else 0),
+        "filtered": int(filtered)
+        if filtered is not None
+        else offset + len(items) + (1 if has_more else 0),
+        "counts_exact": counts_exact,
+        "has_more": has_more if not counts_exact else offset + limit < int(filtered or 0),
         "limit": limit,
         "offset": offset,
         "markets": items,
@@ -2644,26 +2684,29 @@ def get_event_group(event_id: str, db: Session = Depends(get_db)) -> dict:
         )
 
     pks = [m.id for m in markets_list]
-    tcount = _trade_counts_by_market(db, pks)
-    acount = _anomaly_counts_by_market(db, pks)
+    metrics = {
+        int(row.market_pk): row
+        for row in db.query(MarketMetric).filter(MarketMetric.market_pk.in_(pks)).all()
+    }
+    tcount = {
+        pk: int(metric.trade_count or 0) for pk, metric in metrics.items()
+    } or _trade_counts_by_market(db, pks)
+    acount = {
+        pk: int(metric.anomaly_count or 0) for pk, metric in metrics.items()
+    } or _anomaly_counts_by_market(db, pks)
     rmap = _reason_codes_for_market_pks(db, pks)
+    latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
 
     market_payloads: list[dict] = []
     for m in markets_list:
-        latest_snap = (
-            db.query(MarketSnapshot)
-            .filter(MarketSnapshot.market_pk == m.id)
-            .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-            .first()
-        )
-        last_price = (
-            float(latest_snap.last_price_dollars)
-            if latest_snap and latest_snap.last_price_dollars is not None
-            else None
-        )
-        volume_24h = (
-            float(latest_snap.volume_24h_fp)
-            if latest_snap and latest_snap.volume_24h_fp is not None
+        metric = metrics.get(m.id)
+        metric_last_price = (
+            _metric_probability_float(
+                last_price_cents=metric.last_price_cents,
+                yes_bid_cents=metric.yes_bid_cents,
+                yes_ask_cents=metric.yes_ask_cents,
+            )
+            if metric is not None
             else None
         )
         market_payloads.append(
@@ -2671,8 +2714,15 @@ def get_event_group(event_id: str, db: Session = Depends(get_db)) -> dict:
                 m,
                 trade_count=tcount.get(m.id, 0),
                 anomaly_count=acount.get(m.id, 0),
-                last_price=last_price,
-                volume_24h=volume_24h,
+                last_price=metric_last_price
+                if metric_last_price is not None
+                else latest_by_pk.get(m.id, {}).get("last_price"),
+                volume_24h=(
+                    float(metric.volume_24h_contracts)
+                    if metric is not None and metric.volume_24h_contracts is not None
+                    else latest_by_pk.get(m.id, {}).get("volume_24h")
+                ),
+                volume_total=latest_by_pk.get(m.id, {}).get("volume_total"),
                 reason_codes=rmap.get(m.id, []),
             )
         )
@@ -2792,7 +2842,15 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
 @router.get("/markets/{market_id}/series")
 def get_market_series(
     market_id: str,
-    limit: int = Query(default=2000, ge=10, le=10000),
+    limit: int = Query(default=600, ge=10, le=5000),
+    since: str | None = Query(
+        default=None,
+        description="Optional ISO timestamp; when set, return rows newer than this.",
+    ),
+    include_context: bool = Query(
+        default=False,
+        description="Include expensive peer/news/sibling context scores.",
+    ),
     db: Session = Depends(get_db),
 ) -> dict:
     """Trade time-series + snapshot time-series for the chart.
@@ -2802,23 +2860,25 @@ def get_market_series(
     directly. Snapshots are returned alongside for top-of-book context.
     """
     market = _get_market_or_404(db, market_id)
+    since_dt: datetime | None = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid since timestamp")
 
-    trade_rows = (
-        db.query(Trade)
-        .filter(Trade.market_pk == market.id)
-        .order_by(Trade.ts.desc(), Trade.id.desc())
-        .limit(limit)
-        .all()
-    )
+    trade_query = db.query(Trade).filter(Trade.market_pk == market.id)
+    if since_dt is not None:
+        trade_query = trade_query.filter(Trade.ts > since_dt)
+    trade_rows = trade_query.order_by(Trade.ts.desc(), Trade.id.desc()).limit(limit).all()
     trade_rows = list(reversed(trade_rows))
 
-    snap_rows = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-        .limit(limit)
-        .all()
-    )
+    snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market.id)
+    if since_dt is not None:
+        snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
+    snap_rows = snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc()).limit(
+        min(limit, 1000)
+    ).all()
     snap_rows = list(reversed(snap_rows))
 
     trade_payloads = [
@@ -2839,31 +2899,34 @@ def get_market_series(
     ]
     snapshot_payloads = [_snapshot_payload(s) for s in snap_rows]
     explanations = explain_trades_against_window(trade_payloads, window=50)
-    peer_rows = _peer_baseline_rows_for_market(db, market)
-    peer_baselines = build_peer_baselines(peer_rows, min_points=12)
-    peer_key = (
-        str(market.category or "unclassified"),
-        str(market.subcategory or "*"),
-    )
-    first_trade_ts = trade_rows[0].ts if trade_rows else None
-    last_trade_ts = trade_rows[-1].ts if trade_rows else None
-    contextual = explain_trades_with_context(
-        trade_payloads,
-        market=_market_context(market),
-        snapshots=snapshot_payloads,
-        local_explanations=explanations,
-        peer_baseline=peer_baselines.get(peer_key)
-        or peer_baselines.get((peer_key[0], "*")),
-        news_events=_news_context_for_market(db, market),
-        sibling_snapshots=_sibling_snapshot_context(
-            db,
-            market,
-            start=first_trade_ts,
-            end=last_trade_ts,
-        ),
-    )
+    contextual: list[dict | None] = []
+    if include_context:
+        peer_rows = _peer_baseline_rows_for_market(db, market, limit=1500)
+        peer_baselines = build_peer_baselines(peer_rows, min_points=12)
+        peer_key = (
+            str(market.category or "unclassified"),
+            str(market.subcategory or "*"),
+        )
+        first_trade_ts = trade_rows[0].ts if trade_rows else None
+        last_trade_ts = trade_rows[-1].ts if trade_rows else None
+        contextual = explain_trades_with_context(
+            trade_payloads,
+            market=_market_context(market),
+            snapshots=snapshot_payloads,
+            local_explanations=explanations,
+            peer_baseline=peer_baselines.get(peer_key)
+            or peer_baselines.get((peer_key[0], "*")),
+            news_events=_news_context_for_market(db, market),
+            sibling_snapshots=_sibling_snapshot_context(
+                db,
+                market,
+                start=first_trade_ts,
+                end=last_trade_ts,
+                limit=800,
+            ),
+        )
     for i, explanation in enumerate(explanations):
-        context = contextual[i] if i < len(contextual) else None
+        context = contextual[i] if include_context and i < len(contextual) else None
         local_score = float(explanation["score"]) if explanation is not None else 0.0
         context_score = float(context["score"]) if context is not None else 0.0
         combined_score = max(local_score, context_score)
@@ -2894,6 +2957,8 @@ def get_market_series(
 
     return {
         "market_id": market.market_id,
+        "partial": since_dt is not None,
+        "limit": limit,
         "tape_cluster": {
             "burst_score_0_10": burst["burst_score_0_10"],
             "largest_window_count": burst["largest_window_count"],
@@ -2957,6 +3022,7 @@ def list_recent_anomalies(
         lambda: _recent_anomalies_payload(
             db, limit, severity, market_scope=market_scope
         ),
+        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
     )
 
 
@@ -2970,6 +3036,7 @@ def get_top_markets(
     return _cached_dashboard_payload(
         f"top_markets:{limit}:{market_scope}",
         lambda: _top_markets_payload(db, limit, market_scope=market_scope),
+        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
     )
 
 
@@ -2984,6 +3051,7 @@ def get_suspicious_trades(
         lambda: _suspicious_trades_payload(
             db, limit=limit, market_scope=market_scope
         ),
+        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
     )
 
 
@@ -3007,6 +3075,7 @@ def get_news_signals(
             include_ambiguous=include_ambiguous,
             market_scope=market_scope,
         ),
+        ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
 
 
