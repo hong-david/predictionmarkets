@@ -92,7 +92,18 @@ def _news_summary(db: Session, market: Market) -> dict[str, Any]:
     }
 
 
-def _anomaly_summary(db: Session, market: Market) -> dict[str, Any]:
+def _anomaly_summary(
+    db: Session,
+    market: Market,
+    metric: MarketMetric | None = None,
+) -> dict[str, Any]:
+    if metric is not None:
+        return {
+            "count": int(metric.anomaly_count or 0),
+            "high_count": int(metric.high_anomaly_count or 0),
+            "last_ts": _iso(metric.last_anomaly_ts),
+        }
+
     high_case = case((Anomaly.severity.in_(("high", "critical")), 1), else_=0)
     count, high_count, last_ts = (
         db.query(
@@ -165,7 +176,7 @@ def historical_signal_report(
     for market, metric in rows:
         flags = _flag_summary(db, market, min_flag_score=min_flag_score)
         news = _news_summary(db, market)
-        anomalies = _anomaly_summary(db, market)
+        anomalies = _anomaly_summary(db, market, metric)
         trade_count = int(metric.trade_count or 0)
         markets.append(
             {
