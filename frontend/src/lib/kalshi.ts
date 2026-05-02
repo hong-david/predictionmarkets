@@ -4,5 +4,6 @@ export function kalshiMarketUrl(
 ): string | null {
   const ticker = (eventId || marketId || "").trim();
   if (!ticker) return null;
-  return `https://kalshi.com/markets/${encodeURIComponent(ticker.toLowerCase())}`;
+
+  return `https://kalshi.com/search?q=${encodeURIComponent(ticker.toLowerCase())}`;
 }

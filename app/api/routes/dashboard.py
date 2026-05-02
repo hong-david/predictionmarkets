@@ -100,8 +100,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _DASHBOARD_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_CACHE_TTL_SEC", "300"))
-_DASHBOARD_STATS_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_STATS_CACHE_TTL_SEC", "20"))
-_DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", "60"))
+# Defaults stay above typical cache-warm intervals (~200s) so Redis keys survive between warms.
+_DASHBOARD_STATS_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_STATS_CACHE_TTL_SEC", "300"))
+_DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", "300"))
 _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
     os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
 )

@@ -112,7 +112,7 @@ services:
       - "5000"
       - --with-dashboard-cache-warmer
       - --dashboard-cache-warm-interval-seconds
-      - "200"
+      - "120"
       - --dashboard-cache-warm-market-scopes
       - active
     depends_on:
