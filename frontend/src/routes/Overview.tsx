@@ -32,6 +32,10 @@ import { categoryDisplay, priorDisplay, priorShort } from "@/lib/labels";
 import { EmptyState, Skeleton, StatusDot } from "@/components/StatusBits";
 import { fmtAgo, fmtDollars, fmtInt, fmtPrice, fmtTime } from "@/lib/utils";
 
+/** Match `GET /api/dashboard/overview` defaults used on first paint and in `warm_dashboard_cache_once`. */
+const OVERVIEW_TOP = 10;
+const OVERVIEW_ANOMALIES = 10;
+
 /** Order priors high → low so chart bars line up with intuition. */
 const PRIOR_ORDER: Record<string, number> = {
   high: 0,
@@ -100,49 +104,28 @@ function StatTile({
 export default function OverviewPage() {
   const navigate = useNavigate();
   const [marketScope, setMarketScope] = useState<MarketScope>("active");
-  const stats = useQuery({
-    queryKey: ["stats", marketScope],
-    queryFn: () => api.stats({ market_scope: marketScope }),
-    refetchInterval: 20_000,
-    staleTime: 10_000,
+  const overview = useQuery({
+    queryKey: ["overview", marketScope, OVERVIEW_TOP, OVERVIEW_ANOMALIES],
+    queryFn: () =>
+      api.overview({
+        top: OVERVIEW_TOP,
+        anomalies: OVERVIEW_ANOMALIES,
+        market_scope: marketScope,
+      }),
+    refetchInterval: 25_000,
+    staleTime: 12_000,
   });
-  const breakdown = useQuery({
-    queryKey: ["breakdown", marketScope],
-    queryFn: () => api.breakdown({ market_scope: marketScope }),
-    staleTime: 5 * 60_000,
-  });
-  const topMarkets = useQuery({
-    queryKey: ["top-markets", marketScope],
-    queryFn: () => api.topMarkets(10, marketScope),
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  const recentAnomalies = useQuery({
-    queryKey: ["recent-anomalies", marketScope],
-    queryFn: () => api.recentAnomalies(10, undefined, marketScope),
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  const suspiciousTradeQuery = useQuery({
-    queryKey: ["suspicious-trades", marketScope],
-    queryFn: () => api.suspiciousTrades(12, marketScope),
-    refetchInterval: 30_000,
-    staleTime: 15_000,
-  });
-  const newsSignalQuery = useQuery({
-    queryKey: ["news-signals", marketScope],
-    queryFn: () => api.newsSignals(8, 4, marketScope),
-    staleTime: 5 * 60_000,
-  });
-  const st = stats.data;
-  const br = breakdown.data;
-  const topM = topMarkets.data;
-  const recentFlags = recentAnomalies.data;
-  const suspiciousTrades = suspiciousTradeQuery.data;
-  const newsSignals = newsSignalQuery.data;
+  const st = overview.data?.stats;
+  const br = overview.data?.breakdown;
+  const topM = overview.data?.top_markets;
+  const recentFlags = overview.data?.recent_anomalies;
+  const suspiciousTrades = overview.data?.suspicious_trades;
+  const newsSignals = overview.data?.news_signals;
+  const secondaryReady = overview.isSuccess;
   const newsDiagnostics = useQuery({
     queryKey: ["news-diagnostics"],
     queryFn: () => api.newsDiagnostics(),
+    enabled: secondaryReady,
     refetchInterval: 30_000,
     staleTime: 15_000,
     retry: 1,
@@ -150,38 +133,22 @@ export default function OverviewPage() {
   const historicalQa = useQuery({
     queryKey: ["historical-signal-qa"],
     queryFn: () => api.historicalSignalQa({ limit: 6, min_flag_score: 5 }),
+    enabled: secondaryReady,
     refetchInterval: 60_000,
     staleTime: 30_000,
     retry: 1,
   });
 
-  const pageUpdatedAt = Math.max(
-    stats.dataUpdatedAt,
-    topMarkets.dataUpdatedAt,
-    recentAnomalies.dataUpdatedAt,
-    suspiciousTradeQuery.dataUpdatedAt,
-    newsSignalQuery.dataUpdatedAt,
-  );
-  const pagePending =
-    stats.isPending || breakdown.isPending || topMarkets.isPending;
-  const pageError =
-    stats.error ||
-    breakdown.error ||
-    topMarkets.error ||
-    recentAnomalies.error ||
-    suspiciousTradeQuery.error ||
-    newsSignalQuery.error;
+  const pageUpdatedAt = overview.dataUpdatedAt;
+  const pagePending = overview.isPending;
+  const pageError = overview.error;
 
   const updated = pageUpdatedAt
     ? `updated ${fmtAgo(new Date(pageUpdatedAt).toISOString())}`
     : "connecting…";
   const tone = pageError
     ? "error"
-    : stats.isFetching ||
-        topMarkets.isFetching ||
-        recentAnomalies.isFetching ||
-        suspiciousTradeQuery.isFetching ||
-        newsSignalQuery.isFetching
+    : overview.isFetching
       ? "stale"
       : "live";
   const errMsg =
@@ -221,12 +188,7 @@ export default function OverviewPage() {
                 <button
                   type="button"
                   onClick={() => {
-                    void stats.refetch();
-                    void breakdown.refetch();
-                    void topMarkets.refetch();
-                    void recentAnomalies.refetch();
-                    void suspiciousTradeQuery.refetch();
-                    void newsSignalQuery.refetch();
+                    void overview.refetch();
                   }}
                   className="text-sm rounded-md border border-border bg-card px-3 py-1.5 hover:bg-secondary transition-colors"
                 >
@@ -323,7 +285,7 @@ export default function OverviewPage() {
                     color: PRIOR_COLOR[b.key] ?? "hsl(var(--primary))",
                   }))
               }
-              loading={breakdown.isPending}
+              loading={overview.isPending}
               yTick={(v: string) => priorShort(v)}
               onBarClick={(row) =>
                 navigate(
@@ -351,7 +313,7 @@ export default function OverviewPage() {
                     color: `hsl(var(--chart-${(i % 5) + 1}))`,
                   }))
               }
-              loading={breakdown.isPending}
+              loading={overview.isPending}
               yTick={(v: string) => categoryDisplay(v)}
               onBarClick={(row) =>
                 navigate(
@@ -370,7 +332,7 @@ export default function OverviewPage() {
             subtitle="Active/open markets with the most retained execution prints, 24h retained trade dollars, and exchange-reported lifetime volume."
           />
           <div className="flex-1 overflow-x-auto">
-            {topMarkets.isPending ? (
+            {overview.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
               </div>
@@ -423,7 +385,7 @@ export default function OverviewPage() {
             }
           />
           <div className="flex-1 overflow-x-auto">
-            {recentAnomalies.isPending ? (
+            {overview.isPending ? (
               <div className="p-4">
                 <Skeleton className="h-32" />
               </div>
@@ -494,11 +456,11 @@ export default function OverviewPage() {
           }
         />
         <div className="overflow-x-auto">
-          {newsSignalQuery.isPending ? (
+          {overview.isPending ? (
             <div className="p-4">
               <Skeleton className="h-32" />
             </div>
-          ) : !newsSignals?.signals.length ? (
+          ) : !newsSignals?.signals?.length ? (
             <EmptyState>
               No news-linked signals to show yet. Stored articles may exist, but none
               currently pass the market-link relevance and trade-timing filters.
@@ -548,7 +510,7 @@ export default function OverviewPage() {
           }
         />
         <div className="overflow-x-auto">
-          {suspiciousTradeQuery.isPending ? (
+          {overview.isPending ? (
             <div className="p-4">
               <Skeleton className="h-32" />
             </div>
@@ -641,19 +603,24 @@ function PipelineHealthWidget() {
   const health = useQuery({
     queryKey: ["pipeline-health"],
     queryFn: () => api.pipelineHealth(),
-    refetchInterval: 10_000,
-    staleTime: 5_000,
+    enabled: expanded,
+    staleTime: 45_000,
+    refetchInterval: expanded ? 120_000 : false,
     retry: 1,
   });
   const data = health.data;
   const summaryTone = health.isError
     ? "error"
-    : pipelineSummaryTone(data?.summary.status);
+    : !expanded
+      ? "empty"
+      : pipelineSummaryTone(data?.summary.status);
   const summaryText = health.isError
     ? "Health unavailable"
-    : health.isPending && !data
-      ? "Checking"
-      : pipelineSummaryText(data);
+    : !expanded
+      ? "Expand for status"
+      : health.isPending && !data
+        ? "Checking…"
+        : pipelineSummaryText(data);
   const errorMessage =
     health.error instanceof Error
       ? health.error.message

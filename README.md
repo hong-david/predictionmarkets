@@ -381,11 +381,16 @@ flowchart LR
 
 Important API surfaces:
 
-- `GET /api/dashboard/overview` remains available, but the frontend now loads
-  the home page as smaller cached section requests so one slow section does not
-  block the first paint.
+- `GET /api/dashboard/overview` bundles stats, breakdown, top markets, recent
+  anomalies, suspicious trades, and news signals in one JSON response (Redis
+  cache key `overview:{top}:{anomalies}:{severity}:{scope}`). The Overview page
+  in `frontend/src/routes/Overview.tsx` uses this as **first paint** (`top=10`,
+  `anomalies=10`, current `market_scope`); the cache warmer primes the same
+  keys per scope. News diagnostics, historical QA, and **pipeline health** load
+  afterward so the first round-trip is not competing with those heavier reads.
 - `GET /api/dashboard/stats`, `/breakdown`, `/top-markets`, `/anomalies`,
-  `/suspicious-trades`, and `/news-signals` serve the home page sections.
+  `/suspicious-trades`, and `/news-signals` remain available for granular refresh
+  or other clients.
 - `GET /api/dashboard/markets` lists active or historical markets with filters.
   It defaults to cheap pagination with `counts_exact=false` and `has_more`.
   Exact counts are optional with `include_counts=true`.
@@ -396,7 +401,10 @@ Important API surfaces:
 - `GET /api/dashboard/markets/{market_id}/news` returns stored and search-backed
   related news.
 - `GET /api/dashboard/search` searches markets and stored news.
-- `GET /api/dashboard/pipeline-health` shows freshness and counts for jobs.
+- `GET /api/dashboard/pipeline-health` shows freshness and counts for jobs. It
+  is cached with `DASHBOARD_STATIC_CACHE_TTL_SEC` because the handler aggregates
+  many counts; the Overview UI only requests it after the user expands the
+  pipeline health control.
 - `GET /api/dashboard/storage-health` reports disk and table pressure.
 
 The frontend uses URL search params on `/markets` so filtered views can be
@@ -406,10 +414,10 @@ The market detail chart clamps probability-like prices to `[0, 1]` both in the
 API payload and before rendering. Chart arrows are reserved for stronger saved
 market activity alerts, so low-level alert history does not crowd the chart.
 
-The dashboard favors small, cacheable reads. Home page sections are fetched
-independently, market lists read compact projections first, event pages batch
-latest snapshots for related contracts, and market detail pages poll less often.
-Historical market pages do not poll live endpoints.
+The dashboard favors small, cacheable reads. The home **Overview** uses one
+bundled read first, then secondary panels; market lists read compact projections
+first, event pages batch latest snapshots for related contracts, and market
+detail pages poll less often. Historical market pages do not poll live endpoints.
 
 Dashboard pages:
 
@@ -476,6 +484,24 @@ Scores are also separated:
 | Optional hot stores | ClickHouse/OpenSearch help when available. | Postgres remains responsible for correctness. |
 | Retention-first design | Budget deployments stay manageable. | Some low-value raw detail is intentionally discarded. |
 
+## Changelog
+
+### 2026-05-01
+
+- `warm_dashboard_cache_once` now primes Redis for `GET /api/dashboard/overview`
+  using keys `overview:10:10::{market_scope}` (aligned with the home page’s
+  `top=10` / `anomalies=10` granular calls), in addition to existing per-route keys.
+- The overview bundle is built via `_dashboard_overview_payload`; `top_markets`
+  and `recent_anomalies` inside the bundle now use the request `market_scope`
+  instead of being hard-coded to `active`.
+- Overview first paint uses `api.overview` (one request); news diagnostics,
+  historical QA, and pipeline health load after the bundle succeeds. Pipeline
+  health fetches only when the user expands the widget; `GET /pipeline-health`
+  uses the static dashboard Redis TTL to cut repeat DB load.
+- Budget Redis (`docker-compose.budget.yml`): **128 MB cap** and **`allkeys-lru`**
+  mean any key (including `dashboard:*`) can be evicted when memory is full;
+  see **Redis (budget)** in `docs/deployment.md`.
+
 ## Operational Shape
 
 The budget deployment is one small AWS instance running Docker Compose:
@@ -511,9 +537,11 @@ Some indexes are created concurrently so large raw tables can stay usable while
 the migration is running.
 
 The budget pipeline can also run `scripts.warm_dashboard_cache` as a lightweight
-cache warmer. It pre-populates Redis for the home page sections, the default
-markets page, pipeline/news diagnostics, and historical QA so the first browser
-request does not pay the full query cost.
+cache warmer. It pre-populates Redis for the home page sections (including
+`GET /api/dashboard/overview` with `top=10` and `anomalies=10` per warmed
+`market_scope`, matching the granular Overview limits), the default markets page,
+pipeline/news diagnostics, and historical QA so the first browser request does
+not pay the full query cost.
 
 ## Runtime Configuration
 
@@ -530,7 +558,7 @@ Most configuration comes from `.env` through `app/core/config.py`.
 | `DASHBOARD_CACHE_TTL_SEC` | Default Redis cache TTL for dashboard API reads. |
 | `DASHBOARD_STATS_CACHE_TTL_SEC` | Short TTL for frequently refreshed counters and health-adjacent sections. |
 | `DASHBOARD_LIST_CACHE_TTL_SEC` | Medium TTL for list endpoints such as markets, top markets, alerts, and flags. |
-| `DASHBOARD_STATIC_CACHE_TTL_SEC` | Longer TTL for slower-moving sections and grouped detail reads. |
+| `DASHBOARD_STATIC_CACHE_TTL_SEC` | Longer TTL for slower-moving sections, grouped detail reads, and `GET /api/dashboard/pipeline-health` (expensive aggregate). |
 | `RETENTION_*` | Raw event age limits and pruning batch size. |
 | `OPENSEARCH_URL` | Optional OpenSearch endpoint. Empty means Postgres fallback. |
 | `CLICKHOUSE_URL` | Optional ClickHouse endpoint. |
@@ -575,7 +603,8 @@ RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS=14
 
 | Symptom | Likely cause | What to check |
 | --- | --- | --- |
-| Dashboard loads but counts are flat | Pipeline worker is stopped or stale. | `/api/dashboard/pipeline-health`, `docker compose logs pipeline` |
+| Dashboard loads but counts are flat | Pipeline worker is stopped or stale. | Expand pipeline health on Overview (or call `/api/dashboard/pipeline-health`), `docker compose logs pipeline` |
+| Dashboard keys missing in Redis | Budget Redis is 128 MB with `allkeys-lru`; keys compete with rate limits and can be evicted. | `redis-cli --scan --pattern 'dashboard:*'`, `INFO memory`; see **Redis (budget)** in `docs/deployment.md`. |
 | Markets show raw tickers as titles | WS discovered stubs before REST hydration. | Run `scripts.hydrate_unknown_markets --top-by-trades`. |
 | News panels are empty | News source failed, links were filtered, or no relevant news exists. | `/api/dashboard/news-diagnostics`, pipeline logs. |
 | Search is weak | OpenSearch is off or index is empty. | Run `scripts.rebuild_search_index`; Postgres fallback still works. |

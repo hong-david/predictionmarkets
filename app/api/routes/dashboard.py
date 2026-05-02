@@ -108,6 +108,9 @@ _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
 )
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
+# Match `frontend/src/routes/Overview.tsx` granular limits for cache/warm alignment.
+_OVERVIEW_WARM_TOP = 10
+_OVERVIEW_WARM_ANOMALIES = 10
 _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
 _PIPELINE_MARKET_POLLER_STALE_AFTER = timedelta(hours=6)
 _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
@@ -1379,11 +1382,15 @@ def get_pipeline_health(db: Session = Depends(get_db)) -> dict:
 
     These are not all standalone services: some are long-running processes,
     while others are jobs, materializers, or compact DB projections.
+
+    Uses the static dashboard TTL: this handler aggregates many DB reads and
+    optional storage checks; caching longer than stats reduces repeat load when
+    the header widget is opened or polled infrequently.
     """
     return _cached_dashboard_payload(
         "pipeline_health",
         lambda: _pipeline_health_payload(db),
-        ttl_sec=_DASHBOARD_STATS_CACHE_TTL_SEC,
+        ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
 
 
@@ -2116,6 +2123,37 @@ def _suspicious_trades_payload(
     }
 
 
+def _dashboard_overview_payload(
+    db: Session,
+    *,
+    top: int,
+    anomalies: int,
+    severity: str | None,
+    market_scope: str,
+) -> dict:
+    """Body for `GET /overview` and `warm_dashboard_cache_once` overview keys."""
+    ms = _normalize_market_scope(market_scope)
+    return {
+        "stats": _stats_payload(db, market_scope=ms),
+        "breakdown": _breakdown_payload(db, market_scope=ms),
+        "top_markets": _top_markets_payload(db, top, market_scope=ms),
+        "recent_anomalies": _recent_anomalies_payload(
+            db, anomalies, severity, market_scope=ms
+        ),
+        "suspicious_trades": _suspicious_trades_payload(
+            db, limit=12, market_scope=ms
+        ),
+        "news_signals": _news_signals_payload(
+            db,
+            limit=8,
+            min_score=4.0,
+            include_ambiguous=True,
+            market_scope=ms,
+            validate_current=False,
+        ),
+    }
+
+
 @router.get("/overview")
 def get_dashboard_overview(
     top: int = Query(default=15, ge=1, le=50),
@@ -2131,27 +2169,17 @@ def get_dashboard_overview(
 
     Cuts TTFB vs four separate fetches; still runs the same SQL as those routes.
     """
-    cache_key = f"overview:{top}:{anomalies}:{severity or ''}:{market_scope}"
+    ms = _normalize_market_scope(market_scope)
+    cache_key = f"overview:{top}:{anomalies}:{severity or ''}:{ms}"
     return _cached_dashboard_payload(
         cache_key,
-        lambda: {
-            "stats": _stats_payload(db, market_scope=market_scope),
-            "breakdown": _breakdown_payload(db, market_scope=market_scope),
-            "top_markets": _top_markets_payload(db, top, market_scope="active"),
-            "recent_anomalies": _recent_anomalies_payload(
-                db, anomalies, severity, market_scope="active"
-            ),
-            "suspicious_trades": _suspicious_trades_payload(
-                db, limit=12, market_scope=market_scope
-            ),
-            "news_signals": _news_signals_payload(
-                db,
-                limit=8,
-                min_score=4.0,
-                include_ambiguous=True,
-                market_scope=market_scope,
-            ),
-        },
+        lambda: _dashboard_overview_payload(
+            db,
+            top=top,
+            anomalies=anomalies,
+            severity=severity,
+            market_scope=ms,
+        ),
         ttl_sec=_DASHBOARD_LIST_CACHE_TTL_SEC,
     )
 
@@ -3304,7 +3332,11 @@ def warm_dashboard_cache_once(
     *,
     market_scopes: tuple[str, ...] = ("active",),
 ) -> dict:
-    """Populate Redis/in-process cache for dashboard reads used on first paint."""
+    """Populate Redis/in-process cache for dashboard reads used on first paint.
+
+    Includes `overview:{top}:{anomalies}::{scope}` for the bundled endpoint
+    (see `_OVERVIEW_WARM_*`, aligned with the home page granular limits).
+    """
 
     warmed: list[dict] = []
     errors: list[dict] = []
@@ -3375,6 +3407,21 @@ def warm_dashboard_cache_once(
                 validate_current=False,
             ),
             _DASHBOARD_STATIC_CACHE_TTL_SEC,
+        )
+        overview_key = (
+            f"overview:{_OVERVIEW_WARM_TOP}:{_OVERVIEW_WARM_ANOMALIES}::{scope}"
+        )
+        warm(
+            f"overview:{scope}",
+            overview_key,
+            lambda scope=scope: _dashboard_overview_payload(
+                db,
+                top=_OVERVIEW_WARM_TOP,
+                anomalies=_OVERVIEW_WARM_ANOMALIES,
+                severity=None,
+                market_scope=scope,
+            ),
+            _DASHBOARD_LIST_CACHE_TTL_SEC,
         )
         markets_key = _markets_cache_key(
             q=None,

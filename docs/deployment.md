@@ -18,6 +18,17 @@ target together.
 | API + dashboard | Repo Docker image | The `Dockerfile` builds the Vite frontend into the FastAPI image. |
 | Database | Postgres container on a gp3 EBS volume | RDS is easier, but compute, storage, and backups push the bill past budget. |
 | Cache | Local Redis container, capped at 128 MB | Good enough for dashboard cache without ElastiCache. |
+
+### Redis (budget)
+
+`docker-compose.budget.yml` runs Redis with `--maxmemory 128mb` and
+`--maxmemory-policy allkeys-lru` (no AOF/RDB persistence in that profile). **Any**
+key—including `dashboard:*` cache entries and rate-limit counters—can be evicted
+when usage approaches the cap. Symptoms: first dashboard paint is slow even
+though the cache warmer runs, or `redis-cli --scan --pattern 'dashboard:*'`
+returns nothing until traffic repopulates keys. Mitigations: raise `maxmemory`,
+run a second Redis for hot cache only, or accept occasional cold reads from
+Postgres.
 | Search | Postgres fallback search | OpenSearch is an upgrade path, not a budget default. |
 | Raw analytics | Postgres projections with short retention | ClickHouse is valuable later, but raw tape must be aggressively compacted first. |
 | TLS | Caddy or nginx on the same EC2 host | Avoid the monthly ALB floor. |

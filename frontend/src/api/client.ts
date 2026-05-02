@@ -49,7 +49,7 @@ async function get<T>(
 }
 
 export const api = {
-  /** Single round-trip for the home page (stats + charts + two side lists). */
+  /** Bundled overview: stats, breakdown, top markets, alerts, trade flags, news signals. */
   overview: (params?: { top?: number; anomalies?: number; market_scope?: MarketScope }) =>
     get<DashboardOverview>("/api/dashboard/overview", {
       top: params?.top,
