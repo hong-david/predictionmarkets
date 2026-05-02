@@ -47,7 +47,14 @@ def test_overview_bundles_expected_keys(client: TestClient) -> None:
     r = client.get("/api/dashboard/overview", params={"top": 2, "anomalies": 2})
     assert r.status_code == 200
     body = r.json()
-    assert {"stats", "breakdown", "top_markets", "recent_anomalies"} <= body.keys()
+    assert {
+        "stats",
+        "breakdown",
+        "top_markets",
+        "recent_anomalies",
+        "suspicious_trades",
+        "news_signals",
+    } <= body.keys()
     assert "markets" in body["stats"] and "by_prior" in body["breakdown"]
 
 
