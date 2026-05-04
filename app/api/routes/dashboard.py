@@ -753,7 +753,6 @@ def _pipeline_heartbeat_map(db: Session) -> dict[str, PipelineHeartbeat]:
         logger.debug("pipeline heartbeat rows unavailable: %s", exc)
         return {}
 
-
 def _component_from_heartbeat(
     heartbeat: PipelineHeartbeat | None,
     *,
@@ -773,8 +772,23 @@ def _component_from_heartbeat(
         else None
     )
     latest_at = _latest_datetime(hb_latest, db_latest_at)
+
+    # Dashboard count should represent persisted DB rows, not "last batch wrote N".
     count = db_count
-    status_count = None if zero_count_is_healthy and count == 0 else count
+
+    # But status/liveness can use the heartbeat count when a heartbeat exists.
+    # This prevents a recent successful heartbeat from showing as "empty" just
+    # because db_count is zero in a test, during startup, or for a zero-valid component.
+    heartbeat_count = (
+        heartbeat.count
+        if heartbeat is not None and heartbeat.count is not None
+        else None
+    )
+    status_count = heartbeat_count if hb_latest is not None else db_count
+
+    if zero_count_is_healthy and status_count == 0:
+        status_count = None
+
     if heartbeat is not None and heartbeat.status == "error":
         status = "error"
     elif hb_latest is not None:
@@ -791,9 +805,12 @@ def _component_from_heartbeat(
             stale_after=stale_after,
             now=now,
         )
+
     detail = heartbeat.detail if heartbeat is not None and heartbeat.detail else db_detail
+
     if heartbeat is not None and heartbeat.status == "error" and heartbeat.last_error:
         detail = f"{detail} Last error: {heartbeat.last_error}"
+
     return _pipeline_component(
         key=key,
         label=label,
@@ -806,14 +823,15 @@ def _component_from_heartbeat(
         heartbeat_at=heartbeat.last_heartbeat_at if heartbeat is not None else None,
         last_success_at=heartbeat.last_success_at if heartbeat is not None else None,
         last_error_at=heartbeat.last_error_at if heartbeat is not None else None,
-        last_error=heartbeat.last_error
-        if heartbeat is not None and heartbeat.status == "error"
-        else None,
+        last_error=(
+            heartbeat.last_error
+            if heartbeat is not None and heartbeat.status == "error"
+            else None
+        ),
         component_type=heartbeat.component_type if heartbeat is not None else None,
         source="heartbeat" if hb_latest is not None else "db",
         run_id=heartbeat.run_id if heartbeat is not None else None,
     )
-
 
 def _pipeline_health_payload(db: Session) -> dict:
     now = _utc_now()

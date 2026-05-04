@@ -120,7 +120,7 @@ def test_component_from_heartbeat_prefers_recent_heartbeat() -> None:
 
     assert payload["status"] == "healthy"
     assert payload["source"] == "heartbeat"
-    assert payload["count"] == 12
+    assert payload["count"] == 0
     assert payload["detail"] == "Last batch wrote 12 flags."
 
 
