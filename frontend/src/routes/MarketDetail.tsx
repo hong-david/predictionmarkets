@@ -249,15 +249,28 @@ export default function MarketDetailPage() {
                   ) : null}
                 </div>
                 <div className="text-right">
-                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                    Last
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
+                    Market price
                   </div>
-                  <div className="text-3xl font-semibold num text-primary">
-                    {fmtPrice(m.last_price ?? m.latest_snapshot?.last_price_dollars)}
+                  <div
+                    className="text-3xl font-semibold num text-primary"
+                    title="Uses last traded yes price when available; otherwise falls back to latest quote midpoint."
+                  >
+                    {fmtPrice(
+                      m.last_price ??
+                        m.latest_snapshot?.last_price_dollars ??
+                        midpoint(
+                          m.latest_snapshot?.yes_bid_dollars,
+                          m.latest_snapshot?.yes_ask_dollars,
+                        ),
+                    )}
                   </div>
-                  {m.latest_snapshot?.yes_bid_dollars != null ? (
+                  {m.latest_snapshot ? (
                     <div className="text-xs text-muted-foreground num mt-1">
-                      Best bid {fmtPrice(m.latest_snapshot.yes_bid_dollars)} · Best ask {fmtPrice(m.latest_snapshot.yes_ask_dollars)}
+                      {formatBidAsk(
+                        m.latest_snapshot.yes_bid_dollars,
+                        m.latest_snapshot.yes_ask_dollars,
+                      )}
                     </div>
                   ) : null}
                   {m.latest_snapshot?.liquidity_dollars != null ? (
@@ -327,11 +340,11 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="Each point is a trade’s yes price. Curve: spline through prints (peaks are real prints, not a bid/ask band). Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. If several prints share one second, the x-axis nudges +1s so every print is visible. Bars: contracts in that print. Arrows: saved alert rows on quotes (volume uses cumulative exchange volume, not bar height). Pan and zoom."
-          right={
+          subtitle="Trades are plotted when available. If no trades exist, the chart still uses collected quote snapshots: bid/ask and quote-derived pricing over time. Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. Arrows: saved alert rows on quotes. Pan and zoom."          right={
             series.data
               ? [
-                  `${fmtInt(series.data.trades.length)} trades shown`,
+                  `${fmtInt(series.data.trades.length)} trades`,
+                  `${fmtInt(series.data.snapshots.length)} quote snapshots`,
                   series.data.tape_cluster
                     ? ` · tape burst ${series.data.tape_cluster.burst_score_0_10.toFixed(1)}/10 (${series.data.tape_cluster.largest_window_count} in ${series.data.tape_cluster.window_sec}s${
                         series.data.tape_cluster.dominant_side
@@ -348,9 +361,9 @@ export default function MarketDetailPage() {
         <CardBody className="p-0">
           {series.isPending ? (
             <Skeleton className="h-[420px]" />
-          ) : !series.data?.trades.length ? (
+          ) : !series.data?.trades.length && !series.data?.snapshots.length ? (
             <EmptyState className="h-[420px] flex items-center justify-center">
-              No trade data yet for this market.
+              No pricing data yet for this market.
             </EmptyState>
           ) : (
             <div className="px-2 pb-2">
@@ -685,6 +698,23 @@ function estimateTradeDollars(t: TradePoint): number | null {
   const price =
     side === "no" && t.no_price != null ? t.no_price : t.yes_price ?? t.no_price;
   return price == null ? null : t.count * price;
+}
+
+function midpoint(
+  bid?: number | null,
+  ask?: number | null,
+): number | null {
+  if (bid == null && ask == null) return null;
+  if (bid != null && ask != null) return (bid + ask) / 2;
+  return bid ?? ask ?? null;
+}
+
+function formatBidAsk(
+  bid?: number | null,
+  ask?: number | null,
+): string {
+  if (bid == null && ask == null) return "No current bid/ask quote";
+  return `Best bid ${fmtPrice(bid)} · Best ask ${fmtPrice(ask)}`;
 }
 
 function buildTradeHighlights(
