@@ -14,15 +14,17 @@ export function GlobalSearch() {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
-    const t = window.setTimeout(() => setDebounced(value.trim()), 180);
+    const t = window.setTimeout(() => setDebounced(value.trim()), 500);
     return () => window.clearTimeout(t);
   }, [value]);
+
+  const minSearchLength = 4;
 
   const search = useQuery({
     queryKey: ["globalSearch", debounced],
     queryFn: () => api.search(debounced, "all", 8),
-    enabled: debounced.length >= 2,
-    staleTime: 30_000,
+    enabled: debounced.length >= minSearchLength,
+    staleTime: 60_000,
   });
 
   const submit = () => {

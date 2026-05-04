@@ -58,14 +58,16 @@ export default function MarketDetailPage() {
   const relatedNewsSearchText =
     detail.data?.news_search_query ||
     [detail.data?.title, detail.data?.subtitle].filter(Boolean).join(" ");
+  const relatedNewsSearchReady =
+    relatedNewsSearchText.trim().length >= 8 &&
+    !!news.data &&
+    (news.data.provider === "unavailable" || news.data.articles.length === 0);
+  
   const relatedNews = useQuery({
     queryKey: ["marketRelatedNewsSearch", marketId, relatedNewsSearchText],
-    queryFn: () => api.search(relatedNewsSearchText, "news", 8),
-    enabled:
-      !!relatedNewsSearchText &&
-      !!news.data &&
-      (news.data.provider === "unavailable" || news.data.articles.length === 0),
-    staleTime: 5 * 60_000,
+    queryFn: () => api.search(relatedNewsSearchText.trim(), "news", 8),
+    enabled: relatedNewsSearchReady,
+    staleTime: 15 * 60_000,
   });
 
   if (detail.isError) {
