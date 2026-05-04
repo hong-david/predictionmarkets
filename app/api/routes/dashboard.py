@@ -1522,7 +1522,6 @@ def get_news_diagnostics(db: Session = Depends(get_db)) -> dict:
         ttl_sec=_DASHBOARD_LIST_CACHE_TTL_SEC,
     )
 
-
 @router.get("/historical-signal-qa")
 def get_historical_signal_qa(
     limit: int = Query(default=8, ge=1, le=50),
@@ -1531,7 +1530,9 @@ def get_historical_signal_qa(
     market_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Historical post-mortem sample for checking whether flags look useful."""
+    if os.getenv("ENABLE_HISTORICAL_SIGNAL_QA", "0") != "1":
+        raise HTTPException(status_code=404)
+
     return _cached_dashboard_payload(
         (
             "historical_signal_qa:"
@@ -1546,6 +1547,29 @@ def get_historical_signal_qa(
         ),
         ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
     )
+# @router.get("/historical-signal-qa")
+# def get_historical_signal_qa(
+    # limit: int = Query(default=8, ge=1, le=50),
+    # min_flag_score: float = Query(default=5.0, ge=0.0, le=10.0),
+    # category: str | None = Query(default=None),
+    # market_id: str | None = Query(default=None),
+    # db: Session = Depends(get_db),
+# ) -> dict:
+    # """Historical post-mortem sample for checking whether flags look useful."""
+    # return _cached_dashboard_payload(
+        # (
+            # "historical_signal_qa:"
+            # f"{limit}:{min_flag_score}:{category or ''}:{market_id or ''}"
+        # ),
+        # lambda: historical_signal_report(
+            # db,
+            # limit=limit,
+            # min_flag_score=min_flag_score,
+            # category=category,
+            # market_id=market_id,
+        # ),
+        # ttl_sec=_DASHBOARD_STATIC_CACHE_TTL_SEC,
+    # )
 
 
 @router.get("/storage-health")
