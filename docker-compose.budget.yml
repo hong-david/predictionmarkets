@@ -74,7 +74,7 @@ services:
       - --poll-interval-seconds
       - "900"
       - --poll-batch-size
-      - "250"
+      - "150"
       - --anomaly-market-limit
       - "50"
       - --hydrate-unknown-max
@@ -97,9 +97,8 @@ services:
       - "50"
       - --with-retention-maintenance
       - --retention-execute
-      - --retention-analyze
       - --retention-interval-seconds
-      - "3600"
+      - "7200"
       - --retention-book-event-days
       - "1"
       - --retention-observe-snapshot-days
@@ -109,10 +108,10 @@ services:
       - --retention-hot-snapshot-days
       - "14"
       - --retention-batch-size
-      - "5000"
+      - "500"
       - --with-dashboard-cache-warmer
       - --dashboard-cache-warm-interval-seconds
-      - "120"
+      - "240"
       - --dashboard-cache-warm-market-scopes
       - active
     depends_on:

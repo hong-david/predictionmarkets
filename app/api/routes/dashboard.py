@@ -773,7 +773,7 @@ def _component_from_heartbeat(
         else None
     )
     latest_at = _latest_datetime(hb_latest, db_latest_at)
-    count = heartbeat.count if heartbeat is not None and heartbeat.count is not None else db_count
+    count = db_count
     status_count = None if zero_count_is_healthy and count == 0 else count
     if heartbeat is not None and heartbeat.status == "error":
         status = "error"
