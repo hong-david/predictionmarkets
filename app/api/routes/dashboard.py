@@ -372,34 +372,20 @@ def _latest_snapshot_values_for_market_pks(
 ) -> dict[int, dict[str, float | None]]:
     if not market_pks:
         return {}
-    ranked = (
-        select(
-            MarketSnapshot.market_pk.label("market_pk"),
+        
+    rows = (
+        db.query(
+            MarketMetric.market_pk,
             MarketSnapshot.last_price_dollars.label("last_price"),
             MarketSnapshot.yes_bid_dollars.label("yes_bid"),
             MarketSnapshot.yes_ask_dollars.label("yes_ask"),
             MarketSnapshot.volume_24h_fp.label("volume_24h"),
             MarketSnapshot.volume_fp.label("volume_total"),
-            func.row_number()
-            .over(
-                partition_by=MarketSnapshot.market_pk,
-                order_by=(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc()),
-            )
-            .label("rn"),
         )
-        .where(MarketSnapshot.market_pk.in_(market_pks))
-        .subquery()
+        .join(MarketSnapshot, MarketSnapshot.id == MarketMetric.latest_snapshot_id)
+        .filter(MarketMetric.market_pk.in_(market_pks))
+        .all()
     )
-    rows = db.execute(
-        select(
-            ranked.c.market_pk,
-            ranked.c.last_price,
-            ranked.c.yes_bid,
-            ranked.c.yes_ask,
-            ranked.c.volume_24h,
-            ranked.c.volume_total,
-        ).where(ranked.c.rn == 1)
-    ).all()
 
     def _display_price(row) -> float | None:
         if row.last_price is not None:

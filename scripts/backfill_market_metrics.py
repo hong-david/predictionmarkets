@@ -13,7 +13,7 @@ from datetime import timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -63,26 +63,29 @@ def _market_batches(
 def _latest_snapshots(db: Session, market_pks: list[int]) -> dict[int, MarketSnapshot]:
     if not market_pks:
         return {}
-    ranked = (
-        select(
-            MarketSnapshot.id.label("id"),
-            MarketSnapshot.market_pk.label("market_pk"),
-            func.row_number()
-            .over(
-                partition_by=MarketSnapshot.market_pk,
-                order_by=(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc()),
-            )
-            .label("rn"),
-        )
-        .where(MarketSnapshot.market_pk.in_(market_pks))
-        .subquery()
-    )
     ids = [
         int(row.id)
-        for row in db.execute(select(ranked.c.id).where(ranked.c.rn == 1)).all()
+        for row in db.execute(
+            text(
+                """
+                SELECT picked.id
+                FROM unnest(CAST(:market_pks AS integer[])) AS scope(market_pk)
+                JOIN LATERAL (
+                    SELECT ms.id
+                    FROM market_snapshots ms
+                    WHERE ms.market_pk = scope.market_pk
+                    ORDER BY ms.ts DESC, ms.id DESC
+                    LIMIT 1
+                ) AS picked ON TRUE
+                """
+            ),
+            {"market_pks": market_pks},
+        ).all()
     ]
+
     if not ids:
         return {}
+
     return {
         int(row.market_pk): row
         for row in db.query(MarketSnapshot).filter(MarketSnapshot.id.in_(ids)).all()
