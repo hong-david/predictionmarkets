@@ -99,7 +99,7 @@ services:
       - --with-retention-maintenance
       - --retention-execute
       - --retention-interval-seconds
-      - "7200"
+      - "900"
       - --retention-book-event-days
       - "1"
       - --retention-observe-snapshot-days
