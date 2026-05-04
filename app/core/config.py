@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     retention_snapshot_observe_max_age_days: int = 2
     retention_snapshot_sampled_max_age_days: int = 7
     retention_snapshot_hot_max_age_days: int = 30
-    retention_batch_size: int = 5000
+    retention_batch_size: int = 500
 
     model_config = SettingsConfigDict(
         env_file=".env",

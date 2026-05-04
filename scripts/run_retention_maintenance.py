@@ -97,6 +97,7 @@ def _run_batched_delete(
     execute: bool,
     batch_size: int,
     delete_batch,
+    sleep_seconds: float = 0.25,
 ) -> dict[str, int]:
     if not execute or count_before <= 0:
         return {"matched": count_before, "deleted": 0, "batches": 0}
@@ -111,6 +112,8 @@ def _run_batched_delete(
         db.commit()
         if n < batch_size:
             break
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
     return {"matched": count_before, "deleted": deleted, "batches": batches}
 
 
