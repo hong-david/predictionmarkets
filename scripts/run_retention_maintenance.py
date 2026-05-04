@@ -85,8 +85,46 @@ def _delete_snapshots_batch(
     *,
     batch_size: int,
 ) -> int:
-    ids = _snapshot_scope(tier, cutoff).order_by(MarketSnapshot.id.asc()).limit(batch_size)
-    result = db.execute(delete(MarketSnapshot).where(MarketSnapshot.id.in_(ids)))
+    result = db.execute(
+        text(
+            """
+            WITH tier_markets AS MATERIALIZED (
+                SELECT market_pk, latest_snapshot_id
+                FROM market_metrics
+                WHERE storage_tier = :tier
+            ),
+            candidate_ids AS MATERIALIZED (
+                SELECT s.id
+                FROM tier_markets mm
+                JOIN LATERAL (
+                    SELECT ms.id
+                    FROM market_snapshots ms
+                    WHERE ms.market_pk = mm.market_pk
+                      AND ms.ts < :cutoff
+                      AND (
+                        mm.latest_snapshot_id IS NULL
+                        OR ms.id != mm.latest_snapshot_id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM anomalies a
+                        WHERE a.latest_snapshot_id = ms.id
+                      )
+                    LIMIT 8
+                ) s ON TRUE
+                LIMIT :batch_size
+            )
+            DELETE FROM market_snapshots ms
+            USING candidate_ids c
+            WHERE ms.id = c.id
+            """
+        ),
+        {
+            "tier": tier,
+            "cutoff": cutoff,
+            "batch_size": batch_size,
+        },
+    )
     return int(result.rowcount or 0)
 
 
@@ -98,22 +136,29 @@ def _run_batched_delete(
     batch_size: int,
     delete_batch,
     sleep_seconds: float = 0.25,
+    max_batches: int = 20,
 ) -> dict[str, int]:
     if not execute or count_before <= 0:
         return {"matched": count_before, "deleted": 0, "batches": 0}
+
     deleted = 0
     batches = 0
-    while True:
+
+    while batches < max_batches:
         n = delete_batch()
         if n <= 0:
             break
+
         deleted += n
         batches += 1
         db.commit()
+
         if n < batch_size:
             break
+
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
+
     return {"matched": count_before, "deleted": deleted, "batches": batches}
 
 
