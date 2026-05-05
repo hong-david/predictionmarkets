@@ -260,9 +260,40 @@ def run_retention_maintenance(
     }
 
 
+
+RETENTION_MAINTENANCE_LOCK_KEY = "predictionmarkets:retention_maintenance"
+
+
+def _try_retention_maintenance_lock(db: Session) -> bool:
+    return bool(
+        db.execute(
+            text("select pg_try_advisory_lock(hashtext(:key))"),
+            {"key": RETENTION_MAINTENANCE_LOCK_KEY},
+        ).scalar()
+    )
+
+
+def _release_retention_maintenance_lock(db: Session) -> None:
+    db.execute(
+        text("select pg_advisory_unlock(hashtext(:key))"),
+        {"key": RETENTION_MAINTENANCE_LOCK_KEY},
+    )
+
+
 def _run_once(args: argparse.Namespace) -> dict[str, Any]:
     db = SessionLocal()
+    locked = False
     try:
+        locked = _try_retention_maintenance_lock(db)
+        if not locked:
+            return {
+                "execute": args.execute,
+                "skipped": True,
+                "reason": "another_retention_sweep_running",
+                "matched_total": 0,
+                "deleted_total": 0,
+            }
+
         return run_retention_maintenance(
             db,
             execute=args.execute,
@@ -277,6 +308,8 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
         db.rollback()
         raise
     finally:
+        if locked:
+            _release_retention_maintenance_lock(db)
         db.close()
 
 
@@ -303,15 +336,22 @@ def main() -> None:
         )
         try:
             result = _run_once(args)
-            mark_pipeline_success(
-                "retention_maintenance",
-                detail=(
+            if result.get("skipped"):
+                detail = "Skipped retention maintenance; another sweep is already running."
+                count = 0
+            else:
+                count = int(result["deleted_total"] if args.execute else result["matched_total"])
+                detail = (
                     f"{'Deleted' if args.execute else 'Matched'} "
                     f"{result['deleted_total'] if args.execute else result['matched_total']} "
                     "old hot-table rows."
-                ),
+                )
+
+            mark_pipeline_success(
+                "retention_maintenance",
+                detail=detail,
                 run_id=run_id,
-                count=int(result["deleted_total"] if args.execute else result["matched_total"]),
+                count=count,
                 metadata=result,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
