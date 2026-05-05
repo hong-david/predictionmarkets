@@ -277,7 +277,7 @@ export default function MarketDetailPage() {
                   ) : null}
                   {m.latest_snapshot?.liquidity_dollars != null ? (
                     <div className="text-[11px] text-muted-foreground num mt-1" title="Reported by the exchange on the last quote update">
-                      Book liquidity (reported) ~ {fmtInt(Math.round(m.latest_snapshot.liquidity_dollars))} USD
+                      Book liquidity (reported) ~ {fmtDollars(m.latest_snapshot.liquidity_dollars)}
                     </div>
                   ) : null}
                 </div>

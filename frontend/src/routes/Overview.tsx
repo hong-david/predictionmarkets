@@ -345,7 +345,7 @@ export default function OverviewPage() {
                     <th className="text-left px-4 py-2 font-medium">Market</th>
                     <th className="text-right px-4 py-2 font-medium">Trades</th>
                     <th className="text-right px-4 py-2 font-medium">24h vol.</th>
-                    <th className="text-right px-4 py-2 font-medium">Total vol.</th>
+                    <th className="text-right px-4 py-2 font-medium">Total $</th>
                   </tr>
                 </thead>
                 <tbody>

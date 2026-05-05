@@ -19,9 +19,15 @@ export function fmtPrice(n: number | null | undefined, digits = 3): string {
 }
 
 /** Approximate dollars paid, rounded for compact table display. */
-export function fmtDollars(n: number | null | undefined): string {
-  if (n == null) return "â€”";
-  return `$${Math.round(n).toLocaleString()}`;
+export function fmtDollars(n: number | null | undefined, digits = 0): string {
+  if (n == null) return "—";
+  const value = Number(n);
+  if (!Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: digits,
+  }).format(value);
 }
 
 /** ISO timestamp -> "5m ago" / "2d ago". Null-safe. */

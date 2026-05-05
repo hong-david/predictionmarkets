@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -51,6 +53,16 @@ _tape_volume_cache: dict[int, tuple[Decimal | None, Decimal | None, float]] = {}
 _CH_TRADES_TABLE = "kalshi_trades_raw"
 _CH_QUOTES_TABLE = "kalshi_quote_changes_raw"
 _CH_L2_TABLE = "kalshi_l2_events_raw"
+
+_WS_TICKER_COALESCE_ENABLED = (
+    os.getenv("KALSHI_WS_TICKER_COALESCE_ENABLED", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+_WS_TICKER_COALESCE_WINDOW_SEC = float(os.getenv("KALSHI_WS_TICKER_COALESCE_WINDOW_SEC", "0.25"))
+_WS_METRICS_LOG_INTERVAL_SEC = float(os.getenv("KALSHI_WS_METRICS_LOG_INTERVAL_SEC", "30"))
+
+_WS_METRICS: Counter[str] = Counter()
+_WS_METRICS_STARTED_AT = time.monotonic()
 
 # Market-state anomaly scoring needs the recent snapshot window, so running it
 # after every sampled ticker snapshot creates a high-volume
@@ -140,8 +152,64 @@ def _clickhouse_ts(value: datetime | None = None) -> datetime:
     return value or datetime.now(timezone.utc)
 
 
+
+def _ws_msg_type(data: dict) -> str:
+    return str(data.get("type") or "unknown")
+
+
+def _ticker_market_key(data: dict) -> str | None:
+    if data.get("type") != "ticker":
+        return None
+    msg = data.get("msg") or {}
+    market_ticker = msg.get("market_ticker")
+    return str(market_ticker) if market_ticker else None
+
+
+async def _flush_ticker_coalescer(
+    *,
+    pending_tickers: dict[str, dict],
+    pending_lock: asyncio.Lock,
+    queue: asyncio.Queue[dict | None],
+) -> int:
+    async with pending_lock:
+        if not pending_tickers:
+            return 0
+        batch = list(pending_tickers.values())
+        pending_tickers.clear()
+
+    for item in batch:
+        await queue.put(item)
+
+    _WS_METRICS["ticker_flushed"] += len(batch)
+    return len(batch)
+
+
+async def _ticker_coalescer_worker(
+    *,
+    pending_tickers: dict[str, dict],
+    pending_lock: asyncio.Lock,
+    queue: asyncio.Queue[dict | None],
+    stop_event: asyncio.Event,
+) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(max(0.05, _WS_TICKER_COALESCE_WINDOW_SEC))
+        await _flush_ticker_coalescer(
+            pending_tickers=pending_tickers,
+            pending_lock=pending_lock,
+            queue=queue,
+        )
+
+    await _flush_ticker_coalescer(
+        pending_tickers=pending_tickers,
+        pending_lock=pending_lock,
+        queue=queue,
+    )
+
+
 async def _dispatch_ws_message(data: dict, session_id: str) -> None:
     msg_type = data.get("type")
+    _WS_METRICS[f"handled_{msg_type or 'unknown'}"] += 1
+
     if msg_type == "ticker":
         await asyncio.to_thread(handle_ticker_message, data)
     elif msg_type == "trade":
