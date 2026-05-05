@@ -21,6 +21,7 @@ from app.db.models import (
     TradeFlag,
 )
 from app.services.classifier import CLASSIFIER_VERSION
+from app.services.market_taxonomy import normalized_category_for_market
 from app.services.surveillance_scores import (
     evidence_score_0_100,
     prior_rank,
@@ -30,7 +31,7 @@ from app.services.trade_baselines import latest_baseline_for_market
 from app.services.trade_context import MarketContext, explain_trades_with_context
 from app.services.trade_suspicion import explain_trades_against_window
 
-TRADE_SCORER_VERSION = 3
+TRADE_SCORER_VERSION = 4
 TRADE_FLAG_MIN_SCORE = 3.0
 TRADE_FLAG_TRIGGERED_SCORE = 7.0
 TRADE_FLAG_CASE_SCORE = 8.5
@@ -71,7 +72,12 @@ def _market_context(market: Market) -> MarketContext:
     return MarketContext(
         market_pk=market.id,
         market_id=market.market_id,
-        category=market.category,
+        category=normalized_category_for_market(
+            category=market.category,
+            event_id=market.event_id,
+            market_id=market.market_id,
+            title=market.title,
+        ),
         subcategory=market.subcategory,
         manipulability_prior=market.manipulability_prior,
         event_id=market.event_id,
