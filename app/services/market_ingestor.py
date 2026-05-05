@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 from app.db.models import Market, MarketSnapshot
 from app.services.classifier import CLASSIFIER_VERSION, classify
 from app.services.decimal_utils import parse_decimal
-from app.services.retention import is_market_in_scope
+from app.services.market_metrics import upsert_quote_metrics
+from app.services.retention import is_market_in_scope, storage_decision_for_event
 from app.services.snapshot_dedup import should_skip_duplicate_snapshot
 
 T = TypeVar("T")
@@ -93,6 +94,7 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
     updated = 0
     snapshots_created = 0
     skipped_out_of_scope = 0
+    metric_updates: list[dict] = []
 
     for item in markets:
         external_market_id = item["ticker"]
@@ -221,6 +223,47 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         )
         db.add(snapshot)
         snapshots_created += 1
+        metric_updates.append(
+            {
+                "market": market,
+                "snapshot": snapshot,
+                "lp": lp,
+                "yb": yb,
+                "ya": ya,
+                "nb": nb,
+                "na": na,
+                "v24": v24,
+                "oi": oi,
+                "liq": liq,
+            }
+        )
+
+    if metric_updates:
+        db.flush()
+        for update in metric_updates:
+            market = update["market"]
+            snapshot = update["snapshot"]
+            decision = storage_decision_for_event(
+                market,
+                volume_24h_fp=update["v24"],
+                open_interest_fp=update["oi"],
+            )
+            upsert_quote_metrics(
+                db,
+                market_pk=market.id,
+                prior=market.manipulability_prior,
+                latest_snapshot_id=snapshot.id,
+                latest_snapshot_ts=snapshot.ts,
+                last_price_dollars=update["lp"],
+                yes_bid_dollars=update["yb"],
+                yes_ask_dollars=update["ya"],
+                no_bid_dollars=update["nb"],
+                no_ask_dollars=update["na"],
+                volume_24h_fp=update["v24"],
+                open_interest_fp=update["oi"],
+                liquidity_dollars=update["liq"],
+                decision=decision,
+            )
 
     db.commit()
 
