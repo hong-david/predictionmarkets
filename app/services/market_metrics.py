@@ -104,7 +104,10 @@ def upsert_quote_metrics(
             "yes_ask_cents": excluded.yes_ask_cents,
             "no_bid_cents": excluded.no_bid_cents,
             "no_ask_cents": excluded.no_ask_cents,
-            "volume_24h_contracts": excluded.volume_24h_contracts,
+            "volume_24h_contracts": func.coalesce(
+                excluded.volume_24h_contracts,
+                MarketMetric.volume_24h_contracts,
+            ),
             "open_interest_contracts": excluded.open_interest_contracts,
             "liquidity_cents": excluded.liquidity_cents,
             "storage_tier": excluded.storage_tier,
