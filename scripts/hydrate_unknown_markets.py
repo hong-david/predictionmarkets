@@ -31,6 +31,7 @@ from app.db.models import Market, MarketMetric, Trade
 from app.db.session import SessionLocal
 from app.services.kalshi_rest import KalshiRestClient
 from app.services.market_ingestor import ingest_markets_payload
+from app.services.market_lifecycle import _market_scope_filters
 
 
 def _utc_now() -> str:
@@ -145,8 +146,7 @@ def select_active_lifecycle_refresh_tickers(
             db.query(Market.market_id)
             .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
             .filter(Market.title != Market.market_id)
-            .filter(Market.status.in_(("active", "open")))
-            .filter(or_(Market.close_time.is_(None), Market.close_time > func.now()))
+            .filter(*_market_scope_filters("active"))
             .filter(or_(Market.updated_at.is_(None), Market.updated_at < cutoff))
             .order_by(
                 MarketMetric.trade_count.desc().nullslast(),
