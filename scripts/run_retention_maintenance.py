@@ -131,15 +131,21 @@ def _delete_snapshots_batch(
 def _run_batched_delete(
     db: Session,
     *,
-    count_before: int,
+    count_before: int | None = None,
     execute: bool,
     batch_size: int,
     delete_batch,
     sleep_seconds: float = 0.25,
     max_batches: int = 20,
 ) -> dict[str, int]:
-    if not execute or count_before <= 0:
-        return {"matched": count_before, "deleted": 0, "batches": 0}
+    # In dry-run mode, we can report the pre-count if the caller chose to compute it.
+    # In execute mode, avoid expensive exact counts and just run bounded delete batches.
+    if not execute:
+        return {
+            "matched": int(count_before or 0),
+            "deleted": 0,
+            "batches": 0,
+        }
 
     deleted = 0
     batches = 0
@@ -159,7 +165,13 @@ def _run_batched_delete(
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
 
-    return {"matched": count_before, "deleted": deleted, "batches": batches}
+    return {
+        # Without an exact pre-count, "matched" should not pretend to be total eligible.
+        # Use deleted as the observed matched/deleted amount for this bounded sweep.
+        "matched": int(count_before) if count_before is not None else deleted,
+        "deleted": deleted,
+        "batches": batches,
+    }
 
 
 def run_retention_maintenance(
@@ -194,7 +206,12 @@ def run_retention_maintenance(
     snapshot_results: dict[str, dict[str, Any]] = {}
     for tier, days in snapshot_specs.items():
         cutoff = _cutoff(days)
-        count = _count_snapshots(db, tier, cutoff)
+
+        # Exact snapshot counts are very expensive on the large market_snapshots table.
+        # Only compute them for dry-run reporting. In execute mode, just run bounded
+        # delete batches and report the actual deleted rows.
+        count = None if execute else _count_snapshots(db, tier, cutoff)
+
         result = _run_batched_delete(
             db,
             count_before=count,
