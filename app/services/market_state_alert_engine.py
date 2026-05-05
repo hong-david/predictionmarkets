@@ -62,13 +62,7 @@ def compute_volume_delta(
 
 
 def _reference_price_mode(snapshot: MarketSnapshot) -> str:
-    """Return how reference_price() will be derived for this snapshot.
-
-    REST/poller snapshots usually include last_price and full no-side fields.
-    WS ticker snapshots can be partial and only include yes bid/ask, causing
-    reference_price() to fall back to midpoint. Deltas across those shapes are
-    not comparable.
-    """
+    """Return how reference_price() will be derived for this snapshot."""
     if getattr(snapshot, "last_price_dollars", None) is not None:
         return "last"
     if (
@@ -82,11 +76,8 @@ def _reference_price_mode(snapshot: MarketSnapshot) -> str:
 def _volume_semantics(snapshot: MarketSnapshot) -> str:
     """Return a coarse snapshot-volume shape.
 
-    Partial WS ticker snapshots have shown different aggregate semantics from
-    complete REST snapshots. Compare volume deltas only within the same shape.
-
-    Use getattr so lightweight test doubles that omit DB-only columns still work.
-    Missing optional fields are treated as the partial shape.
+    Missing optional fields are treated as the partial shape so lightweight
+    test doubles that omit DB-only columns still work.
     """
     complete_quote = (
         getattr(snapshot, "last_price_dollars", None) is not None
@@ -266,7 +257,12 @@ def analyze_market(
 
     if previous is not None and not price_rolling_hit:
         prev_ref_price = reference_price(previous)
-        if latest_ref_price is not None and prev_ref_price is not None:
+        signals["price_delta_comparable"] = _reference_price_comparable(latest, previous)
+        if (
+            signals["price_delta_comparable"]
+            and latest_ref_price is not None
+            and prev_ref_price is not None
+        ):
             price_change = latest_ref_price - prev_ref_price
             abs_price_change = abs(price_change)
             signals["price_change"] = dec_to_float(price_change)
