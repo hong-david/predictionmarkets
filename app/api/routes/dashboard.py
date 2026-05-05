@@ -1825,8 +1825,19 @@ def _recent_anomalies_payload(
     *,
     market_scope: str = "active",
 ) -> dict:
-    base = db.query(Anomaly, Market).join(Market, Market.id == Anomaly.market_pk)
+    base = (
+        db.query(Anomaly, Market)
+        .join(Market, Market.id == Anomaly.market_pk)
+        .join(MarketMetric, MarketMetric.market_pk == Market.id)
+    )
     base = base.filter(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
+    base = base.filter(
+        or_(
+            func.coalesce(MarketMetric.trade_count, 0) > 0,
+            func.coalesce(MarketMetric.volume_24h_contracts, 0) > 0,
+            exists().where(TradeFlag.market_pk == Market.id),
+        )
+    )
     if severity:
         base = base.filter(Anomaly.severity == severity)
     rows = (
