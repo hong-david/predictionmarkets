@@ -287,7 +287,7 @@ def main() -> None:
     parser.add_argument("--poll-batch-size", type=int, default=500)
     parser.add_argument("--anomaly-market-limit", type=int, default=100)
     parser.add_argument("--hydrate-unknown-max", type=int, default=250)
-    parser.add_argument("--refresh-active-lifecycle-max", type=int, default=0)
+    parser.add_argument("--refresh-active-lifecycle-max", type=int, default=25)
     parser.add_argument("--refresh-active-lifecycle-min-age-minutes", type=int, default=30)
     parser.add_argument("--refresh-active-lifecycle-sleep", type=float, default=0.02)
     parser.add_argument("--news-interval-seconds", type=float, default=300.0)

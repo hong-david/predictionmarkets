@@ -216,7 +216,7 @@ def main() -> None:
     parser.add_argument(
         "--refresh-active-lifecycle-max",
         type=int,
-        default=0,
+        default=25,
         help="Per cycle, refresh this many stale local active/open markets by per-market REST lookup. Use 0 to disable.",
     )
     parser.add_argument(
