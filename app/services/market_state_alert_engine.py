@@ -60,6 +60,60 @@ def compute_volume_delta(
     return decimal_volume_delta(latest.volume_fp, previous.volume_fp)
 
 
+
+def _reference_price_mode(snapshot: MarketSnapshot) -> str:
+    """Return how reference_price() will be derived for this snapshot.
+
+    REST/poller snapshots usually include last_price and full no-side fields.
+    WS ticker snapshots can be partial and only include yes bid/ask, causing
+    reference_price() to fall back to midpoint. Deltas across those shapes are
+    not comparable.
+    """
+    if getattr(snapshot, "last_price_dollars", None) is not None:
+        return "last"
+    if (
+        getattr(snapshot, "yes_bid_dollars", None) is not None
+        and getattr(snapshot, "yes_ask_dollars", None) is not None
+    ):
+        return "mid"
+    return "none"
+
+
+def _volume_semantics(snapshot: MarketSnapshot) -> str:
+    """Return a coarse snapshot-volume shape.
+
+    Partial WS ticker snapshots have shown different aggregate semantics from
+    complete REST snapshots. Compare volume deltas only within the same shape.
+
+    Use getattr so lightweight test doubles that omit DB-only columns still work.
+    Missing optional fields are treated as the partial shape.
+    """
+    complete_quote = (
+        getattr(snapshot, "last_price_dollars", None) is not None
+        and getattr(snapshot, "no_bid_dollars", None) is not None
+        and getattr(snapshot, "no_ask_dollars", None) is not None
+        and getattr(snapshot, "volume_24h_fp", None) is not None
+    )
+    return "complete" if complete_quote else "partial"
+
+
+def _reference_price_comparable(
+    current: MarketSnapshot,
+    previous: MarketSnapshot,
+) -> bool:
+    mode = _reference_price_mode(current)
+    return mode != "none" and mode == _reference_price_mode(previous)
+
+
+def _volume_comparable(
+    current: MarketSnapshot,
+    previous: MarketSnapshot,
+) -> bool:
+    if current.volume_fp is None or previous.volume_fp is None:
+        return False
+    return _volume_semantics(current) == _volume_semantics(previous)
+
+
 def _series_spreads(snapshots: list[MarketSnapshot]) -> list[Decimal]:
     spreads: list[Decimal] = []
     for snapshot in snapshots[: min(30, len(snapshots))]:
@@ -78,11 +132,16 @@ def _price_and_volume_deltas(
         current, previous = snapshots[i], snapshots[i + 1]
         current_ref = reference_price(current)
         previous_ref = reference_price(previous)
-        if current_ref is not None and previous_ref is not None:
+        if (
+            _reference_price_comparable(current, previous)
+            and current_ref is not None
+            and previous_ref is not None
+        ):
             price_deltas.append(current_ref - previous_ref)
-        volume_delta = compute_volume_delta(current, previous)
-        if volume_delta is not None:
-            volume_deltas.append(volume_delta)
+        if _volume_comparable(current, previous):
+            volume_delta = compute_volume_delta(current, previous)
+            if volume_delta is not None:
+                volume_deltas.append(volume_delta)
     return price_deltas, volume_deltas
 
 
@@ -118,6 +177,8 @@ def analyze_market(
     signals["latest_spread"] = dec_to_float(latest_spread)
     signals["latest_mid_price"] = dec_to_float(latest_mid)
     signals["latest_reference_price"] = dec_to_float(latest_ref_price)
+    signals["latest_reference_price_mode"] = _reference_price_mode(latest)
+    signals["latest_volume_semantics"] = _volume_semantics(latest)
     signals["latest_volume_fp"] = dec_to_float(latest.volume_fp)
     signals["latest_liquidity_dollars"] = dec_to_float(latest.liquidity_dollars)
     signals["rolling_window_snapshots"] = min(30, len(snapshots))
@@ -230,8 +291,11 @@ def analyze_market(
     if previous is not None:
         signals["previous_snapshot_id"] = previous.id
         signals["previous_reference_price"] = dec_to_float(reference_price(previous))
+        signals["previous_reference_price_mode"] = _reference_price_mode(previous)
+        signals["previous_volume_semantics"] = _volume_semantics(previous)
         signals["previous_volume_fp"] = dec_to_float(previous.volume_fp)
-        volume_delta = compute_volume_delta(latest, previous)
+        signals["volume_delta_comparable"] = _volume_comparable(latest, previous)
+        volume_delta = compute_volume_delta(latest, previous) if signals["volume_delta_comparable"] else None
         signals["volume_delta"] = dec_to_float(volume_delta)
         if not volume_rolling_hit and volume_delta is not None:
             if volume_delta >= Decimal("50"):
