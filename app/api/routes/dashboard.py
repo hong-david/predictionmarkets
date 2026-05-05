@@ -2780,6 +2780,9 @@ def _list_markets_from_metric_projection(
     rows = base.offset(offset).limit(query_limit).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
+    market_pks = [int(row[0].id) for row in rows]
+    latest_by_pk = _latest_snapshot_values_for_market_pks(db, market_pks)
+
     event_ids = [row[0].event_id for row in rows if row[0].event_id]
     event_counts = {}
     if event_ids:
@@ -2814,6 +2817,7 @@ def _list_markets_from_metric_projection(
                 anomaly_count=int(row.anomaly_count or 0),
                 last_price=metric_last_price,
                 volume_24h=metric_volume,
+                volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
                 event_market_count=event_counts.get(market.event_id)
                 if market.event_id
                 else None,
