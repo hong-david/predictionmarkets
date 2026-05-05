@@ -31,7 +31,6 @@ from app.db.models import Market, MarketMetric, Trade
 from app.db.session import SessionLocal
 from app.services.kalshi_rest import KalshiRestClient
 from app.services.market_ingestor import ingest_markets_payload
-from app.services.market_lifecycle import _market_scope_filters
 
 
 def _utc_now() -> str:
@@ -146,7 +145,23 @@ def select_active_lifecycle_refresh_tickers(
             db.query(Market.market_id)
             .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
             .filter(Market.title != Market.market_id)
-            .filter(*_market_scope_filters("active"))
+            .filter(Market.status.in_(("active", "open")))
+            .filter(or_(Market.close_time.is_(None), Market.close_time > func.now()))
+            .filter(
+                ~func.upper(Market.market_id).op("~")(
+                    r"[0-9]{2}((JAN|MAR|MAY|JUL|AUG|OCT|DEC)(0[1-9]|[12][0-9]|3[01])|(APR|JUN|SEP|NOV)(0[1-9]|[12][0-9]|30)|FEB(0[1-9]|1[0-9]|2[0-9]))"
+                )
+                | (
+                    func.to_date(
+                        func.substring(
+                            func.upper(Market.market_id),
+                            r"[0-9]{2}((JAN|MAR|MAY|JUL|AUG|OCT|DEC)(0[1-9]|[12][0-9]|3[01])|(APR|JUN|SEP|NOV)(0[1-9]|[12][0-9]|30)|FEB(0[1-9]|1[0-9]|2[0-9]))"
+                        ),
+                        "YYMONDD",
+                    )
+                    >= func.current_date()
+                )
+            )
             .filter(or_(Market.updated_at.is_(None), Market.updated_at < cutoff))
             .order_by(
                 MarketMetric.trade_count.desc().nullslast(),
