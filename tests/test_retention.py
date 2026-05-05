@@ -165,6 +165,7 @@ class _FakeSession:
     def __init__(self) -> None:
         self.market_rows: list[Any] = []
         self.snapshot_rows: list[Any] = []
+        self.executed: list[Any] = []
         self.committed = False
 
     def query(self, *_args, **_kwargs):
@@ -191,13 +192,18 @@ class _FakeSession:
             if m.id is None:
                 m.id = i
 
+    def execute(self, stmt):
+        self.executed.append(stmt)
+        return None
+
     def commit(self):
         self.committed = True
 
 
 class TestIngestSkipsOutOfScope:
+    @patch("app.services.market_ingestor.upsert_quote_metrics")
     @patch("app.services.market_ingestor.should_skip_duplicate_snapshot", return_value=False)
-    def test_skips_exotic_combo(self, _skip_dup: object) -> None:
+    def test_skips_exotic_combo(self, _skip_dup: object, _upsert_metrics: object) -> None:
         from app.services.market_ingestor import ingest_markets_payload
 
         payload = {
@@ -222,8 +228,9 @@ class TestIngestSkipsOutOfScope:
         assert len(db.market_rows) == 1
         assert db.market_rows[0].market_id == "KXCPI-26FEB-T3.0"
 
+    @patch("app.services.market_ingestor.upsert_quote_metrics")
     @patch("app.services.market_ingestor.should_skip_duplicate_snapshot", return_value=False)
-    def test_skips_crypto_strike(self, _skip_dup: object) -> None:
+    def test_skips_crypto_strike(self, _skip_dup: object, _upsert_metrics: object) -> None:
         # KXBTC15M-* matches the crypto.btc_15m prefix rule which maps
         # to category=crypto_strike — should now be excluded at ingest.
         from app.services.market_ingestor import ingest_markets_payload
