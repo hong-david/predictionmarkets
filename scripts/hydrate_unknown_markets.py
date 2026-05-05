@@ -200,7 +200,12 @@ def select_active_lifecycle_refresh_tickers(
             .filter(Market.title != Market.market_id)
             .filter(Market.status.in_(("active", "open")))
             .filter(or_(Market.close_time.is_(None), Market.close_time > func.now()))
-            .filter(or_(Market.updated_at.is_(None), Market.updated_at < cutoff))
+            .filter(
+                or_(
+                    func.coalesce(MarketMetric.latest_snapshot_ts, Market.updated_at).is_(None),
+                    func.coalesce(MarketMetric.latest_snapshot_ts, Market.updated_at) < cutoff,
+                )
+            )
             .order_by(
                 MarketMetric.trade_count.desc().nullslast(),
                 Market.updated_at.asc().nullsfirst(),
