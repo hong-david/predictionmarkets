@@ -344,6 +344,7 @@ export default function OverviewPage() {
                   <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
                     <th className="text-left px-4 py-2 font-medium">Market</th>
                     <th className="text-right px-4 py-2 font-medium">Trades</th>
+                    <th className="text-right px-4 py-2 font-medium">24h vol.</th>
                     <th className="text-right px-4 py-2 font-medium">24h $ est.</th>
                     <th className="text-right px-4 py-2 font-medium">Total vol.</th>
                   </tr>
@@ -361,10 +362,13 @@ export default function OverviewPage() {
                         {fmtInt(m.trade_count)}
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtDollars(m.trade_dollar_volume)}
+                        {fmtMaybeInt(m.volume_24h)}
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtInt(m.volume_total)}
+                        {fmtMaybeDollars(m.trade_dollar_volume)}
+                      </td>
+                      <td className="px-4 py-2.5 text-right num text-sm">
+                        {fmtMaybeInt(m.volume_total)}
                       </td>
                     </tr>
                   ))}
@@ -545,6 +549,16 @@ export default function OverviewPage() {
       </Card>
     </div>
   );
+}
+
+function fmtMaybeInt(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  return fmtInt(Math.round(Number(value)));
+}
+
+function fmtMaybeDollars(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(Number(value))) return "—";
+  return fmtDollars(Number(value));
 }
 
 function scopeLabel(scope: MarketScope): string {
