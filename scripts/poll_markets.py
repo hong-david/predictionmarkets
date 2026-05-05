@@ -47,7 +47,7 @@ from app.services.pipeline_heartbeat import (
     new_run_id,
     record_pipeline_heartbeat,
 )
-from scripts.hydrate_unknown_markets import hydrate_unknown_tickers
+from scripts.hydrate_unknown_markets import hydrate_unknown_tickers, refresh_active_lifecycle_tickers
 
 
 def _utc_now() -> str:
@@ -63,6 +63,9 @@ def run_cycle(
     anomaly_lookback: int,
     hydrate_unknown_max: int,
     hydrate_unknown_sleep: float,
+    refresh_active_lifecycle_max: int,
+    refresh_active_lifecycle_min_age_minutes: int,
+    refresh_active_lifecycle_sleep: float,
 ) -> dict[str, int]:
     """Single sweep over Kalshi /markets, batched ingest, then anomaly materialize.
 
@@ -133,6 +136,16 @@ def run_cycle(
         totals["missing_unknown"] = hydrate_result["missing"]
         totals["errored_unknown"] = hydrate_result["errored"]
 
+    if refresh_active_lifecycle_max > 0:
+        lifecycle_result = refresh_active_lifecycle_tickers(
+            max_markets=refresh_active_lifecycle_max,
+            min_age_minutes=refresh_active_lifecycle_min_age_minutes,
+            sleep_seconds=refresh_active_lifecycle_sleep,
+        )
+        totals["refreshed_active_lifecycle"] = lifecycle_result["refreshed"]
+        totals["missing_active_lifecycle"] = lifecycle_result["missing"]
+        totals["errored_active_lifecycle"] = lifecycle_result["errored"]
+
     mark_pipeline_success(
         "market_poller",
         detail=(
@@ -199,6 +212,24 @@ def main() -> None:
         type=float,
         default=0.02,
         help="Seconds between per-ticker hydration calls. Default: 0.02.",
+    )
+    parser.add_argument(
+        "--refresh-active-lifecycle-max",
+        type=int,
+        default=25,
+        help="Per cycle, refresh this many stale local active/open markets by per-market REST lookup. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--refresh-active-lifecycle-min-age-minutes",
+        type=int,
+        default=30,
+        help="Only refresh local active/open markets whose updated_at is at least this old. Default: 30.",
+    )
+    parser.add_argument(
+        "--refresh-active-lifecycle-sleep",
+        type=float,
+        default=0.02,
+        help="Seconds between active lifecycle refresh calls. Default: 0.02.",
     )
     args = parser.parse_args()
 
