@@ -65,6 +65,14 @@ _ANOMALY_MATERIALIZE_INTERVAL_BY_TIER_SEC = {
 _ANOMALY_MATERIALIZE_DEFAULT_INTERVAL_SEC = 1800.0
 
 
+def first_present(*values):
+    """Return first non-null/non-empty value without treating 0 as missing."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def _should_materialize_market_anomaly(
     market_pk: int,
     decision: StorageDecision,
@@ -326,10 +334,16 @@ def handle_ticker_message(data: dict) -> None:
         ya = parse_decimal(msg.get("yes_ask_dollars"))
         nb = parse_decimal(msg.get("no_bid_dollars"))
         na = parse_decimal(msg.get("no_ask_dollars"))
-        vol = parse_decimal(msg.get("volume_fp"))
-        v24 = parse_decimal(msg.get("volume_24h_fp"))
-        oi = parse_decimal(msg.get("open_interest_fp"))
-        liq = parse_decimal(msg.get("liquidity_dollars"))
+        vol = parse_decimal(first_present(msg.get("volume_fp"), msg.get("volume")))
+        v24 = parse_decimal(
+            first_present(
+                msg.get("volume_24h_fp"),
+                msg.get("volume_24h"),
+                msg.get("volume24h"),
+            )
+        )
+        oi = parse_decimal(first_present(msg.get("open_interest_fp"), msg.get("open_interest")))
+        liq = parse_decimal(first_present(msg.get("liquidity_dollars"), msg.get("liquidity")))
         _update_tape_hints_from_ticker(market.id, v24, oi)
         decision = storage_decision_for_event(
             market,

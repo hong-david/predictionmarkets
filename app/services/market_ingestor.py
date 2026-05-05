@@ -65,6 +65,14 @@ def chunked(iterable: Iterable[T], size: int) -> Iterator[list[T]]:
         yield batch
 
 
+def first_present(*values):
+    """Return first non-null/non-empty value without treating 0 as missing."""
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def parse_dt(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -174,10 +182,16 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         ya = parse_decimal(item.get("yes_ask_dollars"))
         nb = parse_decimal(item.get("no_bid_dollars"))
         na = parse_decimal(item.get("no_ask_dollars"))
-        vol = parse_decimal(item.get("volume_fp"))
-        v24 = parse_decimal(item.get("volume_24h_fp"))
-        oi = parse_decimal(item.get("open_interest_fp"))
-        liq = parse_decimal(item.get("liquidity_dollars"))
+        vol = parse_decimal(first_present(item.get("volume_fp"), item.get("volume")))
+        v24 = parse_decimal(
+            first_present(
+                item.get("volume_24h_fp"),
+                item.get("volume_24h"),
+                item.get("volume24h"),
+            )
+        )
+        oi = parse_decimal(first_present(item.get("open_interest_fp"), item.get("open_interest")))
+        liq = parse_decimal(first_present(item.get("liquidity_dollars"), item.get("liquidity")))
         if should_skip_duplicate_snapshot(
             db,
             market.id,
