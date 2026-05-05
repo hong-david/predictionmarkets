@@ -52,6 +52,40 @@ _CH_TRADES_TABLE = "kalshi_trades_raw"
 _CH_QUOTES_TABLE = "kalshi_quote_changes_raw"
 _CH_L2_TABLE = "kalshi_l2_events_raw"
 
+# Market-state anomaly scoring needs the recent snapshot window, so running it
+# after every sampled ticker snapshot creates a high-volume
+# `market_snapshots ... order by ts desc limit 40` workload. Keep hot/high-signal
+# markets immediate, but throttle lower-signal tiers per process.
+_ANOMALY_MATERIALIZE_LAST_RUN: dict[int, float] = {}
+_ANOMALY_MATERIALIZE_ALWAYS_TIERS = {"hot", "triggered", "case"}
+_ANOMALY_MATERIALIZE_INTERVAL_BY_TIER_SEC = {
+    "sampled": 1800.0,
+    "observe_only": 3600.0,
+}
+_ANOMALY_MATERIALIZE_DEFAULT_INTERVAL_SEC = 1800.0
+
+
+def _should_materialize_market_anomaly(
+    market_pk: int,
+    decision: StorageDecision,
+) -> bool:
+    tier = (decision.tier or "").strip()
+    if tier in _ANOMALY_MATERIALIZE_ALWAYS_TIERS:
+        return True
+
+    interval = _ANOMALY_MATERIALIZE_INTERVAL_BY_TIER_SEC.get(
+        tier,
+        _ANOMALY_MATERIALIZE_DEFAULT_INTERVAL_SEC,
+    )
+    now_m = time.monotonic()
+    last = _ANOMALY_MATERIALIZE_LAST_RUN.get(market_pk)
+    if last is not None and (now_m - last) < interval:
+        return False
+
+    _ANOMALY_MATERIALIZE_LAST_RUN[market_pk] = now_m
+    return True
+
+
 
 def _raw_backend() -> str:
     backend = settings.kalshi_raw_backend.lower().strip()
@@ -405,12 +439,13 @@ def handle_ticker_message(data: dict) -> None:
                 },
             )
 
-        materialize_market_anomaly(
-            db,
-            market,
-            lookback=40,
-            latest_snapshot_id=snapshot.id,
-        )
+        if _should_materialize_market_anomaly(market.id, decision):
+            materialize_market_anomaly(
+                db,
+                market,
+                lookback=40,
+                latest_snapshot_id=snapshot.id,
+            )
         db.commit()
 
         logger.info(
