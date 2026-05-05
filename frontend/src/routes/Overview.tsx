@@ -208,7 +208,7 @@ export default function OverviewPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
           <p className="text-sm text-muted-foreground">
-            Snapshot of {scopeLabel(marketScope).toLowerCase()} markets and activity · {fmtInt(st?.markets)} in view
+            Snapshot of {scopeLabel(marketScope).toLowerCase()} markets and activity · {fmtInt(st?.markets_in_scope ?? st?.markets)} in view
           </p>
         </div>
         <div className="flex flex-col items-start gap-2 sm:items-end">

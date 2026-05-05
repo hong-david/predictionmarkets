@@ -1203,11 +1203,25 @@ def _news_link_market_filters() -> list:
 
 
 def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
-    """Coarse system-wide counts. Used by `GET /stats` and `GET /overview`."""
+    """Coarse system-wide counts.
+
+    Used by `GET /stats` and `GET /overview`.
+
+    The top homepage stat tiles are intentionally global/system-wide. The
+    active/historical/all scope still matters for the surrounding dashboard
+    sections, but these counters answer "how much have we saved overall?"
+    rather than "how much is in the current filter?"
+    """
     market_scope = _normalize_market_scope(market_scope)
+
     hydrated = _hydrated_market_filters()
     scoped = hydrated + _market_scope_filters(market_scope)
-    markets = db.query(func.count(Market.id)).filter(*scoped).scalar() or 0
+
+    # Kept for page copy like "N in view"; not used for the global stat tiles.
+    markets_in_scope = (
+        db.query(func.count(Market.id)).filter(*scoped).scalar() or 0
+    )
+
     markets_all = db.query(func.count(Market.id)).filter(*hydrated).scalar() or 0
     markets_active = (
         db.query(func.count(Market.id))
@@ -1222,15 +1236,18 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
         or 0
     )
     markets_unknown = (
-        db.query(func.count(Market.id)).filter(Market.status == "unknown").scalar() or 0
+        db.query(func.count(Market.id)).filter(Market.status == "unknown").scalar()
+        or 0
     )
+
     markets_high_prior = (
         db.query(func.count(Market.id))
-        .filter(*scoped)
+        .filter(*hydrated)
         .filter(Market.manipulability_prior == "high")
         .scalar()
         or 0
     )
+
     metric_projection = _market_metrics_available(db)
     metric_counts = None
     if metric_projection:
@@ -1248,56 +1265,69 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
                 ).label("markets_with_flags"),
             )
             .join(Market, Market.id == MarketMetric.market_pk)
-            .filter(*scoped)
+            .filter(*hydrated)
             .one()
         )
+
     trades = (
         int(metric_counts.trades)
         if metric_counts is not None and int(metric_counts.trades or 0) > 0
         else _estimated_table_count(db, "trades")
     )
+
     snapshots = _estimated_table_count(db, "market_snapshots")
+
     book_events = _estimated_table_count(db, "book_events")
     raw_backend = settings.kalshi_raw_backend.lower().strip()
     if book_events == 0 or raw_backend in {"clickhouse", "dual"}:
         clickhouse_book_events = _clickhouse_table_count("kalshi_l2_events_raw")
         if clickhouse_book_events is not None:
             book_events = max(book_events, clickhouse_book_events)
+
     anomalies = (
         int(metric_counts.anomalies)
         if metric_counts is not None and int(metric_counts.anomalies or 0) > 0
         else _estimated_table_count(db, "anomalies")
     )
+
     news_articles = db.query(func.count(NewsArticle.id)).scalar() or 0
+
     anomalies_high = (
         int(metric_counts.high_anomalies)
         if metric_counts is not None and int(metric_counts.high_anomalies or 0) > 0
-        else db.query(func.count(Anomaly.id)).filter(Anomaly.severity == "high").scalar()
+        else db.query(func.count(Anomaly.id))
+        .filter(Anomaly.severity == "high")
+        .scalar()
         or 0
     )
+
     markets_with_flags = (
         int(metric_counts.markets_with_flags)
         if metric_counts is not None
-        else min(markets, anomalies)
+        else min(int(markets_all), int(anomalies))
     )
 
     return {
         "market_scope": market_scope,
-        "markets": markets,
-        "markets_all": markets_all,
-        "markets_active": markets_active,
-        "markets_historical": markets_historical,
-        "markets_status_unknown": markets_unknown,
-        "markets_high_prior": markets_high_prior,
-        "markets_with_flags": markets_with_flags,
-        "trades": trades,
-        "snapshots": snapshots,
-        "book_events": book_events,
-        "anomalies": anomalies,
-        "news_articles": int(news_articles),
-        "anomalies_high_severity": anomalies_high,
-    }
 
+        # Existing `markets` field now means global active/open markets, matching
+        # the homepage stat tile label. `markets_in_scope` is the scoped count.
+        "markets": int(markets_active),
+        "markets_in_scope": int(markets_in_scope),
+
+        "markets_all": int(markets_all),
+        "markets_active": int(markets_active),
+        "markets_historical": int(markets_historical),
+        "markets_status_unknown": int(markets_unknown),
+        "markets_high_prior": int(markets_high_prior),
+        "markets_with_flags": int(markets_with_flags),
+        "trades": int(trades),
+        "snapshots": int(snapshots),
+        "book_events": int(book_events),
+        "anomalies": int(anomalies),
+        "news_articles": int(news_articles),
+        "anomalies_high_severity": int(anomalies_high),
+    }
 
 def _breakdown_payload(db: Session, *, market_scope: str = "active") -> dict:
     """Classification pivots for the overview page."""

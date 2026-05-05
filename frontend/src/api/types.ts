@@ -21,6 +21,7 @@ export type MarketScope = "active" | "historical" | "all";
 export interface SystemStats {
   market_scope: MarketScope | string;
   markets: number;
+  markets_in_scope?: number;
   markets_all: number;
   markets_active: number;
   markets_historical: number;
