@@ -372,7 +372,7 @@ def _latest_snapshot_values_for_market_pks(
 ) -> dict[int, dict[str, float | None]]:
     if not market_pks:
         return {}
-        
+
     rows = (
         db.query(
             MarketMetric.market_pk,
@@ -410,6 +410,7 @@ def _latest_snapshot_values_for_market_pks(
         }
         for row in rows
     }
+
     missing_or_blank = [
         pk
         for pk in market_pks
@@ -417,8 +418,10 @@ def _latest_snapshot_values_for_market_pks(
         or (
             values[pk].get("last_price") is None
             and values[pk].get("volume_24h") is None
+            and values[pk].get("volume_total") is None
         )
     ]
+
     if missing_or_blank:
         metric_rows = (
             db.query(
@@ -440,6 +443,76 @@ def _latest_snapshot_values_for_market_pks(
                 )
             if current["volume_24h"] is None and row.volume_24h_contracts is not None:
                 current["volume_24h"] = float(row.volume_24h_contracts)
+
+    # Fallback for markets where market_metrics.latest_snapshot_id is missing,
+    # stale, or points to a snapshot without volume fields. This only runs for
+    # the small rendered market set, and the endpoint is dashboard-cached.
+    snapshot_missing = [
+        pk
+        for pk in market_pks
+        if pk not in values
+        or values[pk].get("last_price") is None
+        or values[pk].get("volume_24h") is None
+        or values[pk].get("volume_total") is None
+    ]
+
+    if snapshot_missing:
+        has_useful_snapshot_fields = (
+            MarketSnapshot.last_price_dollars.isnot(None)
+            | MarketSnapshot.yes_bid_dollars.isnot(None)
+            | MarketSnapshot.yes_ask_dollars.isnot(None)
+            | MarketSnapshot.volume_24h_fp.isnot(None)
+            | MarketSnapshot.volume_fp.isnot(None)
+        )
+
+        useful_snapshot_ranked = (
+            select(
+                MarketSnapshot.market_pk.label("market_pk"),
+                MarketSnapshot.last_price_dollars.label("last_price"),
+                MarketSnapshot.yes_bid_dollars.label("yes_bid"),
+                MarketSnapshot.yes_ask_dollars.label("yes_ask"),
+                MarketSnapshot.volume_24h_fp.label("volume_24h"),
+                MarketSnapshot.volume_fp.label("volume_total"),
+                func.row_number()
+                .over(
+                    partition_by=MarketSnapshot.market_pk,
+                    order_by=(
+                        case((has_useful_snapshot_fields, 0), else_=1),
+                        MarketSnapshot.ts.desc(),
+                        MarketSnapshot.id.desc(),
+                    ),
+                )
+                .label("rn"),
+            )
+            .where(MarketSnapshot.market_pk.in_(snapshot_missing))
+            .subquery()
+        )
+
+        snapshot_rows = db.execute(
+            select(
+                useful_snapshot_ranked.c.market_pk,
+                useful_snapshot_ranked.c.last_price,
+                useful_snapshot_ranked.c.yes_bid,
+                useful_snapshot_ranked.c.yes_ask,
+                useful_snapshot_ranked.c.volume_24h,
+                useful_snapshot_ranked.c.volume_total,
+            ).where(useful_snapshot_ranked.c.rn == 1)
+        ).all()
+
+        for row in snapshot_rows:
+            current = values.setdefault(
+                int(row.market_pk),
+                {"last_price": None, "volume_24h": None, "volume_total": None},
+            )
+            if current["last_price"] is None:
+                price = _display_price(row)
+                if price is not None:
+                    current["last_price"] = price
+            if current["volume_24h"] is None and row.volume_24h is not None:
+                current["volume_24h"] = float(row.volume_24h)
+            if current["volume_total"] is None and row.volume_total is not None:
+                current["volume_total"] = float(row.volume_total)
+
     price_missing = [
         pk for pk in market_pks if values.get(pk, {}).get("last_price") is None
     ]
@@ -472,8 +545,8 @@ def _latest_snapshot_values_for_market_pks(
             )
             if current["last_price"] is None:
                 current["last_price"] = _probability_float(row.yes_price)
-    return values
 
+    return values
 
 def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
     return {

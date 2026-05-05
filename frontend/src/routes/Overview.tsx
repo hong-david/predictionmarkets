@@ -329,7 +329,7 @@ export default function OverviewPage() {
         <Card className="h-[32rem] overflow-hidden flex flex-col">
           <CardHeader
             title="Most traded markets"
-            subtitle="Active/open markets with the most retained execution prints, 24h retained trade dollars, and exchange-reported lifetime volume."
+            subtitle="Active/open markets with the most retained execution prints, exchange-reported 24h volume, and exchange-reported lifetime volume."
           />
           <div className="flex-1 overflow-x-auto">
             {overview.isPending ? (
@@ -345,7 +345,6 @@ export default function OverviewPage() {
                     <th className="text-left px-4 py-2 font-medium">Market</th>
                     <th className="text-right px-4 py-2 font-medium">Trades</th>
                     <th className="text-right px-4 py-2 font-medium">24h vol.</th>
-                    <th className="text-right px-4 py-2 font-medium">24h $ est.</th>
                     <th className="text-right px-4 py-2 font-medium">Total vol.</th>
                   </tr>
                 </thead>
@@ -363,9 +362,6 @@ export default function OverviewPage() {
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
                         {fmtMaybeInt(m.volume_24h)}
-                      </td>
-                      <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtMaybeDollars(m.trade_dollar_volume)}
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
                         {fmtMaybeInt(m.volume_total)}
@@ -554,11 +550,6 @@ export default function OverviewPage() {
 function fmtMaybeInt(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(Number(value))) return "—";
   return fmtInt(Math.round(Number(value)));
-}
-
-function fmtMaybeDollars(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return "—";
-  return fmtDollars(Number(value));
 }
 
 function scopeLabel(scope: MarketScope): string {
