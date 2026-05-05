@@ -144,11 +144,27 @@ def _tape_hints_for_market(db, market: Market) -> tuple[Decimal | None, Decimal 
     if ent and (now_m - ent[2]) < _TAPE_HINT_TTL_SEC:
         return ent[0], ent[1]
     last = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.id.desc())
+        db.query(
+            MarketSnapshot.volume_24h_fp,
+            MarketSnapshot.open_interest_fp,
+        )
+        .join(MarketMetric, MarketMetric.latest_snapshot_id == MarketSnapshot.id)
+        .filter(MarketMetric.market_pk == market.id)
         .first()
     )
+
+    # Fallback for markets whose metric row has not been initialized yet.
+    if last is None:
+        last = (
+            db.query(
+                MarketSnapshot.volume_24h_fp,
+                MarketSnapshot.open_interest_fp,
+            )
+            .filter(MarketSnapshot.market_pk == market.id)
+            .order_by(MarketSnapshot.id.desc())
+            .first()
+        )
+
     v24 = last.volume_24h_fp if last else None
     oi = last.open_interest_fp if last else None
     _tape_volume_cache[market.id] = (v24, oi, now_m)

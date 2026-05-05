@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
-from app.db.models import MarketSnapshot
+from app.db.models import MarketSnapshot, MarketMetric
 
 _EQ_D = Decimal("0.0001")
 _EQ_Q = Decimal("0.01")
@@ -59,14 +59,41 @@ def should_skip_duplicate_snapshot(
     """
     now = now if now is not None else datetime.now(timezone.utc)
     last = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market_pk)
-        .order_by(MarketSnapshot.id.desc())
+        db.query(
+            MarketSnapshot.ts,
+            MarketSnapshot.last_price_dollars,
+            MarketSnapshot.yes_bid_dollars,
+            MarketSnapshot.yes_ask_dollars,
+            MarketSnapshot.no_bid_dollars,
+            MarketSnapshot.no_ask_dollars,
+            MarketSnapshot.volume_fp,
+            MarketSnapshot.volume_24h_fp,
+            MarketSnapshot.open_interest_fp,
+            MarketSnapshot.liquidity_dollars,
+        )
+        .join(MarketMetric, MarketMetric.latest_snapshot_id == MarketSnapshot.id)
+        .filter(MarketMetric.market_pk == market_pk)
         .first()
     )
+    # Fallback for markets whose metric row has not been initialized yet.
     if last is None:
-        return False
-
+        last = (
+            db.query(
+                MarketSnapshot.ts,
+                MarketSnapshot.last_price_dollars,
+                MarketSnapshot.yes_bid_dollars,
+                MarketSnapshot.yes_ask_dollars,
+                MarketSnapshot.no_bid_dollars,
+                MarketSnapshot.no_ask_dollars,
+                MarketSnapshot.volume_fp,
+                MarketSnapshot.volume_24h_fp,
+                MarketSnapshot.open_interest_fp,
+                MarketSnapshot.liquidity_dollars,
+            )
+            .filter(MarketSnapshot.market_pk == market_pk)
+            .order_by(MarketSnapshot.id.desc())
+            .first()
+        )
     same = (
         _eq_d(last.last_price_dollars, last_price_dollars)
         and _eq_d(last.yes_bid_dollars, yes_bid_dollars)
