@@ -98,6 +98,9 @@ def should_skip_duplicate_snapshot(
             .first()
         )
     
+    if last is None:
+        return False
+
     same = (
         _eq_d(last.last_price_dollars, last_price_dollars)
         and _eq_d(last.yes_bid_dollars, yes_bid_dollars)
