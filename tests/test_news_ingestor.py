@@ -49,6 +49,11 @@ def test_ingest_global_news_fails_open_when_gdelt_unavailable(monkeypatch) -> No
     monkeypatch.setattr("app.services.news_ingestor.fetch_gdelt_articles", fake_fetch)
     monkeypatch.setattr("app.services.news_ingestor.fetch_rss_articles", lambda *a, **k: [])
 
+    # Keep this test focused on the GDELT fail-open path. Extra providers can
+    # produce articles and then require a real db.query(...) later in the flow.
+    monkeypatch.setattr("app.services.news_ingestor.DEFAULT_NEWS_SOURCES", ())
+    monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
+
     result = ingest_global_news(
         object(),
         max_markets=10,
