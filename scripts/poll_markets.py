@@ -216,7 +216,7 @@ def main() -> None:
     parser.add_argument(
         "--refresh-active-lifecycle-max",
         type=int,
-        default=25,
+        default=0,
         help="Per cycle, refresh this many stale local active/open markets by per-market REST lookup. Use 0 to disable.",
     )
     parser.add_argument(
@@ -252,6 +252,9 @@ def main() -> None:
                     anomaly_lookback=args.anomaly_lookback,
                     hydrate_unknown_max=args.hydrate_unknown_max,
                     hydrate_unknown_sleep=args.hydrate_unknown_sleep,
+                    refresh_active_lifecycle_max=args.refresh_active_lifecycle_max,
+                    refresh_active_lifecycle_min_age_minutes=args.refresh_active_lifecycle_min_age_minutes,
+                    refresh_active_lifecycle_sleep=args.refresh_active_lifecycle_sleep,
                 )
             except Exception as exc:
                 mark_pipeline_error("market_poller", exc, detail="Market sweep failed.")

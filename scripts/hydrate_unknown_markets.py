@@ -186,12 +186,11 @@ def select_active_lifecycle_refresh_tickers(
     close_time through the normal ingestor path.
 
     We exclude obviously stale dated tickers in Python instead of SQL because
-    PostgreSQL substring/regex capture behavior can return only a capture group,
-    which is easy to misparse as YYMONDD.
+    PostgreSQL substring/regex capture behavior can return only a capture group.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)
     today = datetime.now(timezone.utc).date()
-    fetch_limit = max_markets * 10 if max_markets is not None else None
+    fetch_limit = max_markets * 20 if max_markets is not None else None
 
     db = SessionLocal()
     try:
