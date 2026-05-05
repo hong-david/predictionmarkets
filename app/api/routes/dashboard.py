@@ -1835,7 +1835,6 @@ def _recent_anomalies_payload(
         or_(
             func.coalesce(MarketMetric.trade_count, 0) > 0,
             func.coalesce(MarketMetric.volume_24h_contracts, 0) > 0,
-            exists().where(TradeFlag.market_pk == Market.id),
         )
     )
     if severity:
