@@ -60,7 +60,7 @@ def _aware(dt: datetime) -> datetime:
 
 def _market_key(row: dict[str, Any]) -> tuple[str, str]:
     return (
-        str(row.get("category") or "unclassified"),
+        str(row.get("category_normalized") or row.get("category") or "unclassified"),
         str(row.get("subcategory") or "*"),
     )
 

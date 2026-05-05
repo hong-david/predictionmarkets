@@ -73,6 +73,11 @@ from app.services.market_lifecycle import (
     market_scope_filters as _market_scope_filters,
     normalize_market_scope as _normalize_market_scope,
 )
+from app.services.market_taxonomy import (
+    category_family_for_market,
+    is_sports_market,
+    normalized_category_for_market,
+)
 from app.services.search_index import dashboard_search
 from app.services.storage_health import storage_health_detail, storage_health_snapshot
 from app.services.surveillance_scores import (
@@ -317,7 +322,9 @@ def _serialize_market_row(
         "title": market.title,
         "subtitle": market.subtitle,
         "status": market.status,
-        "category": market.category,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
         "subcategory": market.subcategory,
         "manipulability_prior": market.manipulability_prior,
         "classifier_confidence": market.classifier_confidence,
@@ -2008,7 +2015,9 @@ def _news_signal_payload(
         "event_market_id": market.event_id,
         "title": market.title,
         "subtitle": market.subtitle,
-        "category": market.category,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
         "manipulability_prior": market.manipulability_prior,
         "article": article_payload,
         "article_title": article.title,
@@ -2094,6 +2103,233 @@ def _news_signals_payload(
     }
 
 
+
+
+def _dashboard_market_category(market: Market) -> str | None:
+    return normalized_category_for_market(
+        category=market.category,
+        event_id=market.event_id,
+        market_id=market.market_id,
+        title=market.title,
+    )
+
+
+def _dashboard_market_family(market: Market) -> str:
+    return category_family_for_market(
+        category=_dashboard_market_category(market),
+        event_id=market.event_id,
+        market_id=market.market_id,
+        title=market.title,
+    )
+
+
+def _is_suspicious_sports_item(item: dict) -> bool:
+    return is_sports_market(
+        category=item.get("category"),
+        event_id=item.get("event_id"),
+        market_id=item.get("market_id"),
+        title=item.get("title"),
+    )
+
+
+def _diversify_suspicious_trades(items: list[dict], limit: int) -> list[dict]:
+    """Presentation-only diversification for dashboard suspicious_trades.
+
+    Keeps raw trade_flags.score unchanged. Input order is preserved as the
+    priority order: score desc, then timestamp desc.
+    """
+    if limit <= 0:
+        return []
+
+    sports_cap = min(limit, 4)
+    category_cap = 3
+
+    out: list[dict] = []
+    skipped: list[dict] = []
+    seen_trade_keys: set[str] = set()
+    seen_markets: set[str] = set()
+    seen_sports_events: set[str] = set()
+    category_counts: dict[str, int] = defaultdict(int)
+    sports_count = 0
+
+    def trade_key(item: dict) -> str:
+        return str(
+            item.get("trade_id")
+            or f"{item.get('market_id')}:{item.get('ts')}:{item.get('suspicion')}"
+        )
+
+    def market_key(item: dict) -> str:
+        return str(item.get("market_id") or "")
+
+    def sports_event_key(item: dict) -> str:
+        return str(item.get("event_id") or item.get("market_id") or "")
+
+    def add(item: dict) -> None:
+        nonlocal sports_count
+
+        out.append(item)
+        seen_trade_keys.add(trade_key(item))
+
+        mk = market_key(item)
+        if mk:
+            seen_markets.add(mk)
+
+        category = str(item.get("category") or "unclassified")
+        category_counts[category] += 1
+
+        if category in _SUSPICIOUS_SPORTS_CATEGORIES:
+            sports_count += 1
+            ek = sports_event_key(item)
+            if ek:
+                seen_sports_events.add(ek)
+
+    for item in items:
+        if len(out) >= limit:
+            break
+
+        key = trade_key(item)
+        if key in seen_trade_keys:
+            continue
+
+        category = str(item.get("category") or "unclassified")
+        mk = market_key(item)
+
+        if mk and mk in seen_markets:
+            skipped.append(item)
+            continue
+
+        if category_counts[category] >= category_cap:
+            skipped.append(item)
+            continue
+
+
+_SUSPICIOUS_SPORTS_CATEGORIES = {
+    "sports_outcome",
+    "sports_derivative",
+    "sports_prop",
+}
+
+_SUSPICIOUS_SPORTS_EVENT_PREFIXES = (
+    "KXATP",
+    "KXWTA",
+    "KXITF",
+    "KXNPB",
+    "KXMLB",
+    "KXNBA",
+    "KXNFL",
+    "KXNHL",
+    "KXMLS",
+    "KXEPL",
+    "KXUFC",
+    "KXPGA",
+    "KXDPWORLDTOUR",
+)
+
+
+def _is_suspicious_sports_item(item: dict) -> bool:
+    category = str(item.get("category") or "")
+    if category in _SUSPICIOUS_SPORTS_CATEGORIES:
+        return True
+
+    event_or_market = str(item.get("event_id") or item.get("market_id") or "").upper()
+    return event_or_market.startswith(_SUSPICIOUS_SPORTS_EVENT_PREFIXES)
+
+
+def _diversify_suspicious_trades(items: list[dict], limit: int) -> list[dict]:
+    """Presentation-only diversification for dashboard suspicious_trades.
+
+    Keeps raw trade_flags.score unchanged. Input order remains the priority
+    order: score desc, then timestamp desc.
+    """
+    if limit <= 0:
+        return []
+
+    sports_cap = min(limit, 4)
+    category_cap = 3
+
+    out: list[dict] = []
+    skipped: list[dict] = []
+    seen_trade_keys: set[str] = set()
+    seen_markets: set[str] = set()
+    seen_sports_events: set[str] = set()
+    category_counts: dict[str, int] = defaultdict(int)
+    sports_count = 0
+
+    def trade_key(item: dict) -> str:
+        return str(
+            item.get("trade_id")
+            or f"{item.get('market_id')}:{item.get('ts')}:{item.get('suspicion')}"
+        )
+
+    def market_key(item: dict) -> str:
+        return str(item.get("market_id") or "")
+
+    def sports_event_key(item: dict) -> str:
+        return str(item.get("event_id") or item.get("market_id") or "")
+
+    def can_add(item: dict, *, strict: bool) -> bool:
+        nonlocal sports_count
+
+        key = trade_key(item)
+        if key in seen_trade_keys:
+            return False
+
+        is_sports = _is_suspicious_sports_item(item)
+        if is_sports:
+            if sports_count >= sports_cap:
+                return False
+            ek = sports_event_key(item)
+            if ek and ek in seen_sports_events:
+                return False
+
+        if strict:
+            mk = market_key(item)
+            if mk and mk in seen_markets:
+                return False
+
+            category = str(item.get("category") or "unclassified")
+            if category_counts[category] >= category_cap:
+                return False
+
+        return True
+
+    def add(item: dict) -> None:
+        nonlocal sports_count
+
+        out.append(item)
+        seen_trade_keys.add(trade_key(item))
+
+        mk = market_key(item)
+        if mk:
+            seen_markets.add(mk)
+
+        category = str(item.get("category") or "unclassified")
+        category_counts[category] += 1
+
+        if _is_suspicious_sports_item(item):
+            sports_count += 1
+            ek = sports_event_key(item)
+            if ek:
+                seen_sports_events.add(ek)
+
+    for item in items:
+        if len(out) >= limit:
+            break
+        if can_add(item, strict=True):
+            add(item)
+        else:
+            skipped.append(item)
+
+    # Fill remaining slots by relaxing category/market caps, but never the sports cap.
+    for item in skipped:
+        if len(out) >= limit:
+            break
+        if can_add(item, strict=False):
+            add(item)
+
+    return out[:limit]
+
+
 def _suspicious_trades_payload(
     db: Session,
     *,
@@ -2102,6 +2338,8 @@ def _suspicious_trades_payload(
     market_scope: str = "active",
 ) -> dict:
     scope_filters = _market_scope_filters(market_scope)
+    candidate_limit = max(limit * 25, 300)
+
     persisted = (
         db.query(TradeFlag, Trade, Market)
         .join(Trade, Trade.id == TradeFlag.trade_pk)
@@ -2109,53 +2347,58 @@ def _suspicious_trades_payload(
         .filter(*(_hydrated_market_filters() + scope_filters))
         .filter(TradeFlag.scorer_version == TRADE_SCORER_VERSION)
         .order_by(TradeFlag.score.desc(), TradeFlag.ts.desc())
-        .limit(limit)
+        .limit(candidate_limit)
         .all()
     )
+
     if persisted:
+        trades = [
+            {
+                "market_id": market.market_id,
+                "event_id": market.event_id,
+                "title": market.title,
+                "subtitle": market.subtitle,
+                "category": _dashboard_market_category(market),
+                "raw_category": market.category,
+                "category_family": _dashboard_market_family(market),
+                "manipulability_prior": market.manipulability_prior,
+                "trade_id": trade.trade_id,
+                "ts": trade.ts.isoformat() if trade.ts else None,
+                "yes_price": float(trade.yes_price_dollars)
+                if trade.yes_price_dollars is not None
+                else None,
+                "no_price": float(trade.no_price_dollars)
+                if trade.no_price_dollars is not None
+                else None,
+                "count": float(trade.count_fp) if trade.count_fp is not None else None,
+                "trade_dollar_amount": _trade_notional_dollars(
+                    yes_price=trade.yes_price_dollars,
+                    no_price=trade.no_price_dollars,
+                    count=trade.count_fp,
+                    taker_side=trade.taker_side,
+                ),
+                "taker_side": trade.taker_side,
+                "suspicion": float(flag.score),
+                "local_suspicion": float(flag.local_score),
+                "context_score": float(flag.context_score),
+                "reasons": flag.reasons or [],
+                "features": {
+                    "context": flag.features or {},
+                    "components": flag.components or {},
+                },
+                "severity": flag.severity,
+                "promoted_storage_tier": flag.promoted_storage_tier,
+            }
+            for flag, trade, market in persisted
+        ]
+        trades = _diversify_suspicious_trades(trades, limit)
         return {
-            "count": len(persisted),
-            "trades": [
-                {
-                    "market_id": market.market_id,
-                    "event_id": market.event_id,
-                    "title": market.title,
-                    "subtitle": market.subtitle,
-                    "category": market.category,
-                    "manipulability_prior": market.manipulability_prior,
-                    "trade_id": trade.trade_id,
-                    "ts": trade.ts.isoformat() if trade.ts else None,
-                    "yes_price": float(trade.yes_price_dollars)
-                    if trade.yes_price_dollars is not None
-                    else None,
-                    "no_price": float(trade.no_price_dollars)
-                    if trade.no_price_dollars is not None
-                    else None,
-                    "count": float(trade.count_fp)
-                    if trade.count_fp is not None
-                    else None,
-                    "trade_dollar_amount": _trade_notional_dollars(
-                        yes_price=trade.yes_price_dollars,
-                        no_price=trade.no_price_dollars,
-                        count=trade.count_fp,
-                        taker_side=trade.taker_side,
-                    ),
-                    "taker_side": trade.taker_side,
-                    "suspicion": float(flag.score),
-                    "local_suspicion": float(flag.local_score),
-                    "context_score": float(flag.context_score),
-                    "reasons": flag.reasons or [],
-                    "features": {
-                        "context": flag.features or {},
-                        "components": flag.components or {},
-                    },
-                    "severity": flag.severity,
-                    "promoted_storage_tier": flag.promoted_storage_tier,
-                }
-                for flag, trade, market in persisted
-            ],
+            "count": len(trades),
+            "trades": trades,
             "sample": sample,
+            "candidate_count": len(persisted),
             "source": "trade_flags",
+            "diversified": True,
         }
 
     rows = (
@@ -2174,7 +2417,9 @@ def _suspicious_trades_payload(
         peer_rows.append(
             {
                 "market_pk": trade.market_pk,
-                "category": market.category,
+                "category": _dashboard_market_category(market),
+                "raw_category": market.category,
+                "category_family": _dashboard_market_family(market),
                 "subcategory": market.subcategory,
                 "ts": trade.ts.isoformat() if trade.ts else None,
                 "yes_price": float(trade.yes_price_dollars)
@@ -2215,9 +2460,9 @@ def _suspicious_trades_payload(
             market=_market_context(market),
             local_explanations=explanations,
             peer_baseline=peer_baselines.get(
-                (str(market.category or "unclassified"), str(market.subcategory or "*"))
+                (_dashboard_market_category(market) or "unclassified", str(market.subcategory or "*"))
             )
-            or peer_baselines.get((str(market.category or "unclassified"), "*")),
+            or peer_baselines.get((_dashboard_market_category(market) or "unclassified", "*")),
         )
         for (trade, market), payload, explanation, context in zip(
             market_rows, payloads, explanations, contextual
@@ -2235,7 +2480,9 @@ def _suspicious_trades_payload(
                     "event_id": market.event_id,
                     "title": market.title,
                     "subtitle": market.subtitle,
-                    "category": market.category,
+                    "category": _dashboard_market_category(market),
+                    "raw_category": market.category,
+                    "category_family": _dashboard_market_family(market),
                     "manipulability_prior": market.manipulability_prior,
                     "trade_id": trade.trade_id,
                     **payload,
@@ -2259,7 +2506,7 @@ def _suspicious_trades_payload(
     candidates.sort(key=lambda x: (x["suspicion"], x["ts"] or ""), reverse=True)
     return {
         "count": min(len(candidates), limit),
-        "trades": candidates[:limit],
+        "trades": _diversify_suspicious_trades(candidates, limit),
         "sample": sample,
     }
 
@@ -3126,7 +3373,7 @@ def get_market_series(
         peer_rows = _peer_baseline_rows_for_market(db, market, limit=1500)
         peer_baselines = build_peer_baselines(peer_rows, min_points=12)
         peer_key = (
-            str(market.category or "unclassified"),
+            _dashboard_market_category(market) or "unclassified",
             str(market.subcategory or "*"),
         )
         first_trade_ts = trade_rows[0].ts if trade_rows else None

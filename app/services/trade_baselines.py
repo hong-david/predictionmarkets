@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.db.models import Market, Trade, TradeBaseline
+from app.services.market_taxonomy import normalized_category_for_market
 from app.services.trade_context import PeerBaseline, build_peer_baselines
 
 
@@ -46,7 +47,12 @@ def trade_rows_for_baselines(
     return [
         {
             "market_pk": t.market_pk,
-            "category": m.category,
+            "category": normalized_category_for_market(
+                category=m.category,
+                event_id=m.event_id,
+                market_id=m.market_id,
+                title=m.title,
+            ),
             "subcategory": m.subcategory,
             "ts": t.ts.isoformat() if t.ts else None,
             "yes_price": float(t.yes_price_dollars)
@@ -132,11 +138,17 @@ def latest_baseline_for_market(
     *,
     scorer_version: int,
 ) -> PeerBaseline | None:
-    if not market.category:
+    category = normalized_category_for_market(
+        category=market.category,
+        event_id=market.event_id,
+        market_id=market.market_id,
+        title=market.title,
+    )
+    if not category:
         return None
     scopes: Iterable[BaselineScope] = (
-        BaselineScope(market.category, market.subcategory or "*"),
-        BaselineScope(market.category, "*"),
+        BaselineScope(category, market.subcategory or "*"),
+        BaselineScope(category, "*"),
     )
     for scope in scopes:
         row = (
