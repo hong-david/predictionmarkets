@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import argparse
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
-from app.db.models import Market, Trade
+from app.db.models import Market, MarketMetric, Trade
 from app.db.session import SessionLocal
 from app.services.kalshi_rest import KalshiRestClient
 from app.services.market_ingestor import ingest_markets_payload
@@ -121,6 +121,111 @@ def hydrate_unknown_tickers(
         flush=True,
     )
     return {"hydrated": hydrated, "missing": missing, "errored": errored}
+
+
+
+def select_active_lifecycle_refresh_tickers(
+    *,
+    max_markets: int | None,
+    min_age_minutes: int,
+) -> list[str]:
+    """Return local active/open markets whose lifecycle metadata is stale.
+
+    The normal poller sweeps Kalshi with status=open. Once a market finalizes
+    upstream, it can disappear from that sweep while the local row still says
+    active/open. This bounded selector finds high-impact local active rows that
+    have not been touched recently and lets per-market REST correct status and
+    close_time through the normal ingestor path.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)
+
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(Market.market_id)
+            .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
+            .filter(Market.title != Market.market_id)
+            .filter(Market.status.in_(("active", "open")))
+            .filter(or_(Market.close_time.is_(None), Market.close_time > func.now()))
+            .filter(or_(Market.updated_at.is_(None), Market.updated_at < cutoff))
+            .order_by(
+                MarketMetric.trade_count.desc().nullslast(),
+                Market.updated_at.asc().nullsfirst(),
+                Market.id.desc(),
+            )
+        )
+        if max_markets is not None:
+            q = q.limit(max_markets)
+        return [row[0] for row in q.all()]
+    finally:
+        db.close()
+
+
+def refresh_active_lifecycle_tickers(
+    *,
+    max_markets: int | None,
+    min_age_minutes: int,
+    sleep_seconds: float,
+) -> dict[str, int]:
+    """Refresh a bounded set of local active/open markets by per-market REST."""
+    tickers = select_active_lifecycle_refresh_tickers(
+        max_markets=max_markets,
+        min_age_minutes=min_age_minutes,
+    )
+
+    if not tickers:
+        print(
+            f"[{_utc_now()}] no stale active/open markets need lifecycle refresh",
+            flush=True,
+        )
+        return {"refreshed": 0, "missing": 0, "errored": 0}
+
+    print(
+        f"[{_utc_now()}] refreshing lifecycle for {len(tickers)} active/open ticker(s) "
+        f"(min_age={min_age_minutes}m, sleep={sleep_seconds}s)",
+        flush=True,
+    )
+
+    client = KalshiRestClient()
+    refreshed = 0
+    missing = 0
+    errored = 0
+
+    db = SessionLocal()
+    try:
+        for i, ticker in enumerate(tickers, start=1):
+            try:
+                market = client.get_market(ticker)
+            except Exception as e:
+                errored += 1
+                print(f"  {ticker}: error {e!r}", flush=True)
+                time.sleep(sleep_seconds)
+                continue
+
+            if market is None:
+                missing += 1
+                print(f"  {ticker}: missing upstream", flush=True)
+            else:
+                ingest_markets_payload(db, {"markets": [market]})
+                refreshed += 1
+
+            if i % 25 == 0 or i == len(tickers):
+                print(
+                    f"  [{_utc_now()}] lifecycle progress {i}/{len(tickers)} "
+                    f"refreshed={refreshed} missing={missing} errored={errored}",
+                    flush=True,
+                )
+
+            time.sleep(sleep_seconds)
+    finally:
+        db.close()
+
+    print(
+        f"[{_utc_now()}] lifecycle refresh done. "
+        f"refreshed={refreshed} missing={missing} errored={errored}",
+        flush=True,
+    )
+    return {"refreshed": refreshed, "missing": missing, "errored": errored}
 
 
 def main() -> None:
