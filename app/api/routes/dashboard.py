@@ -472,39 +472,43 @@ def _latest_snapshot_values_for_market_pks(
             | MarketSnapshot.volume_fp.isnot(None)
         )
 
-        useful_snapshot_ranked = (
-            select(
-                MarketSnapshot.market_pk.label("market_pk"),
-                MarketSnapshot.last_price_dollars.label("last_price"),
-                MarketSnapshot.yes_bid_dollars.label("yes_bid"),
-                MarketSnapshot.yes_ask_dollars.label("yes_ask"),
-                MarketSnapshot.volume_24h_fp.label("volume_24h"),
-                MarketSnapshot.volume_fp.label("volume_total"),
-                func.row_number()
-                .over(
-                    partition_by=MarketSnapshot.market_pk,
-                    order_by=(
-                        case((has_useful_snapshot_fields, 0), else_=1),
-                        MarketSnapshot.ts.desc(),
-                        MarketSnapshot.id.desc(),
-                    ),
+        snapshot_rows = []
+        for pk in snapshot_missing:
+            # Keep this as point lookups against (market_pk, ts, id) indexes. The
+            # previous row_number partition fallback could scan large snapshot
+            # ranges when compact metrics were missing or sparse.
+            row = (
+                db.query(
+                    MarketSnapshot.market_pk.label("market_pk"),
+                    MarketSnapshot.last_price_dollars.label("last_price"),
+                    MarketSnapshot.yes_bid_dollars.label("yes_bid"),
+                    MarketSnapshot.yes_ask_dollars.label("yes_ask"),
+                    MarketSnapshot.volume_24h_fp.label("volume_24h"),
+                    MarketSnapshot.volume_fp.label("volume_total"),
                 )
-                .label("rn"),
+                .filter(MarketSnapshot.market_pk == pk)
+                .filter(has_useful_snapshot_fields)
+                .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
+                .limit(1)
+                .one_or_none()
             )
-            .where(MarketSnapshot.market_pk.in_(snapshot_missing))
-            .subquery()
-        )
-
-        snapshot_rows = db.execute(
-            select(
-                useful_snapshot_ranked.c.market_pk,
-                useful_snapshot_ranked.c.last_price,
-                useful_snapshot_ranked.c.yes_bid,
-                useful_snapshot_ranked.c.yes_ask,
-                useful_snapshot_ranked.c.volume_24h,
-                useful_snapshot_ranked.c.volume_total,
-            ).where(useful_snapshot_ranked.c.rn == 1)
-        ).all()
+            if row is None:
+                row = (
+                    db.query(
+                        MarketSnapshot.market_pk.label("market_pk"),
+                        MarketSnapshot.last_price_dollars.label("last_price"),
+                        MarketSnapshot.yes_bid_dollars.label("yes_bid"),
+                        MarketSnapshot.yes_ask_dollars.label("yes_ask"),
+                        MarketSnapshot.volume_24h_fp.label("volume_24h"),
+                        MarketSnapshot.volume_fp.label("volume_total"),
+                    )
+                    .filter(MarketSnapshot.market_pk == pk)
+                    .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
+                    .limit(1)
+                    .one_or_none()
+                )
+            if row is not None:
+                snapshot_rows.append(row)
 
         for row in snapshot_rows:
             current = values.setdefault(
@@ -524,25 +528,20 @@ def _latest_snapshot_values_for_market_pks(
         pk for pk in market_pks if values.get(pk, {}).get("last_price") is None
     ]
     if price_missing:
-        ranked_trades = (
-            select(
-                Trade.market_pk.label("market_pk"),
-                Trade.yes_price_dollars.label("yes_price"),
-                func.row_number()
-                .over(
-                    partition_by=Trade.market_pk,
-                    order_by=(Trade.ts.desc(), Trade.id.desc()),
+        trade_rows = []
+        for pk in price_missing:
+            row = (
+                db.query(
+                    Trade.market_pk.label("market_pk"),
+                    Trade.yes_price_dollars.label("yes_price"),
                 )
-                .label("rn"),
+                .filter(Trade.market_pk == pk)
+                .order_by(Trade.ts.desc(), Trade.id.desc())
+                .limit(1)
+                .one_or_none()
             )
-            .where(Trade.market_pk.in_(price_missing))
-            .subquery()
-        )
-        trade_rows = db.execute(
-            select(ranked_trades.c.market_pk, ranked_trades.c.yes_price).where(
-                ranked_trades.c.rn == 1
-            )
-        ).all()
+            if row is not None:
+                trade_rows.append(row)
         for row in trade_rows:
             if row.yes_price is None:
                 continue
@@ -939,26 +938,24 @@ def _pipeline_health_payload(db: Session) -> dict:
         )
 
     def ws_trade_component() -> dict:
-        count, latest_at = db.query(func.count(Trade.id), func.max(Trade.ts)).one()
-        latest_at = _as_utc(latest_at)
+        count = _estimated_table_count(db, "trades")
+        latest_at = _latest_column_value(db, Trade.ts)
         return _component_from_heartbeat(
             heartbeats.get("ws_trade_feed"),
             key="ws_trade_feed",
             label="WebSocket trade feed",
             description="Kalshi WebSocket trade channel writing public executions.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} stored trades; latest trade timestamp drives freshness.",
+            db_count=count,
+            db_detail=f"About {count:,} stored trades; latest trade timestamp drives freshness.",
             stale_after=_PIPELINE_WS_STALE_AFTER,
             now=now,
         )
 
     def news_ingest_component() -> dict:
-        count, latest_seen, latest_published = db.query(
-            func.count(NewsArticle.id),
-            func.max(NewsArticle.first_seen_at),
-            func.max(NewsArticle.published_at),
-        ).one()
+        count = _estimated_table_count(db, "news_articles")
+        latest_seen = _latest_column_value(db, NewsArticle.first_seen_at)
+        latest_published = _latest_column_value(db, NewsArticle.published_at)
         latest_at = _latest_datetime(latest_seen, latest_published)
         return _component_from_heartbeat(
             heartbeats.get("news_ingest"),
@@ -966,18 +963,16 @@ def _pipeline_health_payload(db: Session) -> dict:
             label="News ingest",
             description="Global news/RSS/GDELT ingest storing normalized article metadata.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} normalized articles stored.",
+            db_count=count,
+            db_detail=f"About {count:,} normalized articles stored.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
         )
 
     def news_links_component() -> dict:
-        count, latest_event = db.query(
-            func.count(NewsEvent.id),
-            func.max(NewsEvent.created_at),
-        ).one()
-        latest_article = db.query(func.max(NewsArticle.first_seen_at)).scalar()
+        count = _estimated_table_count(db, "news_events")
+        latest_event = _latest_column_value(db, NewsEvent.created_at)
+        latest_article = _latest_column_value(db, NewsArticle.first_seen_at)
         latest_at = _latest_datetime(latest_event, latest_article)
         return _component_from_heartbeat(
             heartbeats.get("news_links"),
@@ -985,36 +980,40 @@ def _pipeline_health_payload(db: Session) -> dict:
             label="News links",
             description="Candidate article-to-market links from relevance scoring.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} linked news events.",
+            db_count=count,
+            db_detail=f"About {count:,} linked news events.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
         )
 
     def news_trade_correlations_component() -> dict:
-        count, latest_at = (
-            db.query(func.count(NewsEvent.id), func.max(NewsEvent.created_at))
-            .filter(NewsEvent.pre_news_trade_score > 0)
-            .one()
+        heartbeat = heartbeats.get("news_trade_correlations")
+        count = (
+            int(heartbeat.count)
+            if heartbeat is not None and heartbeat.count is not None
+            else None
+        )
+        latest_at = _latest_column_value(
+            db,
+            NewsEvent.created_at,
+            NewsEvent.pre_news_trade_score > 0,
         )
         return _component_from_heartbeat(
-            heartbeats.get("news_trade_correlations"),
+            heartbeat,
             key="news_trade_correlations",
             label="News/trade correlations",
             description="Materialized pre-news trade alignment on linked news events.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} links have a positive pre-news trade score.",
+            db_count=count,
+            db_detail="Latest positive pre-news trade score is checked with an indexed lookup.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
         )
 
     def trade_flags_component() -> dict:
-        count, latest_ts, latest_created = db.query(
-            func.count(TradeFlag.id),
-            func.max(TradeFlag.ts),
-            func.max(TradeFlag.created_at),
-        ).one()
+        count = _estimated_table_count(db, "trade_flags")
+        latest_ts = _latest_column_value(db, TradeFlag.ts)
+        latest_created = _latest_column_value(db, TradeFlag.created_at)
         latest_at = _latest_datetime(latest_ts, latest_created)
         return _component_from_heartbeat(
             heartbeats.get("trade_flags"),
@@ -1022,59 +1021,42 @@ def _pipeline_health_payload(db: Session) -> dict:
             label="Trade flags",
             description="Contextual suspicious-trade flag materializer.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} persisted trade flags.",
+            db_count=count,
+            db_detail=f"About {count:,} persisted trade flags.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
         )
 
     def quote_book_anomalies_component() -> dict:
-        count, latest_at = db.query(func.count(Anomaly.id), func.max(Anomaly.created_at)).one()
+        count = _estimated_table_count(db, "anomalies")
+        latest_at = _latest_column_value(db, Anomaly.created_at)
         return _component_from_heartbeat(
             heartbeats.get("quote_book_anomalies"),
             key="quote_book_anomalies",
             label="Quote/book alerts",
             description="Quote and order-book market-state alert materialization.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
-            db_detail=f"{int(count or 0):,} stored quote/book alert rows.",
+            db_count=count,
+            db_detail=f"About {count:,} stored quote/book alert rows.",
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
             zero_count_is_healthy=True,
         )
 
     def retention_projection_component() -> dict:
-        count, latest_at = db.query(
-            func.count(MarketMetric.market_pk),
-            func.max(MarketMetric.updated_at),
-        ).one()
-        promoted_count: int | None = None
-        try:
-            promoted_count = (
-                db.query(func.count(MarketMetric.market_pk))
-                .filter(
-                    or_(
-                        MarketMetric.storage_tier != "observe_only",
-                        MarketMetric.retention_score > 0,
-                    )
-                )
-                .scalar()
-                or 0
-            )
-        except SQLAlchemyError:
-            db.rollback()
-        detail = f"{int(count or 0):,} market metric rows"
-        if promoted_count is not None:
-            detail += f"; {int(promoted_count):,} promoted above observe-only."
-        else:
-            detail += "; retention tier detail unavailable."
+        count = _estimated_table_count(db, "market_metrics")
+        latest_at = _latest_column_value(db, MarketMetric.updated_at)
+        detail = (
+            f"About {count:,} market metric rows; retention tier detail is "
+            "omitted from request-time health to avoid full projection scans."
+        )
         return _component_from_heartbeat(
             heartbeats.get("retention_projection"),
             key="retention_projection",
             label="Retention/storage-tier projection",
             description="MarketMetric projection carrying retention tier and compact serving state.",
             db_latest_at=latest_at,
-            db_count=int(count or 0),
+            db_count=count,
             db_detail=detail,
             stale_after=_PIPELINE_DAILY_STALE_AFTER,
             now=now,
@@ -1212,6 +1194,14 @@ def _estimated_table_count(db: Session, table_name: str) -> int:
         {"table_name": table_name},
     ).scalar()
     return max(0, int(estimate or 0))
+
+
+def _latest_column_value(db: Session, column, *filters) -> datetime | None:
+    """Index-backed latest timestamp lookup for health/dashboard metadata."""
+    query = db.query(column).filter(column.isnot(None))
+    if filters:
+        query = query.filter(*filters)
+    return _as_utc(query.order_by(column.desc()).limit(1).scalar())
 
 
 def _clickhouse_table_count(table_name: str) -> int | None:
@@ -1370,7 +1360,7 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
         else _estimated_table_count(db, "anomalies")
     )
 
-    news_articles = db.query(func.count(NewsArticle.id)).scalar() or 0
+    news_articles = _estimated_table_count(db, "news_articles")
 
     anomalies_high = (
         int(metric_counts.high_anomalies)
@@ -1522,17 +1512,17 @@ def _news_diagnostics_payload(db: Session) -> dict:
     if not isinstance(registry, dict):
         registry = source_registry_diagnostics()
 
-    article_count, latest_seen, latest_published = db.query(
-        func.count(NewsArticle.id),
-        func.max(NewsArticle.first_seen_at),
-        func.max(NewsArticle.published_at),
-    ).one()
-    link_count, correlated_count, latest_link = (
-        db.query(
-            func.count(NewsEvent.id),
-            func.sum(case((NewsEvent.pre_news_trade_score > 0, 1), else_=0)),
-            func.max(NewsEvent.created_at),
-        ).one()
+    article_count = _estimated_table_count(db, "news_articles")
+    latest_seen = _latest_column_value(db, NewsArticle.first_seen_at)
+    latest_published = _latest_column_value(db, NewsArticle.published_at)
+    link_count = _estimated_table_count(db, "news_events")
+    latest_link = _latest_column_value(db, NewsEvent.created_at)
+    correlated_count = (
+        int(correlations.count)
+        if correlations is not None and correlations.count is not None
+        else int(metadata.get("news_events_correlated") or 0)
+        if isinstance(metadata, dict)
+        else 0
     )
 
     rss_feed_counts = source_counts.get("rss_feed_counts") or {}
@@ -1561,7 +1551,7 @@ def _news_diagnostics_payload(db: Session) -> dict:
         else None,
         "fetch_error": metadata.get("fetch_error") if isinstance(metadata, dict) else None,
         "summary": {
-            "articles_stored": int(article_count or 0),
+            "articles_stored": int(article_count),
             "articles_seen_last_run": int(metadata.get("articles_seen") or 0)
             if isinstance(metadata, dict)
             else 0,
@@ -1573,13 +1563,13 @@ def _news_diagnostics_payload(db: Session) -> dict:
             )
             if isinstance(metadata, dict)
             else 0,
-            "news_events_linked": int(link_count or 0),
+            "news_events_linked": int(link_count),
             "news_events_linked_last_run": int(
                 metadata.get("news_events_linked") or 0
             )
             if isinstance(metadata, dict)
             else 0,
-            "positive_correlations": int(correlated_count or 0),
+            "positive_correlations": int(correlated_count),
             "profiles_refreshed_last_run": int(
                 metadata.get("profiles_refreshed") or 0
             )

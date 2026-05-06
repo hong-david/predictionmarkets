@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -26,6 +27,8 @@ from app.services.pipeline_heartbeat import (
     mark_pipeline_success,
     new_run_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _cutoff(days: int) -> datetime:
@@ -110,6 +113,7 @@ def _delete_snapshots_batch(
                         FROM anomalies a
                         WHERE a.latest_snapshot_id = ms.id
                       )
+                    ORDER BY ms.ts ASC, ms.id ASC
                     LIMIT 8
                 ) s ON TRUE
                 LIMIT :batch_size
@@ -185,8 +189,15 @@ def run_retention_maintenance(
     batch_size: int = settings.retention_batch_size,
     analyze: bool = False,
 ) -> dict[str, Any]:
+    started = time.monotonic()
     batch_size = max(1, batch_size)
     book_cutoff = _cutoff(book_event_days)
+    logger.info(
+        "retention maintenance started execute=%s batch_size=%s",
+        execute,
+        batch_size,
+    )
+    book_started = time.monotonic()
     book_count = _count_book_events(db, book_cutoff)
     book_result = _run_batched_delete(
         db,
@@ -197,6 +208,7 @@ def run_retention_maintenance(
             db, book_cutoff, batch_size=batch_size
         ),
     )
+    book_result["duration_seconds"] = round(time.monotonic() - book_started, 3)
 
     snapshot_specs = {
         "observe_only": observe_snapshot_days,
@@ -206,6 +218,7 @@ def run_retention_maintenance(
     snapshot_results: dict[str, dict[str, Any]] = {}
     for tier, days in snapshot_specs.items():
         cutoff = _cutoff(days)
+        tier_started = time.monotonic()
 
         # Exact snapshot counts are very expensive on the large market_snapshots table.
         # Only compute them for dry-run reporting. In execute mode, just run bounded
@@ -228,7 +241,22 @@ def run_retention_maintenance(
             **result,
             "cutoff": cutoff.isoformat(),
             "max_age_days": days,
+            "duration_seconds": round(time.monotonic() - tier_started, 3),
+            "remaining_eligible_estimate": None if execute else int(count or 0),
+            "remaining_estimate_reason": (
+                "not_computed_in_execute_mode"
+                if execute
+                else "exact_dry_run_count_before_delete"
+            ),
         }
+        logger.info(
+            "retention tier=%s matched=%s deleted=%s batches=%s duration_seconds=%.3f",
+            tier,
+            snapshot_results[tier]["matched"],
+            snapshot_results[tier]["deleted"],
+            snapshot_results[tier]["batches"],
+            snapshot_results[tier]["duration_seconds"],
+        )
 
     if execute:
         db.commit()
@@ -245,9 +273,18 @@ def run_retention_maintenance(
     matched_total = int(book_result["matched"]) + sum(
         int(result["matched"]) for result in snapshot_results.values()
     )
+    duration_seconds = round(time.monotonic() - started, 3)
+    logger.info(
+        "retention maintenance finished execute=%s deleted_total=%s matched_total=%s duration_seconds=%.3f",
+        execute,
+        deleted_total,
+        matched_total,
+        duration_seconds,
+    )
     return {
         "execute": execute,
         "batch_size": batch_size,
+        "duration_seconds": duration_seconds,
         "matched_total": matched_total,
         "deleted_total": deleted_total,
         "book_events": {
@@ -286,15 +323,18 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
     try:
         locked = _try_retention_maintenance_lock(db)
         if not locked:
+            logger.info("retention maintenance lock skipped")
             return {
                 "execute": args.execute,
                 "skipped": True,
                 "reason": "another_retention_sweep_running",
+                "lock_acquired": False,
                 "matched_total": 0,
                 "deleted_total": 0,
             }
 
-        return run_retention_maintenance(
+        logger.info("retention maintenance lock acquired")
+        result = run_retention_maintenance(
             db,
             execute=args.execute,
             book_event_days=args.book_event_days,
@@ -304,6 +344,8 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=args.batch_size,
             analyze=args.analyze,
         )
+        result["lock_acquired"] = True
+        return result
     except Exception:
         db.rollback()
         raise
