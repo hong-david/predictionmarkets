@@ -54,12 +54,50 @@ _CH_TRADES_TABLE = "kalshi_trades_raw"
 _CH_QUOTES_TABLE = "kalshi_quote_changes_raw"
 _CH_L2_TABLE = "kalshi_l2_events_raw"
 
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning("Invalid %s=%r; using minimum %s", name, raw, minimum)
+        return minimum
+    if maximum is not None and value > maximum:
+        logger.warning("Invalid %s=%r; using maximum %s", name, raw, maximum)
+        return maximum
+    return value
+
+
 _WS_TICKER_COALESCE_ENABLED = (
     os.getenv("KALSHI_WS_TICKER_COALESCE_ENABLED", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
-_WS_TICKER_COALESCE_WINDOW_SEC = float(os.getenv("KALSHI_WS_TICKER_COALESCE_WINDOW_SEC", "0.25"))
-_WS_METRICS_LOG_INTERVAL_SEC = float(os.getenv("KALSHI_WS_METRICS_LOG_INTERVAL_SEC", "30"))
+_WS_TICKER_COALESCE_WINDOW_SEC = _env_float(
+    "KALSHI_WS_TICKER_COALESCE_WINDOW_SEC",
+    0.25,
+    minimum=0.05,
+)
+_WS_TICKER_FLUSH_MAX_QUEUE_FRACTION = _env_float(
+    "KALSHI_WS_TICKER_FLUSH_MAX_QUEUE_FRACTION",
+    0.8,
+    minimum=0.0,
+    maximum=1.0,
+)
+_WS_METRICS_LOG_INTERVAL_SEC = _env_float(
+    "KALSHI_WS_METRICS_LOG_INTERVAL_SEC",
+    30.0,
+    minimum=1.0,
+)
 
 _WS_METRICS: Counter[str] = Counter()
 _WS_METRICS_STARTED_AT = time.monotonic()
@@ -67,6 +105,7 @@ _WS_METRIC_KEYS = (
     "ticker_pending_new",
     "ticker_coalesced",
     "ticker_flushed",
+    "ticker_flush_deferred",
 )
 
 # Market-state anomaly scoring needs the recent snapshot window, so running it
@@ -175,7 +214,20 @@ async def _flush_ticker_coalescer(
     pending_tickers: dict[str, dict],
     pending_lock: asyncio.Lock,
     queue: asyncio.Queue[dict | None],
+    force: bool = False,
 ) -> int:
+    maxsize = queue.maxsize
+    if (
+        not force
+        and maxsize > 0
+        and queue.qsize() >= int(maxsize * _WS_TICKER_FLUSH_MAX_QUEUE_FRACTION)
+    ):
+        async with pending_lock:
+            pending_count = len(pending_tickers)
+        if pending_count:
+            _WS_METRICS["ticker_flush_deferred"] += 1
+        return 0
+
     async with pending_lock:
         if not pending_tickers:
             return 0
@@ -209,6 +261,7 @@ async def _ticker_coalescer_worker(
         pending_tickers=pending_tickers,
         pending_lock=pending_lock,
         queue=queue,
+        force=True,
     )
 
 
@@ -273,6 +326,7 @@ def _ws_metrics_metadata(
         "messages_per_sec_session": round(session_message_count / session_elapsed, 3),
         "ticker_coalesce_enabled": _WS_TICKER_COALESCE_ENABLED,
         "ticker_coalesce_window_sec": _WS_TICKER_COALESCE_WINDOW_SEC,
+        "ticker_flush_max_queue_fraction": _WS_TICKER_FLUSH_MAX_QUEUE_FRACTION,
     }
     for msg_type in sorted(message_types):
         metadata[f"received_{msg_type}"] = _WS_METRICS.get(f"received_{msg_type}", 0)
