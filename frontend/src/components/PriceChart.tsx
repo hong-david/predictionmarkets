@@ -17,6 +17,7 @@ import { useEffect, useRef } from "react";
 import type {
   AnomalyRow,
   MarketSeries,
+  SnapshotPoint,
   TradePoint,
 } from "@/api/types";
 import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
@@ -181,17 +182,43 @@ export function PriceChart({
 
     const linePoints: LineData[] = [];
     const volumePoints: HistogramData[] = [];
-    const seenTimes = new Set<number>();
+    const lineSeenTimes = new Set<number>();
+    const volumeSeenTimes = new Set<number>();
+    const priceCandidates = [
+      ...series.snapshots
+        .map((snapshot) => ({
+          ts: snapshot.ts,
+          value: snapshotDisplayPrice(snapshot),
+          sourceRank: 0,
+        }))
+        .filter(
+          (row): row is { ts: string; value: number; sourceRank: number } =>
+            row.ts != null && row.value != null,
+        ),
+      ...series.trades
+        .map((trade) => ({
+          ts: trade.ts,
+          value: trade.yes_price,
+          sourceRank: 1,
+        }))
+        .filter(
+          (row): row is { ts: string; value: number; sourceRank: number } =>
+            row.ts != null && row.value != null,
+        ),
+    ].sort((a, b) => {
+      const delta = new Date(a.ts).getTime() - new Date(b.ts).getTime();
+      return delta !== 0 ? delta : a.sourceRank - b.sourceRank;
+    });
+
+    for (const point of priceCandidates) {
+      addUniqueLinePoint(linePoints, lineSeenTimes, point.ts, point.value);
+    }
     for (const t of series.trades) {
-      if (!t.ts || t.yes_price == null) continue;
-      // lightweight-charts requires unique, ascending timestamps. Trades
-      // can share the same wall-clock second; nudge the x-axis by +1s until
-      // unique (values are still each print’s `yes_price`).
-      let unix = Math.floor(new Date(t.ts).getTime() / 1000);
-      while (seenTimes.has(unix)) unix += 1;
-      seenTimes.add(unix);
-      const time = unix as UTCTimestamp;
-      linePoints.push({ time, value: clampProbability(t.yes_price) });
+      if (!t.ts) continue;
+      // lightweight-charts requires unique timestamps within each series.
+      // Trades can share the same wall-clock second; nudge volume bars by +1s.
+      const time = uniqueChartTime(volumeSeenTimes, t.ts);
+      if (time == null) continue;
       volumePoints.push({
         time,
         value: t.count ?? 0,
@@ -305,6 +332,32 @@ function formatLocalChartTime(t: Time): string {
     return new Date(t).toLocaleString();
   }
   return "";
+}
+
+function snapshotDisplayPrice(s: SnapshotPoint): number | null {
+  if (s.last_price != null) return s.last_price;
+  if (s.yes_bid != null && s.yes_ask != null) return (s.yes_bid + s.yes_ask) / 2;
+  return s.yes_bid ?? s.yes_ask ?? null;
+}
+
+function uniqueChartTime(seenTimes: Set<number>, ts: string): UTCTimestamp | null {
+  const raw = new Date(ts).getTime();
+  if (!Number.isFinite(raw)) return null;
+  let unix = Math.floor(raw / 1000);
+  while (seenTimes.has(unix)) unix += 1;
+  seenTimes.add(unix);
+  return unix as UTCTimestamp;
+}
+
+function addUniqueLinePoint(
+  out: LineData[],
+  seenTimes: Set<number>,
+  ts: string,
+  value: number,
+): void {
+  const time = uniqueChartTime(seenTimes, ts);
+  if (time == null) return;
+  out.push({ time, value: clampProbability(value) });
 }
 
 function takerColor(t: TradePoint): string {
