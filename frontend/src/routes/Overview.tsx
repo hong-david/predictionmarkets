@@ -361,10 +361,10 @@ export default function OverviewPage() {
                         {fmtInt(m.trade_count)}
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtMaybeInt(m.volume_24h)}
+                        {fmtDollars(m.volume_24h)}
                       </td>
                       <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtMaybeInt(m.volume_total)}
+                        {fmtDollars(m.volume_total)}
                       </td>
                     </tr>
                   ))}
@@ -545,11 +545,6 @@ export default function OverviewPage() {
       </Card>
     </div>
   );
-}
-
-function fmtMaybeInt(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(Number(value))) return "—";
-  return fmtInt(Math.round(Number(value)));
 }
 
 function scopeLabel(scope: MarketScope): string {

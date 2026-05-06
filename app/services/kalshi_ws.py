@@ -63,6 +63,11 @@ _WS_METRICS_LOG_INTERVAL_SEC = float(os.getenv("KALSHI_WS_METRICS_LOG_INTERVAL_S
 
 _WS_METRICS: Counter[str] = Counter()
 _WS_METRICS_STARTED_AT = time.monotonic()
+_WS_METRIC_KEYS = (
+    "ticker_pending_new",
+    "ticker_coalesced",
+    "ticker_flushed",
+)
 
 # Market-state anomaly scoring needs the recent snapshot window, so running it
 # after every sampled ticker snapshot creates a high-volume
@@ -181,6 +186,7 @@ async def _flush_ticker_coalescer(
         await queue.put(item)
 
     _WS_METRICS["ticker_flushed"] += len(batch)
+    _WS_METRICS["queued_ticker"] += len(batch)
     return len(batch)
 
 
@@ -222,6 +228,59 @@ async def _dispatch_ws_message(data: dict, session_id: str) -> None:
         logger.warning("WebSocket error payload: %s", data)
     else:
         logger.debug("Ignoring message type=%s", msg_type)
+
+
+def _ws_metrics_metadata(
+    *,
+    session_id: str,
+    queue_size: int,
+    worker_count: int,
+    session_message_count: int,
+    session_started_at: float,
+    pending_ticker_count: int,
+) -> dict:
+    now_m = time.monotonic()
+    process_elapsed = max(0.001, now_m - _WS_METRICS_STARTED_AT)
+    session_elapsed = max(0.001, now_m - session_started_at)
+    message_types = {
+        key.removeprefix("received_")
+        for key in _WS_METRICS
+        if key.startswith("received_")
+    }
+    message_types.update(
+        key.removeprefix("queued_") for key in _WS_METRICS if key.startswith("queued_")
+    )
+    message_types.update(
+        key.removeprefix("handled_")
+        for key in _WS_METRICS
+        if key.startswith("handled_")
+    )
+
+    metadata = {
+        "session_id": session_id,
+        "queue_size": queue_size,
+        "worker_count": worker_count,
+        "ticker_pending_count": pending_ticker_count,
+        "messages_per_sec_process": round(
+            sum(
+                count
+                for key, count in _WS_METRICS.items()
+                if key.startswith("received_")
+            )
+            / process_elapsed,
+            3,
+        ),
+        "messages_per_sec_session": round(session_message_count / session_elapsed, 3),
+        "ticker_coalesce_enabled": _WS_TICKER_COALESCE_ENABLED,
+        "ticker_coalesce_window_sec": _WS_TICKER_COALESCE_WINDOW_SEC,
+    }
+    for msg_type in sorted(message_types):
+        metadata[f"received_{msg_type}"] = _WS_METRICS.get(f"received_{msg_type}", 0)
+        metadata[f"queued_{msg_type}"] = _WS_METRICS.get(f"queued_{msg_type}", 0)
+        metadata[f"handled_{msg_type}"] = _WS_METRICS.get(f"handled_{msg_type}", 0)
+    for key in _WS_METRIC_KEYS:
+        metadata[key] = _WS_METRICS.get(key, 0)
+    return metadata
 
 
 async def _ws_writer_worker(
@@ -987,32 +1046,75 @@ async def consume_market_data_forever() -> None:
                     asyncio.create_task(_ws_writer_worker(queue, session_id))
                     for _ in range(max(1, settings.kalshi_ws_worker_count))
                 ]
+                pending_tickers: dict[str, dict] = {}
+                pending_lock = asyncio.Lock()
+                coalescer_stop = asyncio.Event()
+                coalescer_task = (
+                    asyncio.create_task(
+                        _ticker_coalescer_worker(
+                            pending_tickers=pending_tickers,
+                            pending_lock=pending_lock,
+                            queue=queue,
+                            stop_event=coalescer_stop,
+                        )
+                    )
+                    if _WS_TICKER_COALESCE_ENABLED
+                    else None
+                )
 
                 try:
                     last_heartbeat = time.monotonic()
+                    session_started_at = last_heartbeat
                     message_count = 0
                     async for raw_message in websocket:
                         data = json.loads(raw_message)
-                        await queue.put(data)
+                        msg_type = _ws_msg_type(data)
+                        _WS_METRICS[f"received_{msg_type}"] += 1
                         message_count += 1
+
+                        ticker_key = _ticker_market_key(data)
+                        if _WS_TICKER_COALESCE_ENABLED and ticker_key:
+                            # Ticker updates are market state snapshots where latest
+                            # state wins. Trades and orderbook streams are event
+                            # streams and must keep their original ordering/granularity.
+                            async with pending_lock:
+                                if ticker_key in pending_tickers:
+                                    _WS_METRICS["ticker_coalesced"] += 1
+                                else:
+                                    _WS_METRICS["ticker_pending_new"] += 1
+                                pending_tickers[ticker_key] = data
+                        else:
+                            await queue.put(data)
+                            _WS_METRICS[f"queued_{msg_type}"] += 1
+
                         now_m = time.monotonic()
-                        if now_m - last_heartbeat >= 30:
+                        if now_m - last_heartbeat >= _WS_METRICS_LOG_INTERVAL_SEC:
+                            async with pending_lock:
+                                pending_count = len(pending_tickers)
+                            metadata = _ws_metrics_metadata(
+                                session_id=session_id,
+                                queue_size=queue.qsize(),
+                                worker_count=len(workers),
+                                session_message_count=message_count,
+                                session_started_at=session_started_at,
+                                pending_ticker_count=pending_count,
+                            )
                             record_pipeline_heartbeat(
                                 "ws_trade_feed",
                                 detail=(
-                                    f"Connected; queued {message_count} messages "
+                                    f"Connected; received {message_count} messages "
                                     f"this session."
                                 ),
                                 run_id=run_id,
                                 count=message_count,
-                                metadata={
-                                    "session_id": session_id,
-                                    "queue_size": queue.qsize(),
-                                    "worker_count": len(workers),
-                                },
+                                metadata=metadata,
                             )
+                            logger.info("WebSocket metrics: %s", metadata)
                             last_heartbeat = now_m
                 finally:
+                    if coalescer_task is not None:
+                        coalescer_stop.set()
+                        await coalescer_task
                     for _ in workers:
                         await queue.put(None)
                     await queue.join()
