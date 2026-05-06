@@ -35,19 +35,25 @@ class ManagedProcess:
     process: subprocess.Popen | None = None
     restart_count: int = 0
     backoff_seconds: float = 1.0
+    forward_output: bool = False
     stdout_handle: object | None = field(default=None, repr=False)
     stderr_handle: object | None = field(default=None, repr=False)
 
     def start(self) -> None:
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.stdout_handle = (self.log_dir / f"{self.key}.log").open("ab")
-        self.stderr_handle = (self.log_dir / f"{self.key}.err").open("ab")
+        stdout = None
+        stderr = None
+        if not self.forward_output:
+            self.stdout_handle = (self.log_dir / f"{self.key}.log").open("ab")
+            self.stderr_handle = (self.log_dir / f"{self.key}.err").open("ab")
+            stdout = self.stdout_handle
+            stderr = self.stderr_handle
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.process = subprocess.Popen(
             self.command,
             cwd=self.cwd,
-            stdout=self.stdout_handle,
-            stderr=self.stderr_handle,
+            stdout=stdout,
+            stderr=stderr,
             creationflags=creationflags,
         )
         self.backoff_seconds = 1.0
@@ -237,6 +243,7 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                 command=retention_command,
                 cwd=root,
                 log_dir=log_dir,
+                forward_output=True,
             )
         )
     if args.with_dashboard_cache_warmer:
