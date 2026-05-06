@@ -209,6 +209,13 @@ def run_retention_maintenance(
         ),
     )
     book_result["duration_seconds"] = round(time.monotonic() - book_started, 3)
+    logger.info(
+        "retention table=book_events matched=%s deleted=%s batches=%s duration_seconds=%.3f",
+        book_result["matched"],
+        book_result["deleted"],
+        book_result["batches"],
+        book_result["duration_seconds"],
+    )
 
     snapshot_specs = {
         "observe_only": observe_snapshot_days,
@@ -352,10 +359,15 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if locked:
             _release_retention_maintenance_lock(db)
+            logger.info("retention maintenance lock released")
         db.close()
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--book-event-days", type=int, default=settings.retention_book_events_max_age_days)
@@ -398,6 +410,7 @@ def main() -> None:
             )
             print(json.dumps(result, indent=2, sort_keys=True))
         except Exception as exc:
+            logger.exception("retention maintenance sweep failed")
             mark_pipeline_error(
                 "retention_maintenance",
                 exc,
