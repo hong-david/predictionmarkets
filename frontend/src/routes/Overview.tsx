@@ -16,14 +16,16 @@ import { Link, useNavigate } from "react-router-dom";
 import { api } from "@/api/client";
 import type {
   BreakdownEntry,
-  HistoricalSignalQaMarket,
   MarketScope,
   NewsDiagnostics,
   NewsSignal,
   PipelineComponentStatus,
   PipelineHealth,
   PipelineSummaryStatus,
+  RecentAnomaliesList,
   SuspiciousTrade,
+  SuspiciousTradesList,
+  TopMarketsList,
 } from "@/api/types";
 import { Badge, severityVariant } from "@/components/Badge";
 import { Card, CardBody, CardHeader } from "@/components/Card";
@@ -128,14 +130,6 @@ export default function OverviewPage() {
     enabled: secondaryReady,
     refetchInterval: 30_000,
     staleTime: 15_000,
-    retry: 1,
-  });
-  const historicalQa = useQuery({
-    queryKey: ["historical-signal-qa"],
-    queryFn: () => api.historicalSignalQa({ limit: 6, min_flag_score: 5 }),
-    enabled: secondaryReady,
-    refetchInterval: 60_000,
-    staleTime: 30_000,
     retry: 1,
   });
 
@@ -326,121 +320,11 @@ export default function OverviewPage() {
       </section>
 
       <section className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
-        <Card className="h-[32rem] overflow-hidden flex flex-col">
-          <CardHeader
-            title="Most traded markets"
-            subtitle="Active/open markets with the most retained execution prints, exchange-reported 24h volume, and exchange-reported lifetime volume."
-          />
-          <div className="flex-1 overflow-x-auto">
-            {overview.isPending ? (
-              <div className="p-4">
-                <Skeleton className="h-32" />
-              </div>
-            ) : !topM?.markets.length ? (
-              <EmptyState>No trades ingested yet.</EmptyState>
-            ) : (
-              <table className="w-full">
-                <thead>
-                  <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
-                    <th className="text-left px-4 py-2 font-medium">Market</th>
-                    <th className="text-right px-4 py-2 font-medium">Trades</th>
-                    <th className="text-right px-4 py-2 font-medium">24h vol.</th>
-                    <th className="text-right px-4 py-2 font-medium">Total $</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {topM.markets.map((m) => (
-                    <tr
-                      key={m.market_id}
-                      className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors"
-                    >
-                      <td className="px-4 py-2.5">
-                        <MarketCell market={m} showPrior />
-                      </td>
-                      <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtInt(m.trade_count)}
-                      </td>
-                      <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtDollars(m.volume_24h)}
-                      </td>
-                      <td className="px-4 py-2.5 text-right num text-sm">
-                        {fmtDollars(m.volume_total)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </div>
-        </Card>
-
-        <Card className="h-[32rem] overflow-hidden flex flex-col">
-          <CardHeader
-            title="Market activity alerts"
-            subtitle="Active/open markets with saved quote, volume, spread, and order-book alert history. These are market alerts, not individual trade accusations."
-            right={
-              recentFlags
-                ? `${fmtInt(recentFlags.count)} shown`
-                : undefined
-            }
-          />
-          <div className="flex-1 overflow-x-auto">
-            {overview.isPending ? (
-              <div className="p-4">
-                <Skeleton className="h-32" />
-              </div>
-            ) : !recentFlags?.anomalies.length ? (
-              <EmptyState>No market activity alerts saved yet.</EmptyState>
-            ) : (
-              <ul className="divide-y divide-border">
-                {recentFlags.anomalies.map((a) => (
-                  <li
-                    key={a.id}
-                    className="px-4 py-3 hover:bg-secondary/30 transition-colors"
-                  >
-                    <div className="flex items-start gap-3">
-                      <div className="flex flex-col items-center min-w-[48px]">
-                        <Badge variant={severityVariant(a.severity)}>
-                          {a.severity}
-                        </Badge>
-                        <div className="mt-1 num text-sm font-semibold">
-                          {a.score.toFixed(1)}
-                        </div>
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <MarketCell
-                          market={{
-                            market_id: a.market_id,
-                            title: a.title || a.market_id,
-                            subtitle: a.subtitle,
-                            category: a.category ?? null,
-                            manipulability_prior: a.manipulability_prior ?? null,
-                          }}
-                          showPrior
-                        />
-                        <div className="mt-2 text-xs text-muted-foreground">
-                          {fmtAgo(a.created_at)}
-                        </div>
-                        {a.reasons?.length ? (
-                          <div className="mt-1.5 flex flex-wrap gap-1">
-                            {a.reasons.slice(0, 4).map((r) => (
-                              <code
-                                key={r}
-                                className="text-[10px] rounded bg-secondary px-1.5 py-0.5 font-mono text-muted-foreground"
-                              >
-                                {r}
-                              </code>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </Card>
+        <MostTradedMarketsCard topM={topM} loading={overview.isPending} />
+        <TopTradeFlagsCard
+          suspiciousTrades={suspiciousTrades}
+          loading={overview.isPending}
+        />
       </section>
 
       <Card>
@@ -492,58 +376,197 @@ export default function OverviewPage() {
           loading={newsDiagnostics.isPending}
           error={newsDiagnostics.error}
         />
-        <HistoricalSignalQaCard
-          rows={historicalQa.data?.markets ?? []}
-          loading={historicalQa.isPending}
-          error={historicalQa.error}
+        <MarketActivityAlertsCard
+          recentFlags={recentFlags}
+          loading={overview.isPending}
         />
       </section>
-
-      <Card>
-        <CardHeader
-          title="Top trade flags"
-          subtitle="Individual trade candidates ranked by the stronger of local outlier score and context score. Low-dollar one-offs are heavily discounted unless they arrive in a strong immediate cluster."
-          right={
-            suspiciousTrades
-              ? `${fmtInt(suspiciousTrades.count)} shown from latest ${fmtInt(suspiciousTrades.sample)} prints`
-              : undefined
-          }
-        />
-        <div className="overflow-x-auto">
-          {overview.isPending ? (
-            <div className="p-4">
-              <Skeleton className="h-32" />
-            </div>
-          ) : !suspiciousTrades?.trades.length ? (
-            <EmptyState>No trade flags found in the recent sample.</EmptyState>
-          ) : (
-            <table className="w-full">
-              <thead>
-                <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-card/40">
-                  <th className="text-left px-4 py-2.5 font-medium">Market</th>
-                  <th className="text-left px-3 py-2.5 font-medium">Time</th>
-                  <th className="text-right px-3 py-2.5 font-medium">Score</th>
-                  <th className="text-right px-3 py-2.5 font-medium">Yes</th>
-                  <th className="text-right px-3 py-2.5 font-medium">Contracts</th>
-                  <th
-                    className="text-right px-3 py-2.5 font-medium"
-                    title="Estimated dollars paid in this print: contracts times the side price."
-                  >
-                    Est $
-                  </th>
-                  <th className="text-left px-3 py-2.5 font-medium">Why</th>
-                </tr>
-              </thead>
-              <tbody>
-                {suspiciousTrades.trades.map((t) => (
-                  <SuspiciousTradeRow key={`${t.market_id}-${t.trade_id}`} trade={t} />
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </Card>
     </div>
+  );
+}
+
+function MostTradedMarketsCard({
+  topM,
+  loading,
+}: {
+  topM: TopMarketsList | undefined;
+  loading?: boolean;
+}) {
+  return (
+    <Card className="h-[32rem] overflow-hidden flex flex-col">
+      <CardHeader
+        title="Most traded markets"
+        subtitle="Active/open markets with the most retained execution prints, exchange-reported 24h volume, and exchange-reported lifetime volume."
+      />
+      <div className="flex-1 overflow-x-auto">
+        {loading ? (
+          <div className="p-4">
+            <Skeleton className="h-32" />
+          </div>
+        ) : !topM?.markets.length ? (
+          <EmptyState>No trades ingested yet.</EmptyState>
+        ) : (
+          <table className="w-full">
+            <thead>
+              <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
+                <th className="text-left px-4 py-2 font-medium">Market</th>
+                <th className="text-right px-4 py-2 font-medium">Trades</th>
+                <th className="text-right px-4 py-2 font-medium">24h vol.</th>
+                <th className="text-right px-4 py-2 font-medium">Total $</th>
+              </tr>
+            </thead>
+            <tbody>
+              {topM.markets.map((m) => (
+                <tr
+                  key={m.market_id}
+                  className="border-b border-border last:border-0 hover:bg-secondary/30 transition-colors"
+                >
+                  <td className="px-4 py-2.5">
+                    <MarketCell market={m} showPrior />
+                  </td>
+                  <td className="px-4 py-2.5 text-right num text-sm">
+                    {fmtInt(m.trade_count)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right num text-sm">
+                    {fmtDollars(m.volume_24h)}
+                  </td>
+                  <td className="px-4 py-2.5 text-right num text-sm">
+                    {fmtDollars(m.volume_total)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function TopTradeFlagsCard({
+  suspiciousTrades,
+  loading,
+}: {
+  suspiciousTrades: SuspiciousTradesList | undefined;
+  loading?: boolean;
+}) {
+  return (
+    <Card className="h-[32rem] overflow-hidden flex flex-col">
+      <CardHeader
+        title="Top trade flags"
+        subtitle="Individual trade candidates ranked by the stronger of local outlier score and context score."
+        right={
+          suspiciousTrades
+            ? `${fmtInt(suspiciousTrades.count)} shown from latest ${fmtInt(suspiciousTrades.sample)} prints`
+            : undefined
+        }
+      />
+      <div className="flex-1 overflow-x-auto">
+        {loading ? (
+          <div className="p-4">
+            <Skeleton className="h-32" />
+          </div>
+        ) : !suspiciousTrades?.trades.length ? (
+          <EmptyState>No trade flags found in the recent sample.</EmptyState>
+        ) : (
+          <table className="w-full min-w-[760px]">
+            <thead>
+              <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border bg-card/40">
+                <th className="text-left px-4 py-2.5 font-medium">Market</th>
+                <th className="text-left px-3 py-2.5 font-medium">Time</th>
+                <th className="text-right px-3 py-2.5 font-medium">Score</th>
+                <th className="text-right px-3 py-2.5 font-medium">Yes</th>
+                <th className="text-right px-3 py-2.5 font-medium">Contracts</th>
+                <th
+                  className="text-right px-3 py-2.5 font-medium"
+                  title="Estimated dollars paid in this print: contracts times the side price."
+                >
+                  Est $
+                </th>
+                <th className="text-left px-3 py-2.5 font-medium">Why</th>
+              </tr>
+            </thead>
+            <tbody>
+              {suspiciousTrades.trades.map((t) => (
+                <SuspiciousTradeRow key={`${t.market_id}-${t.trade_id}`} trade={t} />
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function MarketActivityAlertsCard({
+  recentFlags,
+  loading,
+}: {
+  recentFlags: RecentAnomaliesList | undefined;
+  loading?: boolean;
+}) {
+  return (
+    <Card className="h-[32rem] overflow-hidden flex flex-col">
+      <CardHeader
+        title="Market activity alerts"
+        subtitle="Active/open markets with saved quote, volume, spread, and order-book alert history."
+        right={recentFlags ? `${fmtInt(recentFlags.count)} shown` : undefined}
+      />
+      <div className="flex-1 overflow-x-auto">
+        {loading ? (
+          <div className="p-4">
+            <Skeleton className="h-32" />
+          </div>
+        ) : !recentFlags?.anomalies.length ? (
+          <EmptyState>No market activity alerts saved yet.</EmptyState>
+        ) : (
+          <ul className="divide-y divide-border">
+            {recentFlags.anomalies.map((a) => (
+              <li
+                key={a.id}
+                className="px-4 py-3 hover:bg-secondary/30 transition-colors"
+              >
+                <div className="flex items-start gap-3">
+                  <div className="flex flex-col items-center min-w-[48px]">
+                    <Badge variant={severityVariant(a.severity)}>{a.severity}</Badge>
+                    <div className="mt-1 num text-sm font-semibold">
+                      {a.score.toFixed(1)}
+                    </div>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <MarketCell
+                      market={{
+                        market_id: a.market_id,
+                        title: a.title || a.market_id,
+                        subtitle: a.subtitle,
+                        category: a.category ?? null,
+                        manipulability_prior: a.manipulability_prior ?? null,
+                      }}
+                      showPrior
+                    />
+                    <div className="mt-2 text-xs text-muted-foreground">
+                      {fmtAgo(a.created_at)}
+                    </div>
+                    {a.reasons?.length ? (
+                      <div className="mt-1.5 flex flex-wrap gap-1">
+                        {a.reasons.slice(0, 4).map((r) => (
+                          <code
+                            key={r}
+                            className="text-[10px] rounded bg-secondary px-1.5 py-0.5 font-mono text-muted-foreground"
+                          >
+                            {r}
+                          </code>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -841,59 +864,6 @@ function NewsDiagnosticsCard({
               )}
             </div>
           </div>
-        )}
-      </CardBody>
-    </Card>
-  );
-}
-
-function HistoricalSignalQaCard({
-  rows,
-  loading,
-  error,
-}: {
-  rows: HistoricalSignalQaMarket[];
-  loading?: boolean;
-  error?: unknown;
-}) {
-  const err = error instanceof Error ? error.message : String(error ?? "");
-  return (
-    <Card>
-      <CardHeader
-        title="Historical signal QA"
-        subtitle="Closed or aged-out markets kept for post-mortem review of trade flags, pre-news timing, and quote/book alerts."
-      />
-      <CardBody>
-        {loading ? (
-          <Skeleton className="h-40" />
-        ) : error ? (
-          <EmptyState>
-            <div className="text-left">
-              <div className="font-medium text-foreground">Historical QA unavailable</div>
-              <div className="mt-1 text-xs break-words">{err}</div>
-            </div>
-          </EmptyState>
-        ) : !rows.length ? (
-          <EmptyState>No historical signal sample yet.</EmptyState>
-        ) : (
-          <ul className="divide-y divide-border">
-            {rows.map((row) => (
-              <li key={row.market_id} className="py-2.5 first:pt-0 last:pb-0">
-                <Link to={`/markets/${encodeURIComponent(row.market_id)}`} className="block hover:text-primary">
-                  <div className="line-clamp-1 text-sm font-medium">{row.title}</div>
-                </Link>
-                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-                  <span>{row.qa_label.replace(/_/g, " ")}</span>
-                  <span>{fmtInt(row.trade_count)} trades</span>
-                  <span>best flag {row.flags.best_score.toFixed(1)}</span>
-                  {row.pre_news.best_score > 0 ? (
-                    <span>pre-news {row.pre_news.best_score.toFixed(1)}</span>
-                  ) : null}
-                  <span>{fmtAgo(row.close_time)}</span>
-                </div>
-              </li>
-            ))}
-          </ul>
         )}
       </CardBody>
     </Card>
