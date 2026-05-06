@@ -150,9 +150,28 @@ class _StubHTTPClient:
     def __exit__(self, *exc):
         return False
 
-    def get(self, url: str):
+    def get(self, url: str, params=None):
         self._url = url
+        self._params = params
         return self._response
+
+
+class _SequenceHTTPClient:
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url: str, params=None):
+        self.calls.append({"url": url, "params": params})
+        if not self._responses:
+            raise AssertionError("No scripted HTTP response left")
+        return self._responses.pop(0)
 
 
 def _resp(status_code: int, body: dict | None = None) -> httpx.Response:
@@ -186,3 +205,40 @@ def test_get_market_raises_on_5xx():
         client = KalshiRestClient()
         with pytest.raises(httpx.HTTPStatusError):
             client.get_market("KXBOOM")
+
+
+def test_get_markets_retries_429_before_returning_page():
+    stub = _SequenceHTTPClient(
+        [
+            _resp(429, {"error": "rate limited"}),
+            _resp(200, {"markets": [_market("A")], "cursor": ""}),
+        ]
+    )
+    with (
+        patch("app.services.kalshi_rest.httpx.Client", return_value=stub),
+        patch("app.services.kalshi_rest.time.sleep") as sleep_mock,
+    ):
+        client = KalshiRestClient(retry_attempts=2, retry_backoff_sec=0)
+        result = client.get_markets(limit=1000, status="open")
+
+    assert result["markets"][0]["ticker"] == "A"
+    assert len(stub.calls) == 2
+    sleep_mock.assert_not_called()
+
+
+def test_get_markets_raises_after_429_retries_are_exhausted():
+    stub = _SequenceHTTPClient(
+        [
+            _resp(429, {"error": "rate limited"}),
+            _resp(429, {"error": "still limited"}),
+        ]
+    )
+    with (
+        patch("app.services.kalshi_rest.httpx.Client", return_value=stub),
+        patch("app.services.kalshi_rest.time.sleep"),
+    ):
+        client = KalshiRestClient(retry_attempts=2, retry_backoff_sec=0)
+        with pytest.raises(httpx.HTTPStatusError):
+            client.get_markets(limit=1000, status="open")
+
+    assert len(stub.calls) == 2

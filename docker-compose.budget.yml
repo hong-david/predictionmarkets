@@ -72,6 +72,9 @@ services:
       KALSHI_WS_TICKER_KNOWN_MARKET_GATE_ENABLED: ${KALSHI_WS_TICKER_KNOWN_MARKET_GATE_ENABLED:-1}
       KALSHI_WS_TICKER_KNOWN_MARKET_REFRESH_SEC: ${KALSHI_WS_TICKER_KNOWN_MARKET_REFRESH_SEC:-300}
       KALSHI_POLLER_QUOTE_SNAPSHOTS_ENABLED: ${KALSHI_POLLER_QUOTE_SNAPSHOTS_ENABLED:-0}
+      KALSHI_REST_RETRY_MAX_ATTEMPTS: ${KALSHI_REST_RETRY_MAX_ATTEMPTS:-3}
+      KALSHI_REST_RETRY_BACKOFF_SEC: ${KALSHI_REST_RETRY_BACKOFF_SEC:-1}
+      KALSHI_REST_PAGE_SLEEP_SEC: ${KALSHI_REST_PAGE_SLEEP_SEC:-0.05}
     command:
       - python
       - -m
@@ -86,6 +89,8 @@ services:
       - "50"
       - --hydrate-unknown-max
       - "100"
+      - --poll-error-backoff-seconds
+      - "300"
       - --news-interval-seconds
       - "3600"
       - --news-lookback-hours

@@ -12,17 +12,96 @@ exhausted. The smoke test against live Kalshi was what surfaced the bug.
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Iterator
 
 import httpx
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _retry_after_seconds(response: httpx.Response, fallback: float) -> float:
+    raw = response.headers.get("Retry-After")
+    if raw is None or raw.strip() == "":
+        return fallback
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return fallback
 
 
 class KalshiRestClient:
     DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
     PAGE_SIZE = 1000  # Kalshi's documented max per page.
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL) -> None:
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        *,
+        retry_attempts: int | None = None,
+        retry_backoff_sec: float | None = None,
+        page_sleep_sec: float | None = None,
+    ) -> None:
         self.base_url = base_url
+        self.retry_attempts = max(
+            1,
+            retry_attempts
+            if retry_attempts is not None
+            else _env_int("KALSHI_REST_RETRY_MAX_ATTEMPTS", 3),
+        )
+        self.retry_backoff_sec = max(
+            0.0,
+            retry_backoff_sec
+            if retry_backoff_sec is not None
+            else _env_float("KALSHI_REST_RETRY_BACKOFF_SEC", 1.0),
+        )
+        self.page_sleep_sec = max(
+            0.0,
+            page_sleep_sec
+            if page_sleep_sec is not None
+            else _env_float("KALSHI_REST_PAGE_SLEEP_SEC", 0.0),
+        )
+
+    def _get_with_retries(
+        self,
+        url: str,
+        *,
+        params: dict[str, str | int] | None = None,
+    ) -> httpx.Response:
+        for attempt in range(self.retry_attempts):
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(url, params=params)
+            if response.status_code != 429:
+                return response
+            if attempt >= self.retry_attempts - 1:
+                return response
+            delay = _retry_after_seconds(
+                response,
+                self.retry_backoff_sec * (2**attempt),
+            )
+            if delay > 0:
+                time.sleep(delay)
+
+        return response
 
     def get_market(self, ticker: str) -> dict | None:
         """Fetch a single market by its `ticker` (the Kalshi `market_id`).
@@ -38,12 +117,11 @@ class KalshiRestClient:
         ticker no longer exists upstream (404).
         """
         url = f"{self.base_url}/markets/{ticker}"
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(url)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return response.json().get("market")
+        response = self._get_with_retries(url)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json().get("market")
 
     def get_markets(
         self,
@@ -71,10 +149,9 @@ class KalshiRestClient:
         if status:
             params["status"] = status
 
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(url, params=params)
-            response.raise_for_status()
-            return response.json()
+        response = self._get_with_retries(url, params=params)
+        response.raise_for_status()
+        return response.json()
 
     def iter_markets(
         self,
@@ -110,3 +187,5 @@ class KalshiRestClient:
             cursor = page.get("cursor") or None
             if not cursor:
                 return
+            if self.page_sleep_sec > 0:
+                time.sleep(self.page_sleep_sec)

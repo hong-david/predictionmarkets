@@ -202,6 +202,12 @@ def main() -> None:
         help="Run a single cycle and exit (useful for cron / CI / smoke tests).",
     )
     parser.add_argument(
+        "--error-backoff-seconds",
+        type=float,
+        default=300.0,
+        help="Seconds to wait before retrying after a failed watch-mode cycle. Default: 300.",
+    )
+    parser.add_argument(
         "--hydrate-unknown-max",
         type=int,
         default=250,
@@ -241,6 +247,8 @@ def main() -> None:
         flush=True,
     )
 
+    error_backoff = max(0.0, args.error_backoff_seconds)
+
     try:
         while True:
             try:
@@ -258,7 +266,19 @@ def main() -> None:
                 )
             except Exception as exc:
                 mark_pipeline_error("market_poller", exc, detail="Market sweep failed.")
-                raise
+                print(
+                    f"[{_utc_now()}] cycle failed: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if args.once:
+                    raise
+                if error_backoff > 0:
+                    print(
+                        f"[{_utc_now()}] sleeping {error_backoff:.1f}s before retry",
+                        flush=True,
+                    )
+                    time.sleep(error_backoff)
+                continue
             if args.once:
                 return
             time.sleep(args.interval)

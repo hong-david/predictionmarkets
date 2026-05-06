@@ -158,6 +158,8 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                     str(args.anomaly_market_limit),
                     "--hydrate-unknown-max",
                     str(args.hydrate_unknown_max),
+                    "--error-backoff-seconds",
+                    str(args.poll_error_backoff_seconds),
                     "--refresh-active-lifecycle-max",
                     str(args.refresh_active_lifecycle_max),
                     "--refresh-active-lifecycle-min-age-minutes",
@@ -292,6 +294,7 @@ def main() -> None:
     parser.add_argument("--skip-news", action="store_true")
     parser.add_argument("--poll-interval-seconds", type=int, default=300)
     parser.add_argument("--poll-batch-size", type=int, default=500)
+    parser.add_argument("--poll-error-backoff-seconds", type=float, default=300.0)
     parser.add_argument("--anomaly-market-limit", type=int, default=100)
     parser.add_argument("--hydrate-unknown-max", type=int, default=250)
     parser.add_argument("--refresh-active-lifecycle-max", type=int, default=25)
