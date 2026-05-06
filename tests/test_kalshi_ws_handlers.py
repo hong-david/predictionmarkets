@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import asyncio
 from typing import Any
 from unittest.mock import patch
 
@@ -215,6 +216,121 @@ def test_handle_trade_message_dual_writes_clickhouse_batch():
     assert row["count_contracts"] == 12
     assert row["storage_tier"] == "hot"
     assert fake.commits == 1
+
+
+# ---------- ticker batching / gates ----------------------------------------
+
+
+def test_ticker_metric_gate_skips_recent_nonprice_update():
+    now = datetime.now(timezone.utc)
+    metric = type(
+        "Metric",
+        (),
+        {
+            "updated_at": now,
+            "last_price_cents": 50,
+            "yes_bid_cents": 49,
+            "yes_ask_cents": 51,
+            "no_bid_cents": None,
+            "no_ask_cents": None,
+        },
+    )()
+    values = {
+        "last_price_cents": 50,
+        "yes_bid_cents": 49,
+        "yes_ask_cents": 51,
+        "no_bid_cents": None,
+        "no_ask_cents": None,
+        "volume_24h_contracts": 200,
+    }
+    with (
+        patch.object(kalshi_ws, "_WS_TICKER_METRICS_WRITE_GATE_ENABLED", True),
+        patch.object(kalshi_ws, "_WS_TICKER_METRICS_MIN_INTERVAL_SEC", 5.0),
+    ):
+        assert (
+            kalshi_ws._should_upsert_ticker_metric(
+                metric=metric,
+                values=values,
+                has_new_snapshot=False,
+                now=now,
+            )
+            is False
+        )
+
+
+def test_ticker_metric_gate_writes_price_change_immediately():
+    now = datetime.now(timezone.utc)
+    metric = type(
+        "Metric",
+        (),
+        {
+            "updated_at": now,
+            "last_price_cents": 50,
+            "yes_bid_cents": 49,
+            "yes_ask_cents": 51,
+            "no_bid_cents": None,
+            "no_ask_cents": None,
+        },
+    )()
+    values = {
+        "last_price_cents": 51,
+        "yes_bid_cents": 49,
+        "yes_ask_cents": 51,
+        "no_bid_cents": None,
+        "no_ask_cents": None,
+    }
+    with patch.object(kalshi_ws, "_WS_TICKER_METRICS_WRITE_GATE_ENABLED", True):
+        assert (
+            kalshi_ws._should_upsert_ticker_metric(
+                metric=metric,
+                values=values,
+                has_new_snapshot=False,
+                now=now,
+            )
+            is True
+        )
+
+
+def test_known_market_gate_fails_open_until_cache_loaded():
+    with (
+        patch.object(kalshi_ws, "_WS_TICKER_KNOWN_MARKET_GATE_ENABLED", True),
+        patch.object(kalshi_ws, "_KNOWN_MARKET_TICKERS", set()),
+    ):
+        assert kalshi_ws._ticker_allowed_by_known_market_gate("KXNEW") is True
+
+
+def test_known_market_gate_drops_after_cache_loaded():
+    with (
+        patch.object(kalshi_ws, "_WS_TICKER_KNOWN_MARKET_GATE_ENABLED", True),
+        patch.object(kalshi_ws, "_KNOWN_MARKET_TICKERS", {"KXKNOWN"}),
+    ):
+        assert kalshi_ws._ticker_allowed_by_known_market_gate("KXKNOWN") is True
+        assert kalshi_ws._ticker_allowed_by_known_market_gate("KXNEW") is False
+
+
+def test_flush_ticker_coalescer_queues_one_batch_payload():
+    async def _run():
+        queue: asyncio.Queue[dict | None] = asyncio.Queue()
+        lock = asyncio.Lock()
+        pending = {
+            "KXA": {"type": "ticker", "msg": {"market_ticker": "KXA"}},
+            "KXB": {"type": "ticker", "msg": {"market_ticker": "KXB"}},
+        }
+        with patch.object(kalshi_ws, "_WS_TICKER_BATCH_DB_WRITES_ENABLED", True):
+            flushed = await kalshi_ws._flush_ticker_coalescer(
+                pending_tickers=pending,
+                pending_lock=lock,
+                queue=queue,
+                force=True,
+            )
+        item = await queue.get()
+        assert flushed == 2
+        assert item is not None
+        assert item["type"] == "_ticker_batch"
+        assert [m["msg"]["market_ticker"] for m in item["messages"]] == ["KXA", "KXB"]
+        assert pending == {}
+
+    asyncio.run(_run())
 
 
 # ---------- orderbook_delta handler ----------------------------------------

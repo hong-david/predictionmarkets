@@ -28,7 +28,12 @@ from app.services.classifier import CLASSIFIER_VERSION
 from app.services.decimal_utils import parse_decimal
 from app.services.kalshi_auth import create_ws_headers
 from app.services.clickhouse_writer import clickhouse_batcher
-from app.services.market_metrics import bump_trade_metrics, upsert_quote_metrics
+from app.services.market_metrics import (
+    bulk_upsert_quote_metrics,
+    bump_trade_metrics,
+    quote_metric_values,
+    upsert_quote_metrics,
+)
 from app.services.pipeline_heartbeat import (
     mark_pipeline_error,
     mark_pipeline_start,
@@ -42,7 +47,10 @@ from app.services.retention import (
     should_sample_event,
     storage_decision_for_event,
 )
-from app.services.snapshot_dedup import should_skip_duplicate_snapshot
+from app.services.snapshot_dedup import (
+    should_skip_duplicate_snapshot,
+    snapshot_row_is_duplicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +86,14 @@ def _env_float(
     return value
 
 
-_WS_TICKER_COALESCE_ENABLED = (
-    os.getenv("KALSHI_WS_TICKER_COALESCE_ENABLED", "1").strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+_WS_TICKER_COALESCE_ENABLED = _env_bool("KALSHI_WS_TICKER_COALESCE_ENABLED", True)
 _WS_TICKER_COALESCE_WINDOW_SEC = _env_float(
     "KALSHI_WS_TICKER_COALESCE_WINDOW_SEC",
     0.25,
@@ -98,6 +110,28 @@ _WS_METRICS_LOG_INTERVAL_SEC = _env_float(
     30.0,
     minimum=1.0,
 )
+_WS_TICKER_BATCH_DB_WRITES_ENABLED = _env_bool(
+    "KALSHI_WS_TICKER_BATCH_DB_WRITES_ENABLED",
+    True,
+)
+_WS_TICKER_METRICS_WRITE_GATE_ENABLED = _env_bool(
+    "KALSHI_WS_TICKER_METRICS_WRITE_GATE_ENABLED",
+    True,
+)
+_WS_TICKER_METRICS_MIN_INTERVAL_SEC = _env_float(
+    "KALSHI_WS_TICKER_METRICS_MIN_INTERVAL_SEC",
+    5.0,
+    minimum=0.0,
+)
+_WS_TICKER_KNOWN_MARKET_GATE_ENABLED = _env_bool(
+    "KALSHI_WS_TICKER_KNOWN_MARKET_GATE_ENABLED",
+    True,
+)
+_WS_TICKER_KNOWN_MARKET_REFRESH_SEC = _env_float(
+    "KALSHI_WS_TICKER_KNOWN_MARKET_REFRESH_SEC",
+    300.0,
+    minimum=30.0,
+)
 
 _WS_METRICS: Counter[str] = Counter()
 _WS_METRICS_STARTED_AT = time.monotonic()
@@ -106,7 +140,20 @@ _WS_METRIC_KEYS = (
     "ticker_coalesced",
     "ticker_flushed",
     "ticker_flush_deferred",
+    "ticker_batch_processed",
+    "ticker_batch_messages",
+    "ticker_known_market_gate_dropped",
+    "ticker_known_market_refresh_errors",
+    "ticker_unknown_skipped",
+    "ticker_snapshots_inserted",
+    "ticker_snapshots_skipped_duplicate",
+    "ticker_snapshots_skipped_sampling",
+    "ticker_metrics_upserted",
+    "ticker_metrics_skipped_gate",
 )
+
+_KNOWN_MARKET_TICKERS: set[str] = set()
+_KNOWN_MARKET_LAST_REFRESH = 0.0
 
 # Market-state anomaly scoring needs the recent snapshot window, so running it
 # after every sampled ticker snapshot creates a high-volume
@@ -209,6 +256,62 @@ def _ticker_market_key(data: dict) -> str | None:
     return str(market_ticker) if market_ticker else None
 
 
+def _refresh_known_market_tickers() -> int:
+    """Refresh the ticker allowlist used to keep ticker-only WS traffic cheap.
+
+    Trades and orderbook events still use the lazy market path; this allowlist is
+    only for ticker state, where dropping an unknown first sighting is acceptable
+    because the REST poller owns discovery and hydration.
+    """
+    global _KNOWN_MARKET_LAST_REFRESH, _KNOWN_MARKET_TICKERS
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Market.market_id, Market.ticker)
+            .filter(Market.status != "out_of_scope")
+            .all()
+        )
+        tickers: set[str] = set()
+        for market_id, ticker in rows:
+            if market_id:
+                tickers.add(str(market_id))
+            if ticker:
+                tickers.add(str(ticker))
+        _KNOWN_MARKET_TICKERS = tickers
+        _KNOWN_MARKET_LAST_REFRESH = time.monotonic()
+        return len(tickers)
+    finally:
+        db.close()
+
+
+def _ticker_allowed_by_known_market_gate(market_ticker: str) -> bool:
+    if not _WS_TICKER_KNOWN_MARKET_GATE_ENABLED:
+        return True
+    # Fail open before the first successful refresh; dropping every ticker on a
+    # transient DB read failure would be worse than doing the old per-ticker path.
+    if not _KNOWN_MARKET_TICKERS:
+        return True
+    return market_ticker in _KNOWN_MARKET_TICKERS
+
+
+async def _known_market_ticker_worker(stop_event: asyncio.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            count = await asyncio.to_thread(_refresh_known_market_tickers)
+            logger.info("Refreshed WS ticker known-market allowlist: %s tickers", count)
+        except Exception:
+            _WS_METRICS["ticker_known_market_refresh_errors"] += 1
+            logger.exception("Failed to refresh WS ticker known-market allowlist")
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=max(30.0, _WS_TICKER_KNOWN_MARKET_REFRESH_SEC),
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 async def _flush_ticker_coalescer(
     *,
     pending_tickers: dict[str, dict],
@@ -234,8 +337,11 @@ async def _flush_ticker_coalescer(
         batch = list(pending_tickers.values())
         pending_tickers.clear()
 
-    for item in batch:
-        await queue.put(item)
+    if _WS_TICKER_BATCH_DB_WRITES_ENABLED:
+        await queue.put({"type": "_ticker_batch", "messages": batch})
+    else:
+        for item in batch:
+            await queue.put(item)
 
     _WS_METRICS["ticker_flushed"] += len(batch)
     _WS_METRICS["queued_ticker"] += len(batch)
@@ -267,10 +373,21 @@ async def _ticker_coalescer_worker(
 
 async def _dispatch_ws_message(data: dict, session_id: str) -> None:
     msg_type = data.get("type")
+    if msg_type == "_ticker_batch":
+        messages = data.get("messages") or []
+        _WS_METRICS["handled_ticker"] += len(messages)
+        _WS_METRICS["ticker_batch_processed"] += 1
+        _WS_METRICS["ticker_batch_messages"] += len(messages)
+        await asyncio.to_thread(handle_ticker_messages_batch, messages)
+        return
+
     _WS_METRICS[f"handled_{msg_type or 'unknown'}"] += 1
 
     if msg_type == "ticker":
-        await asyncio.to_thread(handle_ticker_message, data)
+        if _WS_TICKER_BATCH_DB_WRITES_ENABLED:
+            await asyncio.to_thread(handle_ticker_messages_batch, [data])
+        else:
+            await asyncio.to_thread(handle_ticker_message, data)
     elif msg_type == "trade":
         await asyncio.to_thread(handle_trade_message, data)
     elif msg_type == "orderbook_snapshot":
@@ -327,6 +444,17 @@ def _ws_metrics_metadata(
         "ticker_coalesce_enabled": _WS_TICKER_COALESCE_ENABLED,
         "ticker_coalesce_window_sec": _WS_TICKER_COALESCE_WINDOW_SEC,
         "ticker_flush_max_queue_fraction": _WS_TICKER_FLUSH_MAX_QUEUE_FRACTION,
+        "ticker_batch_db_writes_enabled": _WS_TICKER_BATCH_DB_WRITES_ENABLED,
+        "ticker_metrics_write_gate_enabled": _WS_TICKER_METRICS_WRITE_GATE_ENABLED,
+        "ticker_metrics_min_interval_sec": _WS_TICKER_METRICS_MIN_INTERVAL_SEC,
+        "ticker_known_market_gate_enabled": _WS_TICKER_KNOWN_MARKET_GATE_ENABLED,
+        "ticker_known_market_count": len(_KNOWN_MARKET_TICKERS),
+        "ticker_known_market_age_sec": round(
+            now_m - _KNOWN_MARKET_LAST_REFRESH,
+            3,
+        )
+        if _KNOWN_MARKET_LAST_REFRESH
+        else None,
     }
     for msg_type in sorted(message_types):
         metadata[f"received_{msg_type}"] = _WS_METRICS.get(f"received_{msg_type}", 0)
@@ -497,7 +625,399 @@ def _get_or_create_market(db, market_ticker: str) -> Market | None:
     return db.query(Market).filter(Market.market_id == market_ticker).one_or_none()
 
 
+def _parse_ticker_message(data: dict) -> dict | None:
+    msg = data.get("msg") or {}
+    market_ticker = msg.get("market_ticker")
+    if not market_ticker:
+        return None
+    return {
+        "data": data,
+        "market_ticker": str(market_ticker),
+        "last_price_dollars": parse_decimal(msg.get("last_price_dollars")),
+        "yes_bid_dollars": parse_decimal(msg.get("yes_bid_dollars")),
+        "yes_ask_dollars": parse_decimal(msg.get("yes_ask_dollars")),
+        "no_bid_dollars": parse_decimal(msg.get("no_bid_dollars")),
+        "no_ask_dollars": parse_decimal(msg.get("no_ask_dollars")),
+        "volume_fp": parse_decimal(first_present(msg.get("volume_fp"), msg.get("volume"))),
+        "volume_24h_fp": parse_decimal(
+            first_present(
+                msg.get("volume_24h_fp"),
+                msg.get("volume_24h"),
+                msg.get("volume24h"),
+            )
+        ),
+        "open_interest_fp": parse_decimal(
+            first_present(msg.get("open_interest_fp"), msg.get("open_interest"))
+        ),
+        "liquidity_dollars": parse_decimal(
+            first_present(msg.get("liquidity_dollars"), msg.get("liquidity"))
+        ),
+    }
+
+
+def _bulk_get_or_create_markets(
+    db,
+    market_tickers: list[str],
+    *,
+    create_missing: bool,
+) -> dict[str, Market]:
+    if not market_tickers:
+        return {}
+
+    unique_tickers = sorted(set(market_tickers))
+    markets = (
+        db.query(Market)
+        .filter(Market.market_id.in_(unique_tickers))
+        .all()
+    )
+    by_ticker = {str(m.market_id): m for m in markets}
+    missing = [ticker for ticker in unique_tickers if ticker not in by_ticker]
+    if not missing or not create_missing:
+        if missing and not create_missing:
+            _WS_METRICS["ticker_unknown_skipped"] += len(missing)
+        return by_ticker
+
+    rows = []
+    for market_ticker in missing:
+        in_scope, classification = is_ticker_in_scope(market_ticker)
+        if not in_scope:
+            continue
+        rows.append(
+            {
+                "platform": "kalshi",
+                "market_id": market_ticker,
+                "title": market_ticker,
+                "status": "unknown",
+                "category": classification.category,
+                "subcategory": classification.subcategory,
+                "manipulability_prior": classification.manipulability_prior,
+                "classifier_tags": list(classification.tags),
+                "classifier_layer": classification.layer,
+                "classifier_rule": classification.rule,
+                "classifier_confidence": classification.confidence,
+                "classifier_version": CLASSIFIER_VERSION,
+            }
+        )
+
+    if rows:
+        stmt = (
+            pg_insert(Market)
+            .values(rows)
+            .on_conflict_do_nothing(index_elements=["market_id"])
+        )
+        db.execute(stmt)
+        db.flush()
+        markets = (
+            db.query(Market)
+            .filter(Market.market_id.in_(unique_tickers))
+            .all()
+        )
+        by_ticker = {str(m.market_id): m for m in markets}
+
+    _WS_METRICS["ticker_unknown_skipped"] += max(0, len(missing) - len(rows))
+    return by_ticker
+
+
+def _latest_snapshot_rows_by_market(
+    db,
+    market_pks: list[int],
+) -> tuple[dict[int, MarketMetric], dict[int, object]]:
+    if not market_pks:
+        return {}, {}
+
+    metrics = (
+        db.query(MarketMetric)
+        .filter(MarketMetric.market_pk.in_(market_pks))
+        .all()
+    )
+    metric_by_pk = {int(m.market_pk): m for m in metrics}
+    snapshot_ids = [
+        int(m.latest_snapshot_id)
+        for m in metrics
+        if m.latest_snapshot_id is not None
+    ]
+    snapshot_by_id = {}
+    if snapshot_ids:
+        snapshots = (
+            db.query(
+                MarketSnapshot.id,
+                MarketSnapshot.market_pk,
+                MarketSnapshot.ts,
+                MarketSnapshot.last_price_dollars,
+                MarketSnapshot.yes_bid_dollars,
+                MarketSnapshot.yes_ask_dollars,
+                MarketSnapshot.no_bid_dollars,
+                MarketSnapshot.no_ask_dollars,
+                MarketSnapshot.volume_fp,
+                MarketSnapshot.volume_24h_fp,
+                MarketSnapshot.open_interest_fp,
+                MarketSnapshot.liquidity_dollars,
+            )
+            .filter(MarketSnapshot.id.in_(snapshot_ids))
+            .all()
+        )
+        snapshot_by_id = {int(s.id): s for s in snapshots}
+
+    latest_by_pk: dict[int, object] = {}
+    for metric in metrics:
+        if metric.latest_snapshot_id is None:
+            continue
+        snapshot = snapshot_by_id.get(int(metric.latest_snapshot_id))
+        if snapshot is not None:
+            latest_by_pk[int(metric.market_pk)] = snapshot
+
+    missing_latest = [
+        pk
+        for pk in market_pks
+        if pk not in latest_by_pk
+    ]
+    # Metrics should normally carry latest_snapshot_id. This fallback preserves
+    # duplicate safety for older rows without putting the hot path back on the
+    # expensive latest-snapshot query for every ticker.
+    for pk in missing_latest[:25]:
+        last = (
+            db.query(MarketSnapshot)
+            .filter(MarketSnapshot.market_pk == pk)
+            .order_by(MarketSnapshot.id.desc())
+            .first()
+        )
+        if last is not None:
+            latest_by_pk[pk] = last
+
+    return metric_by_pk, latest_by_pk
+
+
+def _metric_updated_recently(metric: MarketMetric | None, now: datetime) -> bool:
+    if metric is None or metric.updated_at is None:
+        return False
+    updated_at = metric.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return (now - updated_at).total_seconds() < _WS_TICKER_METRICS_MIN_INTERVAL_SEC
+
+
+def _should_upsert_ticker_metric(
+    *,
+    metric: MarketMetric | None,
+    values: dict,
+    has_new_snapshot: bool,
+    now: datetime,
+) -> bool:
+    if not _WS_TICKER_METRICS_WRITE_GATE_ENABLED:
+        return True
+    if metric is None or has_new_snapshot:
+        return True
+
+    quote_fields = (
+        "last_price_cents",
+        "yes_bid_cents",
+        "yes_ask_cents",
+        "no_bid_cents",
+        "no_ask_cents",
+    )
+    for field in quote_fields:
+        if getattr(metric, field) != values.get(field):
+            return True
+
+    if _metric_updated_recently(metric, now):
+        return False
+    return True
+
+
+def handle_ticker_messages_batch(messages: list[dict]) -> None:
+    parsed = [p for message in messages if (p := _parse_ticker_message(message))]
+    if not parsed:
+        return
+
+    # A coalesced batch should already have one ticker per market, but keep the
+    # latest value here too so direct callers and non-coalesced single flushes
+    # stay safe.
+    latest_by_ticker: dict[str, dict] = {}
+    for row in parsed:
+        latest_by_ticker[row["market_ticker"]] = row
+    parsed = list(latest_by_ticker.values())
+
+    db = SessionLocal()
+    try:
+        markets_by_ticker = _bulk_get_or_create_markets(
+            db,
+            [row["market_ticker"] for row in parsed],
+            create_missing=not _WS_TICKER_KNOWN_MARKET_GATE_ENABLED,
+        )
+        rows_with_markets: list[tuple[dict, Market]] = []
+        for row in parsed:
+            market = markets_by_ticker.get(row["market_ticker"])
+            if market is None:
+                logger.debug("Skipping unknown ticker message for %s", row["market_ticker"])
+                continue
+            rows_with_markets.append((row, market))
+
+        if not rows_with_markets:
+            db.rollback()
+            return
+
+        now = datetime.now(timezone.utc)
+        market_pks = [int(market.id) for _row, market in rows_with_markets]
+        metric_by_pk, latest_snapshot_by_pk = _latest_snapshot_rows_by_market(
+            db,
+            market_pks,
+        )
+
+        snapshots_to_add: list[tuple[MarketSnapshot, dict, Market, StorageDecision]] = []
+        metric_rows: list[dict] = []
+        metric_heartbeat_decision: StorageDecision | None = None
+
+        for row, market in rows_with_markets:
+            _update_tape_hints_from_ticker(
+                market.id,
+                row["volume_24h_fp"],
+                row["open_interest_fp"],
+            )
+            decision = storage_decision_for_event(
+                market,
+                volume_24h_fp=row["volume_24h_fp"],
+                open_interest_fp=row["open_interest_fp"],
+            )
+            metric_heartbeat_decision = decision
+            latest_snapshot = latest_snapshot_by_pk.get(int(market.id))
+            is_duplicate = (
+                latest_snapshot is not None
+                and snapshot_row_is_duplicate(
+                    latest_snapshot,
+                    last_price_dollars=row["last_price_dollars"],
+                    yes_bid_dollars=row["yes_bid_dollars"],
+                    yes_ask_dollars=row["yes_ask_dollars"],
+                    no_bid_dollars=row["no_bid_dollars"],
+                    no_ask_dollars=row["no_ask_dollars"],
+                    volume_fp=row["volume_fp"],
+                    volume_24h_fp=row["volume_24h_fp"],
+                    open_interest_fp=row["open_interest_fp"],
+                    liquidity_dollars=row["liquidity_dollars"],
+                    now=now,
+                )
+            )
+            should_store_snapshot = False
+            if is_duplicate:
+                _WS_METRICS["ticker_snapshots_skipped_duplicate"] += 1
+            else:
+                should_store_snapshot = decision.persist_raw_tape or should_sample_event(
+                    (
+                        f"ticker:{market.market_id}:{row['last_price_dollars']}:"
+                        f"{row['yes_bid_dollars']}:{row['yes_ask_dollars']}:"
+                        f"{row['volume_fp']}:{row['volume_24h_fp']}:"
+                        f"{row['open_interest_fp']}"
+                    ),
+                    decision.sample_rate,
+                )
+                if not should_store_snapshot:
+                    _WS_METRICS["ticker_snapshots_skipped_sampling"] += 1
+
+            if should_store_snapshot:
+                snapshot = MarketSnapshot(
+                    market_pk=market.id,
+                    last_price_dollars=row["last_price_dollars"],
+                    yes_bid_dollars=row["yes_bid_dollars"],
+                    yes_ask_dollars=row["yes_ask_dollars"],
+                    no_bid_dollars=row["no_bid_dollars"],
+                    no_ask_dollars=row["no_ask_dollars"],
+                    volume_fp=row["volume_fp"],
+                    volume_24h_fp=row["volume_24h_fp"],
+                    open_interest_fp=row["open_interest_fp"],
+                    liquidity_dollars=row["liquidity_dollars"],
+                )
+                db.add(snapshot)
+                snapshots_to_add.append((snapshot, row, market, decision))
+            else:
+                values = quote_metric_values(
+                    market_pk=market.id,
+                    prior=market.manipulability_prior,
+                    latest_snapshot_id=None,
+                    latest_snapshot_ts=None,
+                    last_price_dollars=row["last_price_dollars"],
+                    yes_bid_dollars=row["yes_bid_dollars"],
+                    yes_ask_dollars=row["yes_ask_dollars"],
+                    no_bid_dollars=row["no_bid_dollars"],
+                    no_ask_dollars=row["no_ask_dollars"],
+                    volume_24h_fp=row["volume_24h_fp"],
+                    open_interest_fp=row["open_interest_fp"],
+                    liquidity_dollars=row["liquidity_dollars"],
+                    decision=decision,
+                )
+                if _should_upsert_ticker_metric(
+                    metric=metric_by_pk.get(int(market.id)),
+                    values=values,
+                    has_new_snapshot=False,
+                    now=now,
+                ):
+                    metric_rows.append(values)
+                else:
+                    _WS_METRICS["ticker_metrics_skipped_gate"] += 1
+
+        if snapshots_to_add:
+            db.flush()
+            _WS_METRICS["ticker_snapshots_inserted"] += len(snapshots_to_add)
+            for snapshot, row, market, decision in snapshots_to_add:
+                metric_rows.append(
+                    quote_metric_values(
+                        market_pk=market.id,
+                        prior=market.manipulability_prior,
+                        latest_snapshot_id=snapshot.id,
+                        latest_snapshot_ts=snapshot.ts,
+                        last_price_dollars=row["last_price_dollars"],
+                        yes_bid_dollars=row["yes_bid_dollars"],
+                        yes_ask_dollars=row["yes_ask_dollars"],
+                        no_bid_dollars=row["no_bid_dollars"],
+                        no_ask_dollars=row["no_ask_dollars"],
+                        volume_24h_fp=row["volume_24h_fp"],
+                        open_interest_fp=row["open_interest_fp"],
+                        liquidity_dollars=row["liquidity_dollars"],
+                        decision=decision,
+                    )
+                )
+                if _write_raw_clickhouse():
+                    clickhouse_batcher.enqueue(
+                        _CH_QUOTES_TABLE,
+                        {
+                            "ts": _clickhouse_ts(snapshot.ts),
+                            "market_pk": market.id,
+                            "last_price_cents": _cents(row["last_price_dollars"]),
+                            "yes_bid_cents": _cents(row["yes_bid_dollars"]),
+                            "yes_ask_cents": _cents(row["yes_ask_dollars"]),
+                            "no_bid_cents": _cents(row["no_bid_dollars"]),
+                            "no_ask_cents": _cents(row["no_ask_dollars"]),
+                            "volume_24h_contracts": _contracts(row["volume_24h_fp"]),
+                            "open_interest_contracts": _contracts(row["open_interest_fp"]),
+                            "storage_tier": decision.tier,
+                        },
+                    )
+                if _should_materialize_market_anomaly(market.id, decision):
+                    materialize_market_anomaly(
+                        db,
+                        market,
+                        lookback=40,
+                        latest_snapshot_id=snapshot.id,
+                    )
+
+        if metric_rows:
+            bulk_upsert_quote_metrics(
+                db,
+                metric_rows,
+                heartbeat_decision=metric_heartbeat_decision,
+            )
+            _WS_METRICS["ticker_metrics_upserted"] += len(metric_rows)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def handle_ticker_message(data: dict) -> None:
+    if _WS_TICKER_BATCH_DB_WRITES_ENABLED:
+        handle_ticker_messages_batch([data])
+        return
+
     msg = data.get("msg", {})
     market_ticker = msg.get("market_ticker")
     if not market_ticker:
@@ -1115,6 +1635,12 @@ async def consume_market_data_forever() -> None:
                     if _WS_TICKER_COALESCE_ENABLED
                     else None
                 )
+                known_market_stop = asyncio.Event()
+                known_market_task = (
+                    asyncio.create_task(_known_market_ticker_worker(known_market_stop))
+                    if _WS_TICKER_KNOWN_MARKET_GATE_ENABLED
+                    else None
+                )
 
                 try:
                     last_heartbeat = time.monotonic()
@@ -1127,6 +1653,10 @@ async def consume_market_data_forever() -> None:
                         message_count += 1
 
                         ticker_key = _ticker_market_key(data)
+                        if ticker_key and not _ticker_allowed_by_known_market_gate(ticker_key):
+                            _WS_METRICS["ticker_known_market_gate_dropped"] += 1
+                            continue
+
                         if _WS_TICKER_COALESCE_ENABLED and ticker_key:
                             # Ticker updates are market state snapshots where latest
                             # state wins. Trades and orderbook streams are event
@@ -1166,6 +1696,9 @@ async def consume_market_data_forever() -> None:
                             logger.info("WebSocket metrics: %s", metadata)
                             last_heartbeat = now_m
                 finally:
+                    if known_market_task is not None:
+                        known_market_stop.set()
+                        await known_market_task
                     if coalescer_task is not None:
                         coalescer_stop.set()
                         await coalescer_task

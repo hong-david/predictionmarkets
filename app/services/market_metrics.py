@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+
+from typing import Any
 
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -53,6 +55,90 @@ def _maybe_heartbeat_retention_projection(decision: StorageDecision) -> None:
     )
 
 
+def quote_metric_values(
+    *,
+    market_pk: int,
+    prior: str | None,
+    latest_snapshot_id: int | None,
+    latest_snapshot_ts: datetime | None,
+    last_price_dollars: Decimal | None,
+    yes_bid_dollars: Decimal | None,
+    yes_ask_dollars: Decimal | None,
+    no_bid_dollars: Decimal | None,
+    no_ask_dollars: Decimal | None,
+    volume_24h_fp: Decimal | None,
+    open_interest_fp: Decimal | None,
+    liquidity_dollars: Decimal | None,
+    decision: StorageDecision,
+) -> dict[str, Any]:
+    pr = prior_rank(prior)
+    urgency = urgency_score_0_100(prior_rank=pr, anomaly_count=0)
+    evidence = evidence_score_0_100(anomaly_count=0)
+    return {
+        "market_pk": market_pk,
+        "latest_snapshot_id": latest_snapshot_id,
+        "latest_snapshot_ts": latest_snapshot_ts,
+        "last_price_cents": _cents(last_price_dollars),
+        "yes_bid_cents": _cents(yes_bid_dollars),
+        "yes_ask_cents": _cents(yes_ask_dollars),
+        "no_bid_cents": _cents(no_bid_dollars),
+        "no_ask_cents": _cents(no_ask_dollars),
+        "volume_24h_contracts": _contracts(volume_24h_fp),
+        "open_interest_contracts": _contracts(open_interest_fp),
+        "liquidity_cents": _cents(liquidity_dollars),
+        "urgency_score": urgency,
+        "evidence_score": evidence,
+        "storage_tier": decision.tier,
+        "retention_score": decision.score,
+        "retention_reasons": list(decision.reasons),
+        "updated_at": func.now(),
+    }
+
+
+def bulk_upsert_quote_metrics(
+    db: Session,
+    rows: list[dict[str, Any]],
+    *,
+    heartbeat_decision: StorageDecision | None = None,
+) -> None:
+    if not rows:
+        return
+    stmt = pg_insert(MarketMetric).values(rows)
+    excluded = stmt.excluded
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["market_pk"],
+        set_={
+            # No-snapshot ticker updates should not clear the latest snapshot pointer.
+            "latest_snapshot_id": func.coalesce(
+                excluded.latest_snapshot_id,
+                MarketMetric.latest_snapshot_id,
+            ),
+            "latest_snapshot_ts": func.coalesce(
+                excluded.latest_snapshot_ts,
+                MarketMetric.latest_snapshot_ts,
+            ),
+            "last_price_cents": excluded.last_price_cents,
+            "yes_bid_cents": excluded.yes_bid_cents,
+            "yes_ask_cents": excluded.yes_ask_cents,
+            "no_bid_cents": excluded.no_bid_cents,
+            "no_ask_cents": excluded.no_ask_cents,
+            "volume_24h_contracts": func.coalesce(
+                excluded.volume_24h_contracts,
+                MarketMetric.volume_24h_contracts,
+            ),
+            "open_interest_contracts": excluded.open_interest_contracts,
+            "liquidity_cents": excluded.liquidity_cents,
+            "storage_tier": excluded.storage_tier,
+            "retention_score": excluded.retention_score,
+            "retention_reasons": excluded.retention_reasons,
+            "updated_at": func.now(),
+        },
+    )
+    db.execute(stmt)
+    if heartbeat_decision is not None:
+        _maybe_heartbeat_retention_projection(heartbeat_decision)
+
+
 def upsert_quote_metrics(
     db: Session,
     *,
@@ -70,35 +156,34 @@ def upsert_quote_metrics(
     liquidity_dollars: Decimal | None,
     decision: StorageDecision,
 ) -> None:
-    pr = prior_rank(prior)
-    urgency = urgency_score_0_100(prior_rank=pr, anomaly_count=0)
-    evidence = evidence_score_0_100(anomaly_count=0)
-    values = {
-        "market_pk": market_pk,
-        "latest_snapshot_id": latest_snapshot_id,
-        "latest_snapshot_ts": latest_snapshot_ts or datetime.now(timezone.utc),
-        "last_price_cents": _cents(last_price_dollars),
-        "yes_bid_cents": _cents(yes_bid_dollars),
-        "yes_ask_cents": _cents(yes_ask_dollars),
-        "no_bid_cents": _cents(no_bid_dollars),
-        "no_ask_cents": _cents(no_ask_dollars),
-        "volume_24h_contracts": _contracts(volume_24h_fp),
-        "open_interest_contracts": _contracts(open_interest_fp),
-        "liquidity_cents": _cents(liquidity_dollars),
-        "urgency_score": urgency,
-        "evidence_score": evidence,
-        "storage_tier": decision.tier,
-        "retention_score": decision.score,
-        "retention_reasons": list(decision.reasons),
-        "updated_at": func.now(),
-    }
+    values = quote_metric_values(
+        market_pk=market_pk,
+        prior=prior,
+        latest_snapshot_id=latest_snapshot_id,
+        latest_snapshot_ts=latest_snapshot_ts,
+        last_price_dollars=last_price_dollars,
+        yes_bid_dollars=yes_bid_dollars,
+        yes_ask_dollars=yes_ask_dollars,
+        no_bid_dollars=no_bid_dollars,
+        no_ask_dollars=no_ask_dollars,
+        volume_24h_fp=volume_24h_fp,
+        open_interest_fp=open_interest_fp,
+        liquidity_dollars=liquidity_dollars,
+        decision=decision,
+    )
     stmt = pg_insert(MarketMetric).values(**values)
     excluded = stmt.excluded
     stmt = stmt.on_conflict_do_update(
         index_elements=["market_pk"],
         set_={
-            "latest_snapshot_id": excluded.latest_snapshot_id,
-            "latest_snapshot_ts": excluded.latest_snapshot_ts,
+            "latest_snapshot_id": func.coalesce(
+                excluded.latest_snapshot_id,
+                MarketMetric.latest_snapshot_id,
+            ),
+            "latest_snapshot_ts": func.coalesce(
+                excluded.latest_snapshot_ts,
+                MarketMetric.latest_snapshot_ts,
+            ),
             "last_price_cents": excluded.last_price_cents,
             "yes_bid_cents": excluded.yes_bid_cents,
             "yes_ask_cents": excluded.yes_ask_cents,

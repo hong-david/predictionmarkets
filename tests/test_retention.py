@@ -177,6 +177,9 @@ class _FakeSession:
     def one_or_none(self):
         return None  # always insert, never update
 
+    def all(self):
+        return []
+
     def add(self, obj):
         from app.db.models import Market, MarketSnapshot
 

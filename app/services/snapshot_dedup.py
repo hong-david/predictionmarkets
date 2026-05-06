@@ -101,6 +101,39 @@ def should_skip_duplicate_snapshot(
     if last is None:
         return False
 
+    return snapshot_row_is_duplicate(
+        last,
+        last_price_dollars=last_price_dollars,
+        yes_bid_dollars=yes_bid_dollars,
+        yes_ask_dollars=yes_ask_dollars,
+        no_bid_dollars=no_bid_dollars,
+        no_ask_dollars=no_ask_dollars,
+        volume_fp=volume_fp,
+        volume_24h_fp=volume_24h_fp,
+        open_interest_fp=open_interest_fp,
+        liquidity_dollars=liquidity_dollars,
+        now=now,
+        heartbeat_seconds=heartbeat_seconds,
+    )
+
+
+def snapshot_row_is_duplicate(
+    last,
+    *,
+    last_price_dollars: Decimal | None,
+    yes_bid_dollars: Decimal | None,
+    yes_ask_dollars: Decimal | None,
+    no_bid_dollars: Decimal | None,
+    no_ask_dollars: Decimal | None,
+    volume_fp: Decimal | None,
+    volume_24h_fp: Decimal | None,
+    open_interest_fp: Decimal | None,
+    liquidity_dollars: Decimal | None,
+    now: datetime | None = None,
+    heartbeat_seconds: int = 300,
+) -> bool:
+    """Return True when ``last`` has the same quote fields inside heartbeat."""
+    now = now if now is not None else datetime.now(timezone.utc)
     same = (
         _eq_d(last.last_price_dollars, last_price_dollars)
         and _eq_d(last.yes_bid_dollars, yes_bid_dollars)
