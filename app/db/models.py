@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from sqlalchemy import (
     BigInteger,
     JSON,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -318,6 +319,59 @@ class Anomaly(Base):
     )
 
     market: Mapped["Market"] = relationship()
+
+
+class AnomalyDailySummary(Base):
+    __tablename__ = "anomaly_daily_summaries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_pk: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    summary_date: Mapped[date] = mapped_column(Date, index=True)
+    severity: Mapped[str] = mapped_column(String(20), index=True)
+
+    anomaly_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    max_score: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    avg_score: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    first_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    latest_anomaly_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "market_pk",
+            "summary_date",
+            "severity",
+            name="uq_anomaly_daily_summaries_market_date_severity",
+        ),
+        Index(
+            "ix_anomaly_daily_summaries_market_date",
+            "market_pk",
+            "summary_date",
+        ),
+        Index(
+            "ix_anomaly_daily_summaries_severity_date",
+            "severity",
+            "summary_date",
+        ),
+    )
 
 
 class MarketMetric(Base):

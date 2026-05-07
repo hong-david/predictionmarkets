@@ -248,6 +248,37 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                 forward_output=True,
             )
         )
+    if args.with_anomaly_retention:
+        anomaly_retention_command = [
+            py,
+            "-m",
+            "scripts.run_anomaly_retention",
+            "--watch",
+            "--interval-seconds",
+            str(args.anomaly_retention_interval_seconds),
+            "--cutoff-days",
+            str(args.anomaly_retention_cutoff_days),
+            "--severities",
+            args.anomaly_retention_severities,
+            "--batch-size",
+            str(args.anomaly_retention_batch_size),
+            "--max-batches",
+            str(args.anomaly_retention_max_batches),
+        ]
+        if args.anomaly_retention_execute:
+            anomaly_retention_command.append("--execute")
+        if args.anomaly_retention_analyze:
+            anomaly_retention_command.append("--analyze")
+        processes.append(
+            ManagedProcess(
+                key="anomaly_retention",
+                label="Anomaly retention",
+                command=anomaly_retention_command,
+                cwd=root,
+                log_dir=log_dir,
+                forward_output=True,
+            )
+        )
     if args.with_dashboard_cache_warmer:
         processes.append(
             ManagedProcess(
@@ -318,6 +349,14 @@ def main() -> None:
     parser.add_argument("--retention-sampled-snapshot-days", type=int, default=7)
     parser.add_argument("--retention-hot-snapshot-days", type=int, default=30)
     parser.add_argument("--retention-batch-size", type=int, default=5000)
+    parser.add_argument("--with-anomaly-retention", action="store_true")
+    parser.add_argument("--anomaly-retention-execute", action="store_true")
+    parser.add_argument("--anomaly-retention-analyze", action="store_true")
+    parser.add_argument("--anomaly-retention-interval-seconds", type=float, default=21600.0)
+    parser.add_argument("--anomaly-retention-cutoff-days", type=int, default=7)
+    parser.add_argument("--anomaly-retention-severities", default="none,low")
+    parser.add_argument("--anomaly-retention-batch-size", type=int, default=5000)
+    parser.add_argument("--anomaly-retention-max-batches", type=int, default=100)
     parser.add_argument("--with-dashboard-cache-warmer", action="store_true")
     parser.add_argument("--dashboard-cache-warm-interval-seconds", type=float, default=60.0)
     parser.add_argument("--dashboard-cache-warm-market-scopes", default="active")

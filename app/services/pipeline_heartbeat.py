@@ -28,6 +28,7 @@ COMPONENTS: dict[str, tuple[str, str]] = {
     "news_trade_correlations": ("News/trade correlations", "materializer"),
     "trade_flags": ("Trade flags", "materializer"),
     "quote_book_anomalies": ("Quote/book alerts", "materializer"),
+    "anomaly_retention": ("Anomaly retention", "job"),
     "retention_projection": ("Retention/storage-tier projection", "projection"),
     "storage_guardrails": ("Storage guardrails", "projection"),
     "retention_maintenance": ("Retention maintenance", "job"),
