@@ -342,7 +342,8 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="The main line uses retained trades and explicit last-price snapshots. Bid and ask quotes are shown separately; midpoint is not plotted as price. Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. Arrows: saved alert rows on quotes. Pan and zoom."          right={
+          subtitle="The main line uses a temporary display series: retained trades and explicit last-price snapshots first, then quote midpoint to fill sparse periods on a uniform time grid. Bid and ask quotes are shown separately. Crosshair: your browser local time, plus ET and UTC. Arrows: saved alert rows on quotes. Pan and zoom."
+          right={
             series.data
               ? [
                   `${fmtInt(series.data.trades.length)} trades`,

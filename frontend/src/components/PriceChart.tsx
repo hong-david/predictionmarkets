@@ -17,7 +17,6 @@ import { useEffect, useRef } from "react";
 import type {
   AnomalyRow,
   MarketSeries,
-  TradePoint,
 } from "@/api/types";
 import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
 
@@ -30,6 +29,21 @@ export interface ChartNewsEvent {
 }
 
 const MARKET_ALERT_MARKER_MIN_SCORE = 5.0;
+const DISPLAY_SERIES_TARGET_MAX_POINTS = 2200;
+const DISPLAY_BUCKET_INTERVALS_SEC = [60, 300, 900, 3600, 14400, 86400];
+
+type DisplayObservation = {
+  unix: number;
+  value: number;
+  sourceRank: number;
+};
+
+type DisplaySeries = {
+  points: LineData[];
+  bucketSeconds: number;
+  start: number;
+  end: number;
+};
 
 /**
  * Price + volume chart, with anomaly markers overlaid on the price
@@ -44,11 +58,10 @@ const MARKET_ALERT_MARKER_MIN_SCORE = 5.0;
  * The two series share an x-axis; lightweight-charts handles
  * synchronisation when you pan or zoom.
  *
- * **Curved line + area:** `LineType.Curved` draws a smooth path through
- * each trade’s yes price. Between prints the curve is a spline, not a claim
- * that the contract traded at intermediate prices (there is no public tape
- * between events). A light gradient under the line improves legibility over
- * a hard stepped staircase.
+ * **Temporary display price:** the main line prefers retained trades and
+ * explicit last-price snapshots, then quote midpoint when price data is sparse.
+ * Points are projected onto a uniform time grid and interpolated so calendar
+ * time stays visually linear until canonical chart history exists.
  *
  * **Volume bars:** per-trade *contract size* (that print’s `count`), colored by
  * taker side. Bar height is **not** the same quantity as the snapshot
@@ -124,7 +137,7 @@ export function PriceChart({
     chartRef.current = chart;
 
     const price = chart.addLineSeries({
-      lineType: LineType.WithSteps,
+      lineType: LineType.Curved,
       color: "rgba(120, 185, 255, 0.95)",
       lineWidth: 2,
       lineStyle: LineStyle.Solid,
@@ -215,63 +228,17 @@ export function PriceChart({
       return;
     }
 
-    const linePoints: LineData[] = [];
-    const bidPoints: LineData[] = [];
-    const askPoints: LineData[] = [];
-    const volumePoints: HistogramData[] = [];
-    const lineSeenTimes = new Set<number>();
-    const bidSeenTimes = new Set<number>();
-    const askSeenTimes = new Set<number>();
-    const volumeSeenTimes = new Set<number>();
-    const priceCandidates = [
-      ...series.snapshots
-        .map((snapshot) => ({
-          ts: snapshot.ts,
-          value: snapshot.last_price,
-          sourceRank: 0,
-        }))
-        .filter(
-          (row): row is { ts: string; value: number; sourceRank: number } =>
-            row.ts != null && row.value != null,
-        ),
-      ...series.trades
-        .map((trade) => ({
-          ts: trade.ts,
-          value: trade.yes_price,
-          sourceRank: 1,
-        }))
-        .filter(
-          (row): row is { ts: string; value: number; sourceRank: number } =>
-            row.ts != null && row.value != null,
-        ),
-    ].sort((a, b) => {
-      const delta = new Date(a.ts).getTime() - new Date(b.ts).getTime();
-      return delta !== 0 ? delta : a.sourceRank - b.sourceRank;
-    });
-
-    for (const point of priceCandidates) {
-      addUniqueLinePoint(linePoints, lineSeenTimes, point.ts, point.value);
-    }
-    for (const snapshot of series.snapshots) {
-      if (snapshot.ts && snapshot.yes_bid != null) {
-        addUniqueLinePoint(bidPoints, bidSeenTimes, snapshot.ts, snapshot.yes_bid);
-      }
-      if (snapshot.ts && snapshot.yes_ask != null) {
-        addUniqueLinePoint(askPoints, askSeenTimes, snapshot.ts, snapshot.yes_ask);
-      }
-    }
-    for (const t of series.trades) {
-      if (!t.ts) continue;
-      // lightweight-charts requires unique timestamps within each series.
-      // Trades can share the same wall-clock second; nudge volume bars by +1s.
-      const time = uniqueChartTime(volumeSeenTimes, t.ts);
-      if (time == null) continue;
-      volumePoints.push({
-        time,
-        value: t.count ?? 0,
-        color: takerColor(t),
-      });
-    }
+    const display = buildDisplayPriceSeries(series);
+    const linePoints = display.points;
+    const bidPoints = buildUniformQuoteSeries(
+      quoteObservations(series, "bid"),
+      display,
+    );
+    const askPoints = buildUniformQuoteSeries(
+      quoteObservations(series, "ask"),
+      display,
+    );
+    const volumePoints = buildBucketedVolumePoints(series, display);
 
     const allLinePoints = [...linePoints, ...bidPoints, ...askPoints];
     yRangeRef.current = dynamicProbabilityRange(allLinePoints.map((p) => p.value));
@@ -395,36 +362,245 @@ function formatLocalChartTime(t: Time): string {
   return "";
 }
 
-function uniqueChartTime(seenTimes: Set<number>, ts: string): UTCTimestamp | null {
-  const raw = new Date(ts).getTime();
-  if (!Number.isFinite(raw)) return null;
-  let unix = Math.floor(raw / 1000);
-  while (seenTimes.has(unix)) unix += 1;
-  seenTimes.add(unix);
-  return unix as UTCTimestamp;
+function buildDisplayPriceSeries(series: MarketSeries): DisplaySeries {
+  const observations = normalizeObservations([
+    ...series.snapshots.flatMap((snapshot) => {
+      const out: DisplayObservation[] = [];
+      addObservation(out, snapshot.ts, snapshot.last_price, 2);
+      if (snapshot.yes_bid != null && snapshot.yes_ask != null) {
+        addObservation(out, snapshot.ts, (snapshot.yes_bid + snapshot.yes_ask) / 2, 1);
+      }
+      return out;
+    }),
+    ...series.trades.flatMap((trade) => {
+      const out: DisplayObservation[] = [];
+      addObservation(out, trade.ts, trade.yes_price, 3);
+      return out;
+    }),
+  ]);
+
+  return buildUniformSeries(observations);
 }
 
-function addUniqueLinePoint(
-  out: LineData[],
-  seenTimes: Set<number>,
-  ts: string,
-  value: number,
+function quoteObservations(
+  series: MarketSeries,
+  side: "bid" | "ask",
+): DisplayObservation[] {
+  const out: DisplayObservation[] = [];
+  for (const snapshot of series.snapshots) {
+    addObservation(
+      out,
+      snapshot.ts,
+      side === "bid" ? snapshot.yes_bid : snapshot.yes_ask,
+      1,
+    );
+  }
+  return normalizeObservations(out);
+}
+
+function buildUniformQuoteSeries(
+  observations: DisplayObservation[],
+  display: DisplaySeries,
+): LineData[] {
+  if (!observations.length) return [];
+  if (!display.points.length) return buildUniformSeries(observations).points;
+  return buildUniformPoints(
+    observations,
+    display.bucketSeconds,
+    display.start,
+    display.end,
+  );
+}
+
+function buildUniformSeries(observations: DisplayObservation[]): DisplaySeries {
+  const clean = normalizeObservations(observations);
+  if (!clean.length) {
+    return { points: [], bucketSeconds: 60, start: 0, end: 0 };
+  }
+
+  const first = clean[0].unix;
+  const last = clean[clean.length - 1].unix;
+  const bucketSeconds = displayBucketSeconds(Math.max(0, last - first));
+  const start = Math.floor(first / bucketSeconds) * bucketSeconds;
+  const end = Math.ceil(last / bucketSeconds) * bucketSeconds;
+
+  return {
+    points: buildUniformPoints(clean, bucketSeconds, start, end),
+    bucketSeconds,
+    start,
+    end,
+  };
+}
+
+function buildUniformPoints(
+  observations: DisplayObservation[],
+  bucketSeconds: number,
+  start: number,
+  end: number,
+): LineData[] {
+  const clean = normalizeObservations(observations);
+  if (!clean.length || end < start) return [];
+
+  const bucketValues = bucketBestObservations(clean, bucketSeconds, start, end);
+  const points: LineData[] = [];
+  let nextIndex = 0;
+  let previous: DisplayObservation | null = null;
+
+  for (let unix = start; unix <= end; unix += bucketSeconds) {
+    while (nextIndex < clean.length && clean[nextIndex].unix < unix) {
+      previous = clean[nextIndex];
+      nextIndex += 1;
+    }
+
+    const direct = bucketValues.get(unix);
+    const value =
+      direct?.value ?? interpolatedValue(previous, clean[nextIndex] ?? null, unix);
+    if (value == null) continue;
+    points.push({ time: unix as UTCTimestamp, value: clampProbability(value) });
+  }
+
+  return points;
+}
+
+function buildBucketedVolumePoints(
+  series: MarketSeries,
+  display: DisplaySeries,
+): HistogramData[] {
+  if (!display.points.length) return [];
+
+  const buckets = new Map<
+    number,
+    { total: number; yes: number; no: number; other: number }
+  >();
+  for (const trade of series.trades) {
+    const unix = trade.ts ? parseChartUnix(trade.ts) : null;
+    const count = finiteNumber(trade.count);
+    if (unix == null || count == null || count <= 0) continue;
+
+    const bucket =
+      Math.floor(unix / display.bucketSeconds) * display.bucketSeconds;
+    if (bucket < display.start || bucket > display.end) continue;
+
+    const entry = buckets.get(bucket) ?? { total: 0, yes: 0, no: 0, other: 0 };
+    entry.total += count;
+    if (trade.taker_side === "yes") entry.yes += count;
+    else if (trade.taker_side === "no") entry.no += count;
+    else entry.other += count;
+    buckets.set(bucket, entry);
+  }
+
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([unix, entry]) => ({
+      time: unix as UTCTimestamp,
+      value: entry.total,
+      color: volumeBucketColor(entry),
+    }));
+}
+
+function addObservation(
+  out: DisplayObservation[],
+  ts: string | null | undefined,
+  value: number | null | undefined,
+  sourceRank: number,
 ): void {
-  const time = uniqueChartTime(seenTimes, ts);
-  if (time == null) return;
-  out.push({ time, value: clampProbability(value) });
+  if (!ts) return;
+  const unix = parseChartUnix(ts);
+  const cleanValue = finiteNumber(value);
+  if (unix == null || cleanValue == null) return;
+  out.push({ unix, value: clampProbability(cleanValue), sourceRank });
+}
+
+function normalizeObservations(
+  observations: DisplayObservation[],
+): DisplayObservation[] {
+  const bySecond = new Map<number, DisplayObservation>();
+  for (const obs of observations) {
+    if (!Number.isFinite(obs.unix) || !Number.isFinite(obs.value)) continue;
+    const previous = bySecond.get(obs.unix);
+    if (
+      !previous ||
+      obs.sourceRank > previous.sourceRank ||
+      (obs.sourceRank === previous.sourceRank && obs.unix >= previous.unix)
+    ) {
+      bySecond.set(obs.unix, obs);
+    }
+  }
+  return Array.from(bySecond.values()).sort((a, b) => a.unix - b.unix);
+}
+
+function bucketBestObservations(
+  observations: DisplayObservation[],
+  bucketSeconds: number,
+  start: number,
+  end: number,
+): Map<number, DisplayObservation> {
+  const buckets = new Map<number, DisplayObservation>();
+  for (const obs of observations) {
+    const bucket = Math.floor(obs.unix / bucketSeconds) * bucketSeconds;
+    if (bucket < start || bucket > end) continue;
+    const previous = buckets.get(bucket);
+    if (
+      !previous ||
+      obs.sourceRank > previous.sourceRank ||
+      (obs.sourceRank === previous.sourceRank && obs.unix >= previous.unix)
+    ) {
+      buckets.set(bucket, obs);
+    }
+  }
+  return buckets;
+}
+
+function displayBucketSeconds(spanSeconds: number): number {
+  let bucket =
+    spanSeconds <= 24 * 3600
+      ? 60
+      : spanSeconds <= 7 * 24 * 3600
+        ? 300
+        : spanSeconds <= 30 * 24 * 3600
+          ? 900
+          : 3600;
+
+  while (
+    Math.ceil(spanSeconds / bucket) + 1 > DISPLAY_SERIES_TARGET_MAX_POINTS
+  ) {
+    const next = DISPLAY_BUCKET_INTERVALS_SEC.find((interval) => interval > bucket);
+    if (next == null) break;
+    bucket = next;
+  }
+  return bucket;
+}
+
+function interpolatedValue(
+  previous: DisplayObservation | null,
+  next: DisplayObservation | null,
+  unix: number,
+): number | null {
+  if (previous && next) {
+    if (next.unix === previous.unix) return next.value;
+    const ratio = Math.min(
+      1,
+      Math.max(0, (unix - previous.unix) / (next.unix - previous.unix)),
+    );
+    return previous.value + (next.value - previous.value) * ratio;
+  }
+  return previous?.value ?? next?.value ?? null;
+}
+
+function finiteNumber(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function volumeBucketColor(entry: { yes: number; no: number }): string {
+  if (entry.yes > entry.no) return "rgba(46, 204, 113, 0.55)";
+  if (entry.no > entry.yes) return "rgba(231, 76, 60, 0.55)";
+  return "rgba(78, 161, 255, 0.45)";
 }
 
 function uniqueSortedTimes(points: LineData[]): Time[] {
   return Array.from(new Set(points.map((p) => p.time as number)))
     .sort((a, b) => a - b)
     .map((t) => t as UTCTimestamp);
-}
-
-function takerColor(t: TradePoint): string {
-  if (t.taker_side === "yes") return "rgba(46, 204, 113, 0.55)";
-  if (t.taker_side === "no") return "rgba(231, 76, 60, 0.55)";
-  return "rgba(78, 161, 255, 0.45)";
 }
 
 function clampProbability(value: number): number {
