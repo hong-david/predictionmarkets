@@ -85,6 +85,11 @@ class Market(Base):
         cascade="all, delete-orphan",
     )
 
+    price_history: Mapped[list["MarketPriceHistory"]] = relationship(
+        back_populates="market",
+        cascade="all, delete-orphan",
+    )
+
     metrics: Mapped["MarketMetric"] = relationship(
         back_populates="market",
         cascade="all, delete-orphan",
@@ -126,6 +131,102 @@ class MarketSnapshot(Base):
     )
 
     market: Mapped["Market"] = relationship(back_populates="snapshots")
+
+
+class MarketPriceHistory(Base):
+    __tablename__ = "market_price_history"
+
+    market_pk: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), primary_key=True
+    )
+    interval_sec: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bucket_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+
+    open_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    high_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    low_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    close_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    close_price_source: Mapped[str | None] = mapped_column(
+        String(16), nullable=True
+    )
+    close_price_source_rank: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    first_price_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_price_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    open_yes_bid_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    high_yes_bid_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    low_yes_bid_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    close_yes_bid_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    open_yes_ask_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    high_yes_ask_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    low_yes_ask_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    close_yes_ask_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    close_volume_24h_fp: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 2), nullable=True
+    )
+    close_open_interest_fp: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 2), nullable=True
+    )
+    first_quote_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_quote_ts: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    trade_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    trade_volume_contracts: Mapped[Decimal] = mapped_column(
+        Numeric(18, 2), default=0, nullable=False
+    )
+    quote_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship(back_populates="price_history")
+
+    __table_args__ = (
+        Index("ix_market_price_history_bucket", "bucket_start"),
+    )
 
 
 class Trade(Base):

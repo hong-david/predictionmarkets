@@ -9,6 +9,11 @@ from app.db.models import Market, MarketMetric, MarketSnapshot
 from app.services.classifier import CLASSIFIER_VERSION, classify
 from app.services.decimal_utils import parse_decimal
 from app.services.market_metrics import upsert_quote_metrics
+from app.services.market_price_history import (
+    bulk_upsert_chart_history,
+    quote_history_row,
+    should_write_quote_history,
+)
 from app.services.retention import is_market_in_scope, storage_decision_for_event
 from app.services.snapshot_dedup import should_skip_duplicate_snapshot
 
@@ -313,6 +318,7 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
 
     if metric_updates:
         db.flush()
+        chart_history_rows: list[dict] = []
         for update in metric_updates:
             market = update["market"]
             snapshot = update["snapshot"]
@@ -337,6 +343,21 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
                 liquidity_dollars=update["liq"],
                 decision=decision,
             )
+            event_ts = snapshot.ts or now
+            if should_write_quote_history(int(market.id), event_ts):
+                chart_row = quote_history_row(
+                    market_pk=market.id,
+                    event_ts=event_ts,
+                    last_price_dollars=update["lp"],
+                    yes_bid_dollars=update["yb"],
+                    yes_ask_dollars=update["ya"],
+                    volume_24h_fp=update["v24"],
+                    open_interest_fp=update["oi"],
+                )
+                if chart_row:
+                    chart_history_rows.append(chart_row)
+        if chart_history_rows:
+            bulk_upsert_chart_history(db, chart_history_rows)
 
     db.commit()
 

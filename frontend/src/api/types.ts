@@ -191,11 +191,17 @@ export interface TapeCluster {
 
 export interface SnapshotPoint {
   ts: string | null;
+  market_pk?: number;
   yes_bid: number | null;
   yes_ask: number | null;
   last_price: number | null;
   volume_24h: number | null;
   open_interest: number | null;
+  source?: string | null;
+  interval_sec?: number | null;
+  price_source?: string | null;
+  trade_count?: number | null;
+  quote_count?: number | null;
 }
 
 export interface MarketSeries {

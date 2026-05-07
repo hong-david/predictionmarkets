@@ -55,6 +55,7 @@ from app.db.models import (
     Market,
     MarketMetric,
     MarketNewsProfile,
+    MarketPriceHistory,
     MarketSnapshot,
     NewsArticle,
     NewsEvent,
@@ -73,6 +74,7 @@ from app.services.market_lifecycle import (
     market_scope_filters as _market_scope_filters,
     normalize_market_scope as _normalize_market_scope,
 )
+from app.services.market_price_history import DEFAULT_CHART_HISTORY_INTERVAL_SEC
 from app.services.market_taxonomy import (
     category_family_for_market,
     is_sports_market,
@@ -578,6 +580,33 @@ def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
         "open_interest": float(snapshot.open_interest_fp)
         if snapshot.open_interest_fp is not None
         else None,
+    }
+
+
+def _chart_history_snapshot_payload(row: MarketPriceHistory) -> dict:
+    source = row.close_price_source
+    last_price = (
+        row.close_price_dollars
+        if source in {"trade", "last_price"}
+        else None
+    )
+    return {
+        "ts": row.bucket_start.isoformat() if row.bucket_start else None,
+        "market_pk": row.market_pk,
+        "yes_bid": _probability_float(row.close_yes_bid_dollars),
+        "yes_ask": _probability_float(row.close_yes_ask_dollars),
+        "last_price": _probability_float(last_price),
+        "volume_24h": float(row.close_volume_24h_fp)
+        if row.close_volume_24h_fp is not None
+        else None,
+        "open_interest": float(row.close_open_interest_fp)
+        if row.close_open_interest_fp is not None
+        else None,
+        "source": "chart_history",
+        "interval_sec": row.interval_sec,
+        "price_source": source,
+        "trade_count": int(row.trade_count or 0),
+        "quote_count": int(row.quote_count or 0),
     }
 
 
@@ -3334,13 +3363,30 @@ def get_market_series(
     trade_rows = trade_query.order_by(Trade.ts.desc(), Trade.id.desc()).limit(limit).all()
     trade_rows = list(reversed(trade_rows))
 
-    snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market.id)
+    history_query = db.query(MarketPriceHistory).filter(
+        MarketPriceHistory.market_pk == market.id,
+        MarketPriceHistory.interval_sec == DEFAULT_CHART_HISTORY_INTERVAL_SEC,
+    )
     if since_dt is not None:
-        snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
-    snap_rows = snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc()).limit(
-        min(limit, 1000)
-    ).all()
-    snap_rows = list(reversed(snap_rows))
+        history_query = history_query.filter(MarketPriceHistory.bucket_start > since_dt)
+    history_rows = (
+        history_query.order_by(MarketPriceHistory.bucket_start.desc())
+        .limit(min(limit, 1000))
+        .all()
+    )
+    history_rows = list(reversed(history_rows))
+
+    snap_rows: list[MarketSnapshot] = []
+    if not history_rows:
+        snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market.id)
+        if since_dt is not None:
+            snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
+        snap_rows = (
+            snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
+            .limit(min(limit, 1000))
+            .all()
+        )
+        snap_rows = list(reversed(snap_rows))
 
     trade_payloads = [
         {
@@ -3358,7 +3404,11 @@ def get_market_series(
         }
         for t in trade_rows
     ]
-    snapshot_payloads = [_snapshot_payload(s) for s in snap_rows]
+    snapshot_payloads = (
+        [_chart_history_snapshot_payload(row) for row in history_rows]
+        if history_rows
+        else [_snapshot_payload(s) for s in snap_rows]
+    )
     explanations = explain_trades_against_window(trade_payloads, window=50)
     contextual: list[dict | None] = []
     if include_context:

@@ -34,6 +34,13 @@ from app.services.market_metrics import (
     quote_metric_values,
     upsert_quote_metrics,
 )
+from app.services.market_price_history import (
+    bulk_upsert_chart_history,
+    quote_history_row,
+    should_write_quote_history,
+    trade_history_row,
+    upsert_chart_history,
+)
 from app.services.pipeline_heartbeat import (
     mark_pipeline_error,
     mark_pipeline_start,
@@ -865,6 +872,7 @@ def handle_ticker_messages_batch(messages: list[dict]) -> None:
 
         snapshots_to_add: list[tuple[MarketSnapshot, dict, Market, StorageDecision]] = []
         metric_rows: list[dict] = []
+        chart_history_rows: list[dict] = []
         metric_heartbeat_decision: StorageDecision | None = None
 
         for row, market in rows_with_markets:
@@ -879,6 +887,18 @@ def handle_ticker_messages_batch(messages: list[dict]) -> None:
                 open_interest_fp=row["open_interest_fp"],
             )
             metric_heartbeat_decision = decision
+            if should_write_quote_history(int(market.id), now):
+                chart_row = quote_history_row(
+                    market_pk=market.id,
+                    event_ts=now,
+                    last_price_dollars=row["last_price_dollars"],
+                    yes_bid_dollars=row["yes_bid_dollars"],
+                    yes_ask_dollars=row["yes_ask_dollars"],
+                    volume_24h_fp=row["volume_24h_fp"],
+                    open_interest_fp=row["open_interest_fp"],
+                )
+                if chart_row:
+                    chart_history_rows.append(chart_row)
             latest_snapshot = latest_snapshot_by_pk.get(int(market.id))
             is_duplicate = (
                 latest_snapshot is not None
@@ -1005,6 +1025,8 @@ def handle_ticker_messages_batch(messages: list[dict]) -> None:
                 heartbeat_decision=metric_heartbeat_decision,
             )
             _WS_METRICS["ticker_metrics_upserted"] += len(metric_rows)
+        if chart_history_rows:
+            bulk_upsert_chart_history(db, chart_history_rows)
         db.commit()
     except Exception:
         db.rollback()
@@ -1051,6 +1073,20 @@ def handle_ticker_message(data: dict) -> None:
             volume_24h_fp=v24,
             open_interest_fp=oi,
         )
+        now = datetime.now(timezone.utc)
+        if should_write_quote_history(int(market.id), now):
+            upsert_chart_history(
+                db,
+                quote_history_row(
+                    market_pk=market.id,
+                    event_ts=now,
+                    last_price_dollars=lp,
+                    yes_bid_dollars=yb,
+                    yes_ask_dollars=ya,
+                    volume_24h_fp=v24,
+                    open_interest_fp=oi,
+                ),
+            )
         if should_skip_duplicate_snapshot(
             db,
             market.id,
@@ -1254,6 +1290,15 @@ def handle_trade_message(data: dict) -> None:
             )
 
         if wrote_trade:
+            upsert_chart_history(
+                db,
+                trade_history_row(
+                    market_pk=market.id,
+                    trade_ts=ts,
+                    yes_price_dollars=yes_price,
+                    count_fp=count,
+                ),
+            )
             bump_trade_metrics(db, market_pk=market.id, trade_ts=ts)
         db.commit()
 
