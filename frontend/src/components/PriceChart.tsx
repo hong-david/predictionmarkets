@@ -17,6 +17,7 @@ import { useEffect, useRef } from "react";
 import type {
   AnomalyRow,
   MarketSeries,
+  TradePoint,
 } from "@/api/types";
 import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
 
@@ -29,8 +30,16 @@ export interface ChartNewsEvent {
 }
 
 const MARKET_ALERT_MARKER_MIN_SCORE = 5.0;
+const MAX_ALERT_MARKERS = 3;
+const MAX_TRADE_OUTLIER_MARKERS = 3;
 const DISPLAY_SERIES_TARGET_MAX_POINTS = 2200;
 const DISPLAY_BUCKET_INTERVALS_SEC = [60, 300, 900, 3600, 14400, 86400];
+
+type MarkerLabel = {
+  time: UTCTimestamp;
+  text: string;
+  source: "alert" | "trade" | "selected";
+};
 
 type DisplayObservation = {
   unix: number;
@@ -75,11 +84,13 @@ type DisplaySeries = {
 export function PriceChart({
   series,
   anomalies,
+  tradeOutliers,
   highlightTs,
   newsEvents,
 }: {
   series: MarketSeries | undefined;
   anomalies: AnomalyRow[] | undefined;
+  tradeOutliers?: TradePoint[];
   highlightTs?: string | null;
   newsEvents?: ChartNewsEvent[];
 }) {
@@ -92,6 +103,7 @@ export function PriceChart({
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const lineTimesRef = useRef<Time[]>([]);
   const newsEventsRef = useRef<ChartNewsEvent[]>([]);
+  const markerLabelsRef = useRef<MarkerLabel[]>([]);
   const yRangeRef = useRef<{ minValue: number; maxValue: number }>({
     minValue: 0,
     maxValue: 1,
@@ -194,11 +206,12 @@ export function PriceChart({
     volumeRef.current = volume;
 
     const redrawNewsLines = () => {
-      renderNewsLineOverlay(
+      renderOverlayAnnotations(
         chart,
         overlayRef.current,
         lineTimesRef.current,
         newsEventsRef.current,
+        markerLabelsRef.current,
       );
     };
     chart.timeScale().subscribeVisibleTimeRangeChange(redrawNewsLines);
@@ -224,7 +237,8 @@ export function PriceChart({
       volumeRef.current.setData([]);
       lineTimesRef.current = [];
       newsEventsRef.current = [];
-      clearNewsLineOverlay(overlayRef.current);
+      markerLabelsRef.current = [];
+      clearOverlay(overlayRef.current);
       return;
     }
 
@@ -264,68 +278,131 @@ export function PriceChart({
           : askRef.current;
     if (markerSeries && lineTimesRef.current.length) {
       const sortedTimes = lineTimesRef.current;
-      // One marker per bar time: same clock second can have many materialized rows.
-      const byTime = new Map<number, { score: number; text: string; severity: string }>();
-      for (const a of anomalies ?? []) {
+      const chartMarkers: Array<{
+        time: UTCTimestamp;
+        color: string;
+        text: string;
+        rank: number;
+        source: "alert" | "trade" | "selected";
+      }> = [];
+
+      const topAlerts = [...(anomalies ?? [])]
+        .filter(
+          (a) =>
+            !!a.created_at &&
+            a.score >= MARKET_ALERT_MARKER_MIN_SCORE &&
+            a.severity !== "none" &&
+            a.severity !== "low",
+        )
+        .sort(
+          (a, b) =>
+            b.score - a.score ||
+            String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")),
+        )
+        .slice(0, MAX_ALERT_MARKERS);
+
+      for (const a of topAlerts) {
         if (!a.created_at) continue;
-        if (a.severity === "none" || a.severity === "low" || a.score <= 0) continue;
-        // Suppress low-signal historical rows so arrows mark only review-worthy moves.
-        if (a.score < MARKET_ALERT_MARKER_MIN_SCORE) continue;
         const target = Math.floor(new Date(a.created_at).getTime() / 1000);
         const t = nearestTime(sortedTimes, target);
         if (t == null) continue;
         const hint =
           a.reasons && a.reasons.length > 0
             ? a.reasons[0].slice(0, 28)
-            : "flag";
-        const k = t as number;
-        const text = `${hint} · ${a.score.toFixed(1)}`;
-        const prev = byTime.get(k);
-        if (!prev || a.score > prev.score) {
-          byTime.set(k, { score: a.score, text, severity: a.severity });
-        }
+            : "alert";
+        chartMarkers.push({
+          time: t,
+          color: "rgba(245, 158, 11, 0.95)",
+          text: `${hint} · ${a.score.toFixed(1)}`,
+          rank: a.score,
+          source: "alert",
+        });
+      }
+
+      const topTrades = [...(tradeOutliers ?? [])]
+        .filter((t) => !!t.ts && t.suspicion != null && t.suspicion > 0)
+        .sort(
+          (a, b) =>
+            (b.suspicion ?? 0) - (a.suspicion ?? 0) ||
+            String(b.ts ?? "").localeCompare(String(a.ts ?? "")),
+        )
+        .slice(0, MAX_TRADE_OUTLIER_MARKERS);
+      for (const t of topTrades) {
+        if (!t.ts) continue;
+        const target = Math.floor(new Date(t.ts).getTime() / 1000);
+        const snapped = nearestTime(sortedTimes, target);
+        if (snapped == null) continue;
+        const dollars = t.trade_dollar_amount ?? estimateTradeDollars(t);
+        const dollarsText = dollars == null ? "$?" : formatAbbrevDollars(dollars);
+        chartMarkers.push({
+          time: snapped,
+          color: "rgba(231, 76, 60, 0.98)",
+          text: `outlier ${dollarsText} · ${(t.suspicion ?? 0).toFixed(1)}`,
+          rank: t.suspicion ?? 0,
+          source: "trade",
+        });
       }
       if (highlightTs) {
         const target = Math.floor(new Date(highlightTs).getTime() / 1000);
         if (Number.isFinite(target)) {
           const t = nearestTime(sortedTimes, target);
           if (t != null) {
-            byTime.set(t as number, {
-              score: 999,
+            chartMarkers.push({
+              time: t,
+              color: "rgba(78, 161, 255, 1)",
               text: "selected unusual print",
-              severity: "selected",
+              rank: 999,
+              source: "selected",
             });
           }
         }
       }
-      const markers: SeriesMarker<Time>[] = Array.from(byTime.entries())
-        .sort((a, b) => a[0] - b[0])
-        .map(([ts, m]) => ({
-          time: ts as UTCTimestamp,
+
+      const dedupedByTime = new Map<number, (typeof chartMarkers)[number]>();
+      for (const marker of chartMarkers) {
+        const key = marker.time as number;
+        const existing = dedupedByTime.get(key);
+        if (!existing || marker.rank > existing.rank) {
+          dedupedByTime.set(key, marker);
+        }
+      }
+
+      const merged = Array.from(dedupedByTime.values()).sort(
+        (a, b) => (a.time as number) - (b.time as number),
+      );
+      markerLabelsRef.current = merged.map((m) => ({
+        time: m.time,
+        text: m.text,
+        source: m.source,
+      }));
+      const markers: SeriesMarker<Time>[] = merged.map((m) => ({
+          time: m.time,
           position: "aboveBar" as const,
-          color: severityColor(m.severity),
+          color: m.color,
           shape: "arrowDown" as const,
-          text: m.text,
+          text: "",
         }));
       markerSeries.setMarkers(markers);
     } else {
       priceRef.current.setMarkers([]);
       bidRef.current?.setMarkers([]);
       askRef.current?.setMarkers([]);
+      markerLabelsRef.current = [];
     }
 
     chartRef.current?.timeScale().fitContent();
     requestAnimationFrame(() => {
       if (chartRef.current) {
-        renderNewsLineOverlay(
+        renderOverlayAnnotations(
           chartRef.current,
           overlayRef.current,
           lineTimesRef.current,
           newsEventsRef.current,
+          markerLabelsRef.current,
         );
       }
     });
-  }, [series, anomalies, highlightTs, newsEvents]);
+  }, [series, anomalies, tradeOutliers, highlightTs, newsEvents]);
 
   return (
     <div className="relative h-[420px] w-full" aria-label="Price and volume chart">
@@ -636,13 +713,6 @@ function dynamicProbabilityRange(values: number[]): { minValue: number; maxValue
   return { minValue: lo, maxValue: hi };
 }
 
-function severityColor(s: string): string {
-  if (s === "selected") return "rgba(78, 161, 255, 1)";
-  if (s === "high") return "rgba(231, 76, 60, 0.95)";
-  if (s === "medium") return "rgba(241, 196, 15, 0.95)";
-  return "rgba(46, 204, 113, 0.95)";
-}
-
 function nearestTime(
   sortedTimes: Time[],
   target: number,
@@ -668,54 +738,94 @@ function nearestTime(
     : (sortedTimes[i] as UTCTimestamp);
 }
 
-function clearNewsLineOverlay(overlay: HTMLDivElement | null): void {
+function clearOverlay(overlay: HTMLDivElement | null): void {
   if (overlay) overlay.replaceChildren();
 }
 
-function renderNewsLineOverlay(
+function renderOverlayAnnotations(
   chart: IChartApi,
   overlay: HTMLDivElement | null,
   sortedTimes: Time[],
   events: ChartNewsEvent[],
+  markerLabels: MarkerLabel[],
 ): void {
   if (!overlay) return;
   overlay.replaceChildren();
-  if (!sortedTimes.length || !events.length) return;
+  if (!sortedTimes.length) return;
 
   const first = sortedTimes[0] as number;
   const last = sortedTimes[sortedTimes.length - 1] as number;
-  const seen = new Set<number>();
-  const visibleEvents = events
-    .map((event) => ({ event, unix: event.ts ? parseChartUnix(event.ts) : null }))
-    .filter((row): row is { event: ChartNewsEvent; unix: number } => row.unix != null)
-    .filter((row) => row.unix >= first && row.unix <= last)
-    .sort((a, b) => a.unix - b.unix)
-    .slice(0, 16);
+  if (events.length) {
+    const seen = new Set<number>();
+    const visibleEvents = events
+      .map((event) => ({ event, unix: event.ts ? parseChartUnix(event.ts) : null }))
+      .filter((row): row is { event: ChartNewsEvent; unix: number } => row.unix != null)
+      .filter((row) => row.unix >= first && row.unix <= last)
+      .sort((a, b) => a.unix - b.unix)
+      .slice(0, 16);
 
-  for (const { event, unix } of visibleEvents) {
-    let x = chart.timeScale().timeToCoordinate(unix as UTCTimestamp);
-    if (x == null) {
-      const snapped = nearestTime(sortedTimes, unix);
-      x = snapped == null ? null : chart.timeScale().timeToCoordinate(snapped);
+    for (const { event, unix } of visibleEvents) {
+      let x = chart.timeScale().timeToCoordinate(unix as UTCTimestamp);
+      if (x == null) {
+        const snapped = nearestTime(sortedTimes, unix);
+        x = snapped == null ? null : chart.timeScale().timeToCoordinate(snapped);
+      }
+      if (x == null || x < 0 || x > overlay.clientWidth) continue;
+      const key = Math.round(x);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const line = document.createElement("div");
+      line.className =
+        "absolute top-0 bottom-7 w-px bg-[hsl(var(--severity-medium))]/75";
+      line.style.left = `${x}px`;
+      overlay.append(line);
+
+      const label = document.createElement("div");
+      label.className =
+        "absolute top-2 rounded-sm border border-[hsl(var(--severity-medium))]/50 bg-card/90 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-foreground shadow-sm";
+      label.textContent = event.direction_label
+        ? `news ${event.direction_label.replace("supports_", "")}`
+        : "news";
+      label.style.left = `${Math.min(Math.max(x + 4, 4), Math.max(4, overlay.clientWidth - 86))}px`;
+      overlay.append(label);
     }
-    if (x == null || x < 0 || x > overlay.clientWidth) continue;
-    const key = Math.round(x);
-    if (seen.has(key)) continue;
-    seen.add(key);
+  }
 
-    const line = document.createElement("div");
-    line.className =
-      "absolute top-0 bottom-7 w-px bg-[hsl(var(--severity-medium))]/75";
-    line.style.left = `${x}px`;
-    overlay.append(line);
+  if (!markerLabels.length) return;
+  const laneEnds = [-Infinity, -Infinity, -Infinity, -Infinity];
+  const sorted = [...markerLabels]
+    .map((label) => ({
+      ...label,
+      x: chart.timeScale().timeToCoordinate(label.time),
+    }))
+    .filter((row) => row.x != null)
+    .map((row) => ({
+      ...row,
+      x: Number(row.x),
+    }))
+    .filter((row) => row.x >= 0 && row.x <= overlay.clientWidth)
+    .sort((a, b) => a.x - b.x);
+  for (const item of sorted) {
+    const width = Math.min(220, 16 + item.text.length * 6.2);
+    const left = Math.max(4, Math.min(item.x + 6, Math.max(4, overlay.clientWidth - width - 4)));
+    const right = left + width;
+    let lane = 0;
+    while (lane < laneEnds.length - 1 && laneEnds[lane] > left - 8) lane += 1;
+    laneEnds[lane] = right;
 
     const label = document.createElement("div");
+    const palette =
+      item.source === "trade"
+        ? "border-[rgba(231,76,60,0.75)] bg-[rgba(120,20,20,0.85)] text-[rgba(255,220,220,1)]"
+        : item.source === "alert"
+          ? "border-[rgba(245,158,11,0.75)] bg-[rgba(92,53,10,0.86)] text-[rgba(255,229,188,1)]"
+          : "border-[rgba(78,161,255,0.8)] bg-[rgba(17,48,84,0.88)] text-[rgba(220,238,255,1)]";
     label.className =
-      "absolute top-2 rounded-sm border border-[hsl(var(--severity-medium))]/50 bg-card/90 px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-foreground shadow-sm";
-    label.textContent = event.direction_label
-      ? `news ${event.direction_label.replace("supports_", "")}`
-      : "news";
-    label.style.left = `${Math.min(Math.max(x + 4, 4), Math.max(4, overlay.clientWidth - 86))}px`;
+      `absolute rounded-sm border px-1.5 py-0.5 text-[10px] tracking-wide shadow-sm ${palette}`;
+    label.style.left = `${left}px`;
+    label.style.top = `${4 + lane * 18}px`;
+    label.textContent = item.text;
     overlay.append(label);
   }
 }
@@ -724,4 +834,19 @@ function parseChartUnix(value: string): number | null {
   const ms = new Date(value).getTime();
   if (!Number.isFinite(ms)) return null;
   return Math.floor(ms / 1000);
+}
+
+function estimateTradeDollars(t: TradePoint): number | null {
+  if (t.count == null) return null;
+  const side = (t.taker_side ?? "").toLowerCase();
+  const price =
+    side === "no" && t.no_price != null ? t.no_price : t.yes_price ?? t.no_price;
+  return price == null ? null : t.count * price;
+}
+
+function formatAbbrevDollars(value: number): string {
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) return `$${(value / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `$${(value / 1_000).toFixed(1)}K`;
+  return `$${value.toFixed(0)}`;
 }

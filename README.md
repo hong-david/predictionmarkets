@@ -486,6 +486,17 @@ Scores are also separated:
 
 ## Changelog
 
+### 2026-05-07
+
+- Market detail chart overlays now show up to three saved market alerts and up to
+  three local trade outliers at once, each snapped to chart time with arrow
+  markers for faster visual triage.
+- Marker labels are now source-colored and non-overlapping in the chart overlay:
+  market alerts render orange; local trade outliers render red.
+- Trade-outlier chart labels now include estimated trade dollars plus the local
+  outlier score so analysts can compare magnitude and score in one glance.
+- Reverted `dedd3fa` so ongoing changes build from `c7a6c40` as the branch base.
+
 ### 2026-05-01
 
 - `warm_dashboard_cache_once` now primes Redis for `GET /api/dashboard/overview`

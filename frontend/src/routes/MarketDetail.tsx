@@ -342,7 +342,7 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="The main line uses a temporary display series: retained trades and explicit last-price snapshots first, then quote midpoint to fill sparse periods on a uniform time grid. Bid and ask quotes are shown separately. Crosshair: your browser local time, plus ET and UTC. Arrows: saved alert rows on quotes. Pan and zoom."
+          subtitle="The main line uses a temporary display series: retained trades and explicit last-price snapshots first, then quote midpoint to fill sparse periods on a uniform time grid. Bid and ask quotes are shown separately. Crosshair: your browser local time, plus ET and UTC. Arrows: top 3 saved market alerts (orange) and top 3 local trade outliers (red). Pan and zoom."
           right={
             series.data
               ? [
@@ -373,6 +373,7 @@ export default function MarketDetailPage() {
               <PriceChart
                 series={series.data}
                 anomalies={anomalies.data?.anomalies}
+                tradeOutliers={topSuspiciousTrades.slice(0, 3)}
                 highlightTs={highlightedTradeTs}
                 newsEvents={chartNewsEvents}
               />
