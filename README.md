@@ -496,6 +496,11 @@ Scores are also separated:
 - Trade-outlier chart labels now include estimated trade dollars plus the local
   outlier score so analysts can compare magnitude and score in one glance.
 - Reverted `dedd3fa` so ongoing changes build from `c7a6c40` as the branch base.
+- Reverted `dedd3fa` on `main` (`Revert "Disable scheduled retention deletes"`)
+  so scheduled retention flags in `docker-compose.budget.yml` are restored.
+- Hardened deploy step in `.github/workflows/ci-cd.yml` to clean stale app/pipeline
+  containers and remove compose orphans before `up -d`, preventing EC2 deploy
+  failures such as `container name "/predictionmarkets-pipeline-1" is already in use`.
 
 ### 2026-05-01
 

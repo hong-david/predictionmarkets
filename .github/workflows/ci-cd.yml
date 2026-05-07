@@ -122,5 +122,10 @@ jobs:
           git pull --ff-only origin main
           docker compose -f docker-compose.budget.yml build app pipeline
           docker compose -f docker-compose.budget.yml run --rm app python -m alembic upgrade head
+          # Clean up stale named containers/orphans from interrupted prior runs so
+          # compose can recreate app/pipeline without name conflicts.
+          docker compose -f docker-compose.budget.yml rm -f app pipeline || true
+          docker compose -f docker-compose.budget.yml down --remove-orphans || true
+          docker rm -f predictionmarkets-app-1 predictionmarkets-pipeline-1 >/dev/null 2>&1 || true
           docker compose -f docker-compose.budget.yml up -d app pipeline
           docker compose -f docker-compose.budget.yml ps
