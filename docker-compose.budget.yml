@@ -121,6 +121,19 @@ services:
       - "14"
       - --retention-batch-size
       - "2500"
+      - --with-anomaly-retention
+      - --anomaly-retention-execute
+      - --anomaly-retention-analyze
+      - --anomaly-retention-interval-seconds
+      - "21600"
+      - --anomaly-retention-cutoff-days
+      - "7"
+      - --anomaly-retention-severities
+      - none,low
+      - --anomaly-retention-batch-size
+      - "2500"
+      - --anomaly-retention-max-batches
+      - "20"
       - --with-dashboard-cache-warmer
       - --dashboard-cache-warm-interval-seconds
       - "240"
