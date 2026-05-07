@@ -138,6 +138,10 @@ def _cached_dashboard_payload(
         try:
             raw = r.get(redis_key)
             if raw:
+                # The dashboard warmer runs more frequently than the TTL, but
+                # a cache hit does not refresh Redis expiry by default. Keep
+                # warmed keys alive between warmer passes.
+                r.expire(redis_key, max(1, int(ttl)))
                 return orjson.loads(raw)  # type: ignore[return-value]
         except Exception as exc:
             logger.debug("dashboard redis cache read failed: %s", exc)
@@ -145,6 +149,11 @@ def _cached_dashboard_payload(
     with _dashboard_cache_lock:
         cached = _dashboard_cache.get(key)
         if cached and now - cached[0] < ttl:
+            if r is not None:
+                try:
+                    r.setex(redis_key, max(1, int(ttl)), orjson.dumps(cached[1]))
+                except Exception as exc:
+                    logger.debug("dashboard redis cache write failed: %s", exc)
             return cached[1]  # type: ignore[return-value]
 
     payload = build()
