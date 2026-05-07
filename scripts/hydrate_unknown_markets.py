@@ -22,9 +22,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import re
 import time
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, or_
 
@@ -122,56 +121,6 @@ def hydrate_unknown_tickers(
         flush=True,
     )
     return {"hydrated": hydrated, "missing": missing, "errored": errored}
-
-
-
-
-_SCHEDULED_DATE_TOKEN_RE = re.compile(
-    r"(\d{2}(?:JAN|MAR|MAY|JUL|AUG|OCT|DEC)(?:0[1-9]|[12][0-9]|3[01])"
-    r"|\d{2}(?:APR|JUN|SEP|NOV)(?:0[1-9]|[12][0-9]|30)"
-    r"|\d{2}FEB(?:0[1-9]|1[0-9]|2[0-9]))",
-    re.IGNORECASE,
-)
-
-_MONTH_NUMBERS = {
-    "JAN": 1,
-    "FEB": 2,
-    "MAR": 3,
-    "APR": 4,
-    "MAY": 5,
-    "JUN": 6,
-    "JUL": 7,
-    "AUG": 8,
-    "SEP": 9,
-    "OCT": 10,
-    "NOV": 11,
-    "DEC": 12,
-}
-
-
-def _market_id_has_non_stale_date(market_id: str, today: date) -> bool:
-    """Return False for tickers with an embedded YYMONDD date before today.
-
-    Tickers without an embedded date are kept because many series markets encode
-    teams/rounds rather than a concrete event date.
-    """
-    match = _SCHEDULED_DATE_TOKEN_RE.search(market_id or "")
-    if match is None:
-        return True
-
-    token = match.group(1).upper()
-    try:
-        token_date = date(
-            2000 + int(token[:2]),
-            _MONTH_NUMBERS[token[2:5]],
-            int(token[5:]),
-        )
-    except (KeyError, ValueError):
-        return True
-
-    return token_date >= today
-
-
 def select_active_lifecycle_refresh_tickers(
     *,
     max_markets: int | None,
@@ -185,11 +134,13 @@ def select_active_lifecycle_refresh_tickers(
     have not been touched recently and lets per-market REST correct status and
     close_time through the normal ingestor path.
 
-    We exclude obviously stale dated tickers in Python instead of SQL because
-    PostgreSQL substring/regex capture behavior can return only a capture group.
+    Dated scheduled markets are deliberately included. The dashboard can label
+    an old dated ticker historical even if Kalshi status is lagging locally,
+    but keeping the raw DB status stale makes retention and audits harder.
+    The bounded per-market refresh is the cheap way to let Kalshi correct
+    those rows to finalized/settled without sweeping the whole universe.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)
-    today = datetime.now(timezone.utc).date()
     fetch_limit = max_markets * 20 if max_markets is not None else None
 
     db = SessionLocal()
@@ -219,9 +170,6 @@ def select_active_lifecycle_refresh_tickers(
         tickers: list[str] = []
         for row in q.all():
             ticker = row[0]
-            if not _market_id_has_non_stale_date(ticker, today):
-                continue
-
             tickers.append(ticker)
             if max_markets is not None and len(tickers) >= max_markets:
                 break
