@@ -342,7 +342,7 @@ def main() -> None:
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
     parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--watch", action="store_true")
-    parser.add_argument("--interval-seconds", type=int, default=21_600)
+    parser.add_argument("--interval-seconds", type=float, default=21_600.0)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
