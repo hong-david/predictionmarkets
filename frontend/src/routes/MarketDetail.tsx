@@ -342,7 +342,7 @@ export default function MarketDetailPage() {
       <Card>
         <CardHeader
           title="Price and volume over time"
-          subtitle="Trades are plotted when available. If no trades exist, the chart still uses collected quote snapshots: bid/ask and quote-derived pricing over time. Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. Arrows: saved alert rows on quotes. Pan and zoom."          right={
+          subtitle="The main line uses retained trades and explicit last-price snapshots. Bid and ask quotes are shown separately; midpoint is not plotted as price. Crosshair: your browser’s local time, plus ET and UTC. Compare to Kalshi in the same contract ticker and time zone. Arrows: saved alert rows on quotes. Pan and zoom."          right={
             series.data
               ? [
                   `${fmtInt(series.data.trades.length)} trades`,

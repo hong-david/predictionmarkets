@@ -17,7 +17,6 @@ import { useEffect, useRef } from "react";
 import type {
   AnomalyRow,
   MarketSeries,
-  SnapshotPoint,
   TradePoint,
 } from "@/api/types";
 import { fmtTimeEastern, fmtTimeUtc } from "@/lib/utils";
@@ -75,6 +74,8 @@ export function PriceChart({
   const overlayRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const priceRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const bidRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const askRef = useRef<ISeriesApi<"Line"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const lineTimesRef = useRef<Time[]>([]);
   const newsEventsRef = useRef<ChartNewsEvent[]>([]);
@@ -139,6 +140,36 @@ export function PriceChart({
     });
     priceRef.current = price;
 
+    const bid = chart.addLineSeries({
+      lineType: LineType.WithSteps,
+      color: "rgba(46, 204, 113, 0.5)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      priceFormat: { type: "price", precision: 3, minMove: 0.001 },
+      crosshairMarkerVisible: false,
+      autoscaleInfoProvider: () => ({
+        priceRange: yRangeRef.current,
+      }),
+    });
+    bidRef.current = bid;
+
+    const ask = chart.addLineSeries({
+      lineType: LineType.WithSteps,
+      color: "rgba(231, 76, 60, 0.5)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      priceFormat: { type: "price", precision: 3, minMove: 0.001 },
+      crosshairMarkerVisible: false,
+      autoscaleInfoProvider: () => ({
+        priceRange: yRangeRef.current,
+      }),
+    });
+    askRef.current = ask;
+
     const volume = chart.addHistogramSeries({
       color: "rgba(78, 161, 255, 0.35)",
       priceFormat: { type: "volume" },
@@ -164,6 +195,8 @@ export function PriceChart({
       chart.remove();
       chartRef.current = null;
       priceRef.current = null;
+      bidRef.current = null;
+      askRef.current = null;
       volumeRef.current = null;
     };
   }, []);
@@ -173,6 +206,8 @@ export function PriceChart({
     if (!priceRef.current || !volumeRef.current) return;
     if (!series) {
       priceRef.current.setData([]);
+      bidRef.current?.setData([]);
+      askRef.current?.setData([]);
       volumeRef.current.setData([]);
       lineTimesRef.current = [];
       newsEventsRef.current = [];
@@ -181,14 +216,18 @@ export function PriceChart({
     }
 
     const linePoints: LineData[] = [];
+    const bidPoints: LineData[] = [];
+    const askPoints: LineData[] = [];
     const volumePoints: HistogramData[] = [];
     const lineSeenTimes = new Set<number>();
+    const bidSeenTimes = new Set<number>();
+    const askSeenTimes = new Set<number>();
     const volumeSeenTimes = new Set<number>();
     const priceCandidates = [
       ...series.snapshots
         .map((snapshot) => ({
           ts: snapshot.ts,
-          value: snapshotDisplayPrice(snapshot),
+          value: snapshot.last_price,
           sourceRank: 0,
         }))
         .filter(
@@ -213,6 +252,14 @@ export function PriceChart({
     for (const point of priceCandidates) {
       addUniqueLinePoint(linePoints, lineSeenTimes, point.ts, point.value);
     }
+    for (const snapshot of series.snapshots) {
+      if (snapshot.ts && snapshot.yes_bid != null) {
+        addUniqueLinePoint(bidPoints, bidSeenTimes, snapshot.ts, snapshot.yes_bid);
+      }
+      if (snapshot.ts && snapshot.yes_ask != null) {
+        addUniqueLinePoint(askPoints, askSeenTimes, snapshot.ts, snapshot.yes_ask);
+      }
+    }
     for (const t of series.trades) {
       if (!t.ts) continue;
       // lightweight-charts requires unique timestamps within each series.
@@ -226,18 +273,30 @@ export function PriceChart({
       });
     }
 
-    yRangeRef.current = dynamicProbabilityRange(linePoints.map((p) => p.value));
-    lineTimesRef.current = linePoints.map((p) => p.time);
+    const allLinePoints = [...linePoints, ...bidPoints, ...askPoints];
+    yRangeRef.current = dynamicProbabilityRange(allLinePoints.map((p) => p.value));
+    lineTimesRef.current = uniqueSortedTimes(allLinePoints);
     newsEventsRef.current = newsEvents ?? [];
     priceRef.current.setData(linePoints);
+    bidRef.current?.setData(bidPoints);
+    askRef.current?.setData(askPoints);
     volumeRef.current.setData(volumePoints);
+    priceRef.current.setMarkers([]);
+    bidRef.current?.setMarkers([]);
+    askRef.current?.setMarkers([]);
 
     // Anomaly markers: snap to the nearest trade timestamp on the
     // existing time series so the marker has a y-coordinate. If we have
     // no trades but do have anomalies, the time scale won't include
     // their x-position and lightweight-charts will silently drop them.
-    if (priceRef.current && linePoints.length) {
-      const sortedTimes = linePoints.map((p) => p.time);
+    const markerSeries =
+      linePoints.length > 0
+        ? priceRef.current
+        : bidPoints.length > 0
+          ? bidRef.current
+          : askRef.current;
+    if (markerSeries && lineTimesRef.current.length) {
+      const sortedTimes = lineTimesRef.current;
       // One marker per bar time: same clock second can have many materialized rows.
       const byTime = new Map<number, { score: number; text: string; severity: string }>();
       for (const a of anomalies ?? []) {
@@ -281,9 +340,11 @@ export function PriceChart({
           shape: "arrowDown" as const,
           text: m.text,
         }));
-      priceRef.current.setMarkers(markers);
+      markerSeries.setMarkers(markers);
     } else {
       priceRef.current.setMarkers([]);
+      bidRef.current?.setMarkers([]);
+      askRef.current?.setMarkers([]);
     }
 
     chartRef.current?.timeScale().fitContent();
@@ -334,12 +395,6 @@ function formatLocalChartTime(t: Time): string {
   return "";
 }
 
-function snapshotDisplayPrice(s: SnapshotPoint): number | null {
-  if (s.last_price != null) return s.last_price;
-  if (s.yes_bid != null && s.yes_ask != null) return (s.yes_bid + s.yes_ask) / 2;
-  return s.yes_bid ?? s.yes_ask ?? null;
-}
-
 function uniqueChartTime(seenTimes: Set<number>, ts: string): UTCTimestamp | null {
   const raw = new Date(ts).getTime();
   if (!Number.isFinite(raw)) return null;
@@ -358,6 +413,12 @@ function addUniqueLinePoint(
   const time = uniqueChartTime(seenTimes, ts);
   if (time == null) return;
   out.push({ time, value: clampProbability(value) });
+}
+
+function uniqueSortedTimes(points: LineData[]): Time[] {
+  return Array.from(new Set(points.map((p) => p.time as number)))
+    .sort((a, b) => a - b)
+    .map((t) => t as UTCTimestamp);
 }
 
 function takerColor(t: TradePoint): string {
