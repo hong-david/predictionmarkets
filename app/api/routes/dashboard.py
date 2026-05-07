@@ -2565,8 +2565,8 @@ def _dashboard_overview_payload(
 
 @router.get("/overview")
 def get_dashboard_overview(
-    top: int = Query(default=15, ge=1, le=50),
-    anomalies: int = Query(default=20, ge=1, le=100),
+    top: int = Query(default=_OVERVIEW_WARM_TOP, ge=1, le=50),
+    anomalies: int = Query(default=_OVERVIEW_WARM_ANOMALIES, ge=1, le=100),
     market_scope: str = Query(default="active", description="active | historical | all"),
     severity: str | None = Query(
         default=None,
