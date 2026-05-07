@@ -75,7 +75,7 @@ def _execute_batch_stmt():
             FROM anomalies
             WHERE created_at < :cutoff
               AND severity IN :severities
-            ORDER BY severity ASC, created_at ASC, id ASC
+            ORDER BY severity ASC, created_at DESC, id DESC
             LIMIT :batch_size
         ),
         rolled AS (
