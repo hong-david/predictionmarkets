@@ -228,9 +228,9 @@ export default function OverviewPage() {
               sub={`${fmtInt(st.markets_active)} active/open · ${fmtInt(st.markets_historical)} historical retained · ${fmtInt(st.markets_status_unknown)} still hydrating.`}
             />
             <StatTile
-              label="High watch-priority"
-              value={fmtInt(st.markets_high_prior)}
-              sub="Strict high-priority bucket only. Broad macro data, earnings, and team outcomes stay medium-high so the top watchlist remains reviewable."
+              label="Quote snapshots"
+              value={fmtInt(st.snapshots)}
+              sub="Retained ticker snapshots with latest price, bid/ask, volume, and open-interest fields. Used for chart display and market-state alerting."
               tone="primary"
             />
             <StatTile

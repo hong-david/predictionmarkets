@@ -69,7 +69,6 @@ def test_stats_returns_expected_keys(client: TestClient) -> None:
         "markets_active",
         "markets_historical",
         "markets_status_unknown",
-        "markets_high_prior",
         "markets_with_flags",
         "trades",
         "snapshots",

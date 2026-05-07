@@ -111,6 +111,7 @@ _DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", 
 _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
     os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
 )
+_DASHBOARD_CACHE_SCHEMA_VERSION = "v2"
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 # Match `frontend/src/routes/Overview.tsx` granular limits for cache/warm alignment.
@@ -133,7 +134,8 @@ def _cached_dashboard_payload(
     now = time.monotonic()
     ttl = _DASHBOARD_CACHE_TTL_SEC if ttl_sec is None else ttl_sec
     r = _dashboard_redis()
-    redis_key = f"dashboard:{key}"
+    cache_key = f"{_DASHBOARD_CACHE_SCHEMA_VERSION}:{key}"
+    redis_key = f"dashboard:{cache_key}"
     if r is not None:
         try:
             raw = r.get(redis_key)
@@ -147,7 +149,7 @@ def _cached_dashboard_payload(
             logger.debug("dashboard redis cache read failed: %s", exc)
 
     with _dashboard_cache_lock:
-        cached = _dashboard_cache.get(key)
+        cached = _dashboard_cache.get(cache_key)
         if cached and now - cached[0] < ttl:
             if r is not None:
                 try:
@@ -163,7 +165,7 @@ def _cached_dashboard_payload(
         except Exception as exc:
             logger.debug("dashboard redis cache write failed: %s", exc)
     with _dashboard_cache_lock:
-        _dashboard_cache[key] = (time.monotonic(), payload)
+        _dashboard_cache[cache_key] = (time.monotonic(), payload)
     return payload
 
 
@@ -1319,14 +1321,6 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
         or 0
     )
 
-    markets_high_prior = (
-        db.query(func.count(Market.id))
-        .filter(*hydrated)
-        .filter(Market.manipulability_prior == "high")
-        .scalar()
-        or 0
-    )
-
     metric_projection = _market_metrics_available(db)
     metric_counts = None
     if metric_projection:
@@ -1398,7 +1392,6 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
         "markets_active": int(markets_active),
         "markets_historical": int(markets_historical),
         "markets_status_unknown": int(markets_unknown),
-        "markets_high_prior": int(markets_high_prior),
         "markets_with_flags": int(markets_with_flags),
         "trades": int(trades),
         "snapshots": int(snapshots),

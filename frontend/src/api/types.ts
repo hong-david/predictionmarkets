@@ -26,7 +26,6 @@ export interface SystemStats {
   markets_active: number;
   markets_historical: number;
   markets_status_unknown: number;
-  markets_high_prior: number;
   /** Distinct markets with at least one market-level alert row. */
   markets_with_flags: number;
   trades: number;
