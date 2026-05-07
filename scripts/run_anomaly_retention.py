@@ -53,7 +53,7 @@ def _candidate_stmt():
             count(*)::bigint AS candidate_count,
             min(created_at) AS first_created_at,
             max(created_at) AS last_created_at,
-            count(distinct market_pk)::bigint AS affected_markets
+            NULL::bigint AS affected_markets
         FROM anomalies
         WHERE created_at < :cutoff
           AND severity IN :severities
@@ -75,7 +75,7 @@ def _execute_batch_stmt():
             FROM anomalies
             WHERE created_at < :cutoff
               AND severity IN :severities
-            ORDER BY created_at ASC, id ASC
+            ORDER BY severity ASC, created_at ASC, id ASC
             LIMIT :batch_size
         ),
         rolled AS (
@@ -146,30 +146,24 @@ def _execute_batch_stmt():
             WHERE a.id = v.id
             RETURNING a.market_pk
         ),
-        affected AS MATERIALIZED (
-            SELECT DISTINCT market_pk FROM deleted
-        ),
-        stats AS (
+        deleted_by_market AS (
             SELECT
-                affected.market_pk,
-                count(a.id)::bigint AS anomaly_count,
-                count(a.id) FILTER (
-                    WHERE a.severity IN ('high', 'critical')
-                )::bigint AS high_anomaly_count,
-                max(a.created_at) AS last_anomaly_ts
-            FROM affected
-            LEFT JOIN anomalies a ON a.market_pk = affected.market_pk
-            GROUP BY affected.market_pk
+                market_pk,
+                count(*)::bigint AS deleted_count
+            FROM deleted
+            GROUP BY market_pk
         ),
         metric_update AS (
             UPDATE market_metrics mm
             SET
-                anomaly_count = stats.anomaly_count,
-                high_anomaly_count = stats.high_anomaly_count,
-                last_anomaly_ts = stats.last_anomaly_ts,
+                anomaly_count = greatest(
+                    coalesce(mm.anomaly_count, 0) - deleted_by_market.deleted_count,
+                    coalesce(mm.high_anomaly_count, 0),
+                    0
+                ),
                 updated_at = now()
-            FROM stats
-            WHERE mm.market_pk = stats.market_pk
+            FROM deleted_by_market
+            WHERE mm.market_pk = deleted_by_market.market_pk
             RETURNING mm.market_pk
         )
         SELECT
