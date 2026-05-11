@@ -486,6 +486,16 @@ Scores are also separated:
 
 ## Changelog
 
+### 2026-05-11
+
+- Dashboard Redis cache (`_cached_dashboard_payload` in `app/api/routes/dashboard.py`):
+  normal API reads no longer call `EXPIRE` on hits, so user traffic cannot keep
+  stale JSON alive past the original `SETEX` TTL. `warm_dashboard_cache_once`
+  always passes `force_refresh=True` so the pipeline’s cache warmer still
+  recomputes every warmed key and applies a fresh TTL each cycle.
+- Unit tests in `tests/test_dashboard_helpers.py` cover Redis hit (no rebuild)
+  vs `force_refresh` (rebuild without `GET`).
+
 ### 2026-05-07
 
 - Market detail chart overlays now show up to three saved market alerts and up to

@@ -29,6 +29,11 @@ though the cache warmer runs, or `redis-cli --scan --pattern 'dashboard:*'`
 returns nothing until traffic repopulates keys. Mitigations: raise `maxmemory`,
 run a second Redis for hot cache only, or accept occasional cold reads from
 Postgres.
+
+Dashboard `dashboard:*` keys: user requests that hit Redis return cached bytes
+without extending TTL; the pipeline’s `warm_dashboard_cache_once` path forces
+rebuild + `SETEX` each warm so tiles and pipeline health stay current between
+TTL expirations.
 | Search | Postgres fallback search | OpenSearch is an upgrade path, not a budget default. |
 | Raw analytics | Postgres projections with short retention | ClickHouse is valuable later, but raw tape must be aggressively compacted first. |
 | TLS | Caddy or nginx on the same EC2 host | Avoid the monthly ALB floor. |
