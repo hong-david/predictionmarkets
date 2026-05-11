@@ -376,6 +376,18 @@ from a live bucket, compacted bucket, or raw fallback snapshot.
 | Explainable scoring | Every flag has reasons and components. | Less adaptive than a trained black-box model. |
 | Optional ClickHouse/OpenSearch | Adds scale paths without making them correctness dependencies. | More moving parts when enabled. |
 
+## Changelog
+
+### 2026-05-11
+
+- Dashboard Redis cache (`_cached_dashboard_payload` in `app/api/routes/dashboard.py`):
+  normal API reads no longer call `EXPIRE` on hits, so user traffic cannot keep
+  stale JSON alive past the original `SETEX` TTL. `warm_dashboard_cache_once`
+  always passes `force_refresh=True` so the pipeline’s cache warmer still
+  recomputes every warmed key and applies a fresh TTL each cycle.
+- Unit tests in `tests/test_dashboard_helpers.py` cover Redis hit (no rebuild)
+  vs `force_refresh` (rebuild without `GET`).
+
 ## Runtime Configuration
 
 Most configuration comes from `.env` through `app/core/config.py`.

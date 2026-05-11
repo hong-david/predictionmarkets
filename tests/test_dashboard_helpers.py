@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 from app.api.routes import dashboard
 from app.api.routes.dashboard import (
+    _cached_dashboard_payload,
     _clickhouse_table_count,
+    _DASHBOARD_CACHE_SCHEMA_VERSION,
     _history_coverage_windows,
     _merge_series_snapshot_payloads,
     _metric_probability_float,
@@ -292,3 +294,79 @@ def test_clickhouse_table_count_rejects_unknown_table() -> None:
         assert "unsupported ClickHouse count table" in str(exc)
     else:
         raise AssertionError("expected unsupported table to raise")
+
+
+def _pop_local_dashboard_cache(key: str) -> None:
+    cache_key = f"{_DASHBOARD_CACHE_SCHEMA_VERSION}:{key}"
+    with dashboard._dashboard_cache_lock:
+        dashboard._dashboard_cache.pop(cache_key, None)
+
+
+class _RecordingRedis:
+    """Minimal Redis stub for `_cached_dashboard_payload` tests."""
+
+    def __init__(self, initial: dict[str, bytes] | None = None) -> None:
+        self._data = dict(initial or {})
+        self.get_calls = 0
+        self.setex_calls: list[tuple[str, int, bytes]] = []
+
+    def get(self, key: str) -> bytes | None:
+        self.get_calls += 1
+        return self._data.get(key)
+
+    def setex(self, key: str, ttl: int, value: bytes) -> None:
+        self.setex_calls.append((key, ttl, value))
+        self._data[key] = value
+
+
+def test_cached_dashboard_redis_hit_returns_stale_without_rebuilding(
+    monkeypatch,
+) -> None:
+    import orjson
+
+    key = "z_unit_redis_hit"
+    redis_key = f"dashboard:{_DASHBOARD_CACHE_SCHEMA_VERSION}:{key}"
+    _pop_local_dashboard_cache(key)
+    stale = {"generation": 1}
+    fake = _RecordingRedis(initial={redis_key: orjson.dumps(stale)})
+    monkeypatch.setattr(dashboard, "_dashboard_redis", lambda: fake)
+    builds: list[int] = []
+
+    def build() -> dict:
+        builds.append(1)
+        return {"generation": 2}
+
+    out = _cached_dashboard_payload(key, build, ttl_sec=300)
+    assert out == stale
+    assert builds == []
+    assert fake.get_calls == 1
+    assert fake.setex_calls == []
+
+
+def test_cached_dashboard_force_refresh_rebuilds_even_when_redis_has_key(
+    monkeypatch,
+) -> None:
+    import orjson
+
+    key = "z_unit_force_refresh"
+    redis_key = f"dashboard:{_DASHBOARD_CACHE_SCHEMA_VERSION}:{key}"
+    _pop_local_dashboard_cache(key)
+    fake = _RecordingRedis(
+        initial={redis_key: orjson.dumps({"generation": 1})},
+    )
+    monkeypatch.setattr(dashboard, "_dashboard_redis", lambda: fake)
+    builds: list[int] = []
+
+    def build() -> dict:
+        builds.append(1)
+        return {"generation": 2}
+
+    out = _cached_dashboard_payload(
+        key, build, ttl_sec=60, force_refresh=True,
+    )
+    assert out == {"generation": 2}
+    assert builds == [1]
+    assert fake.get_calls == 0
+    assert len(fake.setex_calls) == 1
+    assert fake.setex_calls[0][0] == redis_key
+    assert orjson.loads(fake.setex_calls[0][2]) == {"generation": 2}

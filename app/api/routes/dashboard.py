@@ -136,34 +136,39 @@ _CLICKHOUSE_COUNT_TABLES = {
 }
 
 def _cached_dashboard_payload(
-    key: str, build: Callable[[], T], *, ttl_sec: float | None = None
+    key: str,
+    build: Callable[[], T],
+    *,
+    ttl_sec: float | None = None,
+    force_refresh: bool = False,
 ) -> T:
     now = time.monotonic()
     ttl = _DASHBOARD_CACHE_TTL_SEC if ttl_sec is None else ttl_sec
     r = _dashboard_redis()
     cache_key = f"{_DASHBOARD_CACHE_SCHEMA_VERSION}:{key}"
     redis_key = f"dashboard:{cache_key}"
-    if r is not None:
-        try:
-            raw = r.get(redis_key)
-            if raw:
-                # The dashboard warmer runs more frequently than the TTL, but
-                # a cache hit does not refresh Redis expiry by default. Keep
-                # warmed keys alive between warmer passes.
-                r.expire(redis_key, max(1, int(ttl)))
-                return orjson.loads(raw)  # type: ignore[return-value]
-        except Exception as exc:
-            logger.debug("dashboard redis cache read failed: %s", exc)
 
-    with _dashboard_cache_lock:
-        cached = _dashboard_cache.get(cache_key)
-        if cached and now - cached[0] < ttl:
-            if r is not None:
-                try:
-                    r.setex(redis_key, max(1, int(ttl)), orjson.dumps(cached[1]))
-                except Exception as exc:
-                    logger.debug("dashboard redis cache write failed: %s", exc)
-            return cached[1]  # type: ignore[return-value]
+    if not force_refresh:
+        if r is not None:
+            try:
+                raw = r.get(redis_key)
+                if raw:
+                    # Do not EXPIRE on read: extending TTL from user traffic could
+                    # keep stale JSON alive indefinitely. Let TTL elapse for rebuilds.
+                    return orjson.loads(raw)  # type: ignore[return-value]
+            except Exception as exc:
+                logger.debug("dashboard redis cache read failed: %s", exc)
+
+        with _dashboard_cache_lock:
+            cached = _dashboard_cache.get(cache_key)
+            if cached and now - cached[0] < ttl:
+                if r is not None:
+                    try:
+                        remaining_ttl = max(1, int(ttl - (now - cached[0])))
+                        r.setex(redis_key, remaining_ttl, orjson.dumps(cached[1]))
+                    except Exception as exc:
+                        logger.debug("dashboard redis cache write failed: %s", exc)
+                return cached[1]
 
     payload = build()
     if r is not None:
@@ -4050,7 +4055,7 @@ def warm_dashboard_cache_once(
     def warm(name: str, key: str, build: Callable[[], object], ttl: float) -> None:
         started = time.monotonic()
         try:
-            _cached_dashboard_payload(key, build, ttl_sec=ttl)
+            _cached_dashboard_payload(key, build, ttl_sec=ttl, force_refresh=True)
         except Exception as exc:  # pragma: no cover - operational best effort
             logger.warning("dashboard cache warm failed for %s: %s", name, exc)
             errors.append({"name": name, "error": str(exc)})
