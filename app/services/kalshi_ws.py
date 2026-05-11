@@ -1647,12 +1647,23 @@ def resolve_book_market_tickers() -> list[str]:
 
     now = datetime.now(timezone.utc)
     recent_cutoff = now - timedelta(minutes=_BOOK_MARKET_ACTIVITY_RECENCY_MINUTES)
-    live_ranked_market = or_(
-        MarketMetric.latest_snapshot_ts >= recent_cutoff,
-        MarketMetric.last_trade_ts >= recent_cutoff,
+
+    positive_metric_activity = or_(
         MarketMetric.volume_24h_contracts > 0,
         MarketMetric.trade_count > 0,
     )
+    
+    recent_metric_update = and_(
+        MarketMetric.updated_at >= recent_cutoff,
+        positive_metric_activity,
+    )
+    
+    live_ranked_market = or_(
+        MarketMetric.latest_snapshot_ts >= recent_cutoff,
+        MarketMetric.last_trade_ts >= recent_cutoff,
+        recent_metric_update,
+    )
+    
     live_fallback_market = or_(
         Market.close_time > now,
         and_(Market.close_time.is_(None), Market.updated_at >= recent_cutoff),
@@ -1666,8 +1677,7 @@ def resolve_book_market_tickers() -> list[str]:
             .where(Market.status.in_(["active", "open", "unknown"]))
             .where(live_ranked_market)
             .where(
-                (MarketMetric.volume_24h_contracts > 0)
-                | (MarketMetric.trade_count > 0)
+                positive_metric_activity
                 | (MarketMetric.latest_snapshot_ts.is_not(None))
             )
             .order_by(
