@@ -308,6 +308,66 @@ class TradeFlag(Base):
     )
 
 
+class TradeEvidence(Base):
+    __tablename__ = "trade_evidence"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_pk: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    source_trade_pk: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    source_trade_flag_pk: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    trade_id: Mapped[str] = mapped_column(String(128), index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    yes_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    no_price_dollars: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+    count_fp: Mapped[Decimal | None] = mapped_column(Numeric(18, 2), nullable=True)
+    taker_side: Mapped[str | None] = mapped_column(String(3), nullable=True)
+
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    local_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    context_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    severity: Mapped[str] = mapped_column(
+        String(16), default="low", nullable=False, index=True
+    )
+    reasons: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    components: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    features: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    scorer_version: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    storage_tier: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    retention_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "trade_id",
+            "scorer_version",
+            name="uq_trade_evidence_trade_version",
+        ),
+        Index("ix_trade_evidence_market_score", "market_pk", "score"),
+        Index("ix_trade_evidence_score_ts", "score", "ts"),
+        Index("ix_trade_evidence_market_ts", "market_pk", "ts"),
+    )
+
+
 class TradeBaseline(Base):
     __tablename__ = "trade_baselines"
 
@@ -472,6 +532,51 @@ class AnomalyDailySummary(Base):
             "severity",
             "summary_date",
         ),
+    )
+
+
+class AnomalyEvidence(Base):
+    __tablename__ = "anomaly_evidence"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    market_pk: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    source_anomaly_pk: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    source_snapshot_pk: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    score: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    severity: Mapped[str] = mapped_column(String(20), index=True)
+    reasons: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    signals: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    storage_tier: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    retention_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    market: Mapped["Market"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_anomaly_pk",
+            name="uq_anomaly_evidence_source_anomaly",
+        ),
+        Index("ix_anomaly_evidence_market_score", "market_pk", "score"),
+        Index("ix_anomaly_evidence_score_ts", "score", "ts"),
+        Index("ix_anomaly_evidence_market_ts", "market_pk", "ts"),
     )
 
 

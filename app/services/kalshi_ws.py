@@ -5,12 +5,13 @@ import os
 import time
 import uuid
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import websockets
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import OperationalError
 
 from app.core.config import settings
 from app.db.models import (
@@ -48,6 +49,8 @@ from app.services.pipeline_heartbeat import (
     record_pipeline_heartbeat,
 )
 from app.services.retention import (
+    EXCLUDED_CATEGORIES,
+    EXCLUDED_PRIORS,
     RetentionSignals,
     StorageDecision,
     is_ticker_in_scope,
@@ -68,6 +71,10 @@ _tape_volume_cache: dict[int, tuple[Decimal | None, Decimal | None, float]] = {}
 _CH_TRADES_TABLE = "kalshi_trades_raw"
 _CH_QUOTES_TABLE = "kalshi_quote_changes_raw"
 _CH_L2_TABLE = "kalshi_l2_events_raw"
+_BOOK_MARKET_ACTIVITY_RECENCY_MINUTES = max(
+    1,
+    int(os.getenv("KALSHI_BOOK_MARKET_ACTIVITY_RECENCY_MINUTES", "30")),
+)
 
 def _env_float(
     name: str,
@@ -139,6 +146,10 @@ _WS_TICKER_KNOWN_MARKET_REFRESH_SEC = _env_float(
     300.0,
     minimum=30.0,
 )
+_WS_TICKER_SNAPSHOTS_ENABLED = _env_bool(
+    "KALSHI_WS_TICKER_SNAPSHOTS_ENABLED",
+    True,
+)
 
 _WS_METRICS: Counter[str] = Counter()
 _WS_METRICS_STARTED_AT = time.monotonic()
@@ -153,6 +164,7 @@ _WS_METRIC_KEYS = (
     "ticker_known_market_refresh_errors",
     "ticker_unknown_skipped",
     "ticker_snapshots_inserted",
+    "ticker_snapshots_skipped_disabled",
     "ticker_snapshots_skipped_duplicate",
     "ticker_snapshots_skipped_sampling",
     "ticker_metrics_upserted",
@@ -173,6 +185,7 @@ _ANOMALY_MATERIALIZE_INTERVAL_BY_TIER_SEC = {
     "observe_only": 3600.0,
 }
 _ANOMALY_MATERIALIZE_DEFAULT_INTERVAL_SEC = 1800.0
+_FULL_TICKER_SNAPSHOT_TIERS = {"hot", "triggered", "case"}
 
 
 def first_present(*values):
@@ -202,6 +215,18 @@ def _should_materialize_market_anomaly(
 
     _ANOMALY_MATERIALIZE_LAST_RUN[market_pk] = now_m
     return True
+
+
+def _should_store_ticker_snapshot(
+    market: Market,
+    row_key: str,
+    decision: StorageDecision,
+) -> bool:
+    """Store full quote evidence for hot tiers; sample lower tiers."""
+    tier = (decision.tier or "").strip()
+    if tier in _FULL_TICKER_SNAPSHOT_TIERS:
+        return True
+    return should_sample_event(row_key, decision.sample_rate)
 
 
 
@@ -268,14 +293,28 @@ def _refresh_known_market_tickers() -> int:
 
     Trades and orderbook events still use the lazy market path; this allowlist is
     only for ticker state, where dropping an unknown first sighting is acceptable
-    because the REST poller owns discovery and hydration.
+    because the REST poller owns discovery and hydration. Keep the allowlist to
+    tradeable in-scope rows so historical tables do not turn into a large
+    resident-memory set in long-running workers.
     """
     global _KNOWN_MARKET_LAST_REFRESH, _KNOWN_MARKET_TICKERS
     db = SessionLocal()
     try:
         rows = (
             db.query(Market.market_id, Market.ticker)
-            .filter(Market.status != "out_of_scope")
+            .filter(Market.status.in_(["active", "open", "unknown"]))
+            .filter(
+                or_(
+                    Market.category.is_(None),
+                    Market.category.notin_(tuple(EXCLUDED_CATEGORIES)),
+                )
+            )
+            .filter(
+                or_(
+                    Market.manipulability_prior.is_(None),
+                    Market.manipulability_prior.notin_(tuple(EXCLUDED_PRIORS)),
+                )
+            )
             .all()
         )
         tickers: set[str] = set()
@@ -455,6 +494,7 @@ def _ws_metrics_metadata(
         "ticker_metrics_write_gate_enabled": _WS_TICKER_METRICS_WRITE_GATE_ENABLED,
         "ticker_metrics_min_interval_sec": _WS_TICKER_METRICS_MIN_INTERVAL_SEC,
         "ticker_known_market_gate_enabled": _WS_TICKER_KNOWN_MARKET_GATE_ENABLED,
+        "ticker_snapshots_enabled": _WS_TICKER_SNAPSHOTS_ENABLED,
         "ticker_known_market_count": len(_KNOWN_MARKET_TICKERS),
         "ticker_known_market_age_sec": round(
             now_m - _KNOWN_MARKET_LAST_REFRESH,
@@ -481,11 +521,28 @@ async def _ws_writer_worker(
         try:
             if data is None:
                 return
-            await _dispatch_ws_message(data, session_id)
+            for attempt in range(2):
+                try:
+                    await _dispatch_ws_message(data, session_id)
+                    break
+                except OperationalError as exc:
+                    if attempt == 0 and _is_deadlock_error(exc):
+                        logger.warning(
+                            "Retrying WS writer payload after Postgres deadlock"
+                        )
+                        await asyncio.sleep(0.05)
+                        continue
+                    raise
         except Exception:
             logger.exception("WebSocket writer worker failed for payload=%s", data)
         finally:
             queue.task_done()
+
+
+def _is_deadlock_error(exc: OperationalError) -> bool:
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None)
+    return sqlstate == "40P01" or "deadlock detected" in str(exc).lower()
 
 
 def _update_tape_hints_from_ticker(
@@ -728,6 +785,8 @@ def _bulk_get_or_create_markets(
 def _latest_snapshot_rows_by_market(
     db,
     market_pks: list[int],
+    *,
+    include_snapshots: bool = True,
 ) -> tuple[dict[int, MarketMetric], dict[int, object]]:
     if not market_pks:
         return {}, {}
@@ -738,6 +797,9 @@ def _latest_snapshot_rows_by_market(
         .all()
     )
     metric_by_pk = {int(m.market_pk): m for m in metrics}
+    if not include_snapshots:
+        return metric_by_pk, {}
+
     snapshot_ids = [
         int(m.latest_snapshot_id)
         for m in metrics
@@ -868,6 +930,7 @@ def handle_ticker_messages_batch(messages: list[dict]) -> None:
         metric_by_pk, latest_snapshot_by_pk = _latest_snapshot_rows_by_market(
             db,
             market_pks,
+            include_snapshots=_WS_TICKER_SNAPSHOTS_ENABLED,
         )
 
         snapshots_to_add: list[tuple[MarketSnapshot, dict, Market, StorageDecision]] = []
@@ -899,38 +962,42 @@ def handle_ticker_messages_batch(messages: list[dict]) -> None:
                 )
                 if chart_row:
                     chart_history_rows.append(chart_row)
-            latest_snapshot = latest_snapshot_by_pk.get(int(market.id))
-            is_duplicate = (
-                latest_snapshot is not None
-                and snapshot_row_is_duplicate(
-                    latest_snapshot,
-                    last_price_dollars=row["last_price_dollars"],
-                    yes_bid_dollars=row["yes_bid_dollars"],
-                    yes_ask_dollars=row["yes_ask_dollars"],
-                    no_bid_dollars=row["no_bid_dollars"],
-                    no_ask_dollars=row["no_ask_dollars"],
-                    volume_fp=row["volume_fp"],
-                    volume_24h_fp=row["volume_24h_fp"],
-                    open_interest_fp=row["open_interest_fp"],
-                    liquidity_dollars=row["liquidity_dollars"],
-                    now=now,
-                )
-            )
             should_store_snapshot = False
-            if is_duplicate:
-                _WS_METRICS["ticker_snapshots_skipped_duplicate"] += 1
+            if not _WS_TICKER_SNAPSHOTS_ENABLED:
+                _WS_METRICS["ticker_snapshots_skipped_disabled"] += 1
             else:
-                should_store_snapshot = decision.persist_raw_tape or should_sample_event(
-                    (
-                        f"ticker:{market.market_id}:{row['last_price_dollars']}:"
-                        f"{row['yes_bid_dollars']}:{row['yes_ask_dollars']}:"
-                        f"{row['volume_fp']}:{row['volume_24h_fp']}:"
-                        f"{row['open_interest_fp']}"
-                    ),
-                    decision.sample_rate,
+                latest_snapshot = latest_snapshot_by_pk.get(int(market.id))
+                is_duplicate = (
+                    latest_snapshot is not None
+                    and snapshot_row_is_duplicate(
+                        latest_snapshot,
+                        last_price_dollars=row["last_price_dollars"],
+                        yes_bid_dollars=row["yes_bid_dollars"],
+                        yes_ask_dollars=row["yes_ask_dollars"],
+                        no_bid_dollars=row["no_bid_dollars"],
+                        no_ask_dollars=row["no_ask_dollars"],
+                        volume_fp=row["volume_fp"],
+                        volume_24h_fp=row["volume_24h_fp"],
+                        open_interest_fp=row["open_interest_fp"],
+                        liquidity_dollars=row["liquidity_dollars"],
+                        now=now,
+                    )
                 )
-                if not should_store_snapshot:
-                    _WS_METRICS["ticker_snapshots_skipped_sampling"] += 1
+                if is_duplicate:
+                    _WS_METRICS["ticker_snapshots_skipped_duplicate"] += 1
+                else:
+                    should_store_snapshot = _should_store_ticker_snapshot(
+                        market,
+                        (
+                            f"ticker:{market.market_id}:{row['last_price_dollars']}:"
+                            f"{row['yes_bid_dollars']}:{row['yes_ask_dollars']}:"
+                            f"{row['volume_fp']}:{row['volume_24h_fp']}:"
+                            f"{row['open_interest_fp']}"
+                        ),
+                        decision,
+                    )
+                    if not should_store_snapshot:
+                        _WS_METRICS["ticker_snapshots_skipped_sampling"] += 1
 
             if should_store_snapshot:
                 snapshot = MarketSnapshot(
@@ -1087,6 +1154,27 @@ def handle_ticker_message(data: dict) -> None:
                     open_interest_fp=oi,
                 ),
             )
+        if not _WS_TICKER_SNAPSHOTS_ENABLED:
+            _WS_METRICS["ticker_snapshots_skipped_disabled"] += 1
+            upsert_quote_metrics(
+                db,
+                market_pk=market.id,
+                prior=market.manipulability_prior,
+                latest_snapshot_id=None,
+                latest_snapshot_ts=None,
+                last_price_dollars=lp,
+                yes_bid_dollars=yb,
+                yes_ask_dollars=ya,
+                no_bid_dollars=nb,
+                no_ask_dollars=na,
+                volume_24h_fp=v24,
+                open_interest_fp=oi,
+                liquidity_dollars=liq,
+                decision=decision,
+            )
+            db.commit()
+            return
+
         if should_skip_duplicate_snapshot(
             db,
             market.id,
@@ -1119,11 +1207,13 @@ def handle_ticker_message(data: dict) -> None:
             db.commit()
             return
 
-        should_store_snapshot = decision.persist_raw_tape or should_sample_event(
+        should_store_snapshot = _should_store_ticker_snapshot(
+            market,
             f"ticker:{market.market_id}:{lp}:{yb}:{ya}:{vol}:{v24}:{oi}",
-            decision.sample_rate,
+            decision,
         )
         if not should_store_snapshot:
+            _WS_METRICS["ticker_snapshots_skipped_sampling"] += 1
             upsert_quote_metrics(
                 db,
                 market_pk=market.id,
@@ -1555,12 +1645,26 @@ def resolve_book_market_tickers() -> list[str]:
     if settings.kalshi_book_market_tickers:
         return list(settings.kalshi_book_market_tickers)
 
+    now = datetime.now(timezone.utc)
+    recent_cutoff = now - timedelta(minutes=_BOOK_MARKET_ACTIVITY_RECENCY_MINUTES)
+    live_ranked_market = or_(
+        MarketMetric.latest_snapshot_ts >= recent_cutoff,
+        MarketMetric.last_trade_ts >= recent_cutoff,
+        MarketMetric.volume_24h_contracts > 0,
+        MarketMetric.trade_count > 0,
+    )
+    live_fallback_market = or_(
+        Market.close_time > now,
+        and_(Market.close_time.is_(None), Market.updated_at >= recent_cutoff),
+    )
+
     db = SessionLocal()
     try:
         ranked = db.execute(
             select(Market.market_id)
             .join(MarketMetric, MarketMetric.market_pk == Market.id)
             .where(Market.status.in_(["active", "open", "unknown"]))
+            .where(live_ranked_market)
             .where(
                 (MarketMetric.volume_24h_contracts > 0)
                 | (MarketMetric.trade_count > 0)
@@ -1581,6 +1685,7 @@ def resolve_book_market_tickers() -> list[str]:
         rows = (
             db.query(Market.market_id)
             .filter(Market.status.in_(["active", "open"]))
+            .filter(live_fallback_market)
             .order_by(Market.updated_at.desc())
             .limit(settings.kalshi_book_market_limit)
             .all()

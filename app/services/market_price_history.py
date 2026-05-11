@@ -25,6 +25,18 @@ DEFAULT_CHART_HISTORY_INTERVAL_SEC = int(
 _QUOTE_MIN_INTERVAL_SEC = float(
     os.getenv("KALSHI_CHART_HISTORY_QUOTE_MIN_INTERVAL_SEC", "60")
 )
+_QUOTE_CACHE_MAX_AGE_BUCKETS = max(
+    1,
+    int(os.getenv("KALSHI_CHART_HISTORY_QUOTE_CACHE_MAX_AGE_BUCKETS", "3")),
+)
+_QUOTE_CACHE_PRUNE_INTERVAL_SEC = max(
+    1.0,
+    float(os.getenv("KALSHI_CHART_HISTORY_QUOTE_CACHE_PRUNE_INTERVAL_SEC", "300")),
+)
+_QUOTE_CACHE_MAX_ENTRIES = max(
+    1000,
+    int(os.getenv("KALSHI_CHART_HISTORY_QUOTE_CACHE_MAX_ENTRIES", "200000")),
+)
 _PRICE_SOURCE_RANK = {
     None: 0,
     "midpoint": 1,
@@ -32,6 +44,7 @@ _PRICE_SOURCE_RANK = {
     "trade": 3,
 }
 _last_quote_write_by_market_bucket: dict[tuple[int, int, datetime], float] = {}
+_last_quote_cache_pruned_at = 0.0
 
 
 def chart_history_enabled() -> bool:
@@ -53,6 +66,10 @@ def should_write_quote_history(
     if _QUOTE_MIN_INTERVAL_SEC <= 0:
         return True
     bucket = bucket_start(event_ts, interval_sec=interval_sec)
+    _prune_quote_write_cache(
+        current_bucket=bucket,
+        current_m=time.monotonic() if now_m is None else now_m,
+    )
     key = (int(market_pk), int(interval_sec), bucket)
     current = time.monotonic() if now_m is None else now_m
     previous = _last_quote_write_by_market_bucket.get(key)
@@ -60,6 +77,48 @@ def should_write_quote_history(
         return False
     _last_quote_write_by_market_bucket[key] = current
     return True
+
+
+def _prune_quote_write_cache(
+    *,
+    current_bucket: datetime,
+    current_m: float,
+) -> None:
+    """Keep the per-process quote throttle bounded in long-running workers."""
+    global _last_quote_cache_pruned_at
+
+    cache_size = len(_last_quote_write_by_market_bucket)
+    if cache_size == 0:
+        _last_quote_cache_pruned_at = current_m
+        return
+
+    if (
+        cache_size <= _QUOTE_CACHE_MAX_ENTRIES
+        and current_m - _last_quote_cache_pruned_at
+        < _QUOTE_CACHE_PRUNE_INTERVAL_SEC
+    ):
+        return
+
+    current_epoch = current_bucket.timestamp()
+    stale_keys = [
+        key
+        for key in _last_quote_write_by_market_bucket
+        if key[2].timestamp()
+        < current_epoch - (int(key[1]) * _QUOTE_CACHE_MAX_AGE_BUCKETS)
+    ]
+    for key in stale_keys:
+        _last_quote_write_by_market_bucket.pop(key, None)
+
+    overflow = len(_last_quote_write_by_market_bucket) - _QUOTE_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest_keys = sorted(
+            _last_quote_write_by_market_bucket,
+            key=lambda key: key[2],
+        )[:overflow]
+        for key in oldest_keys:
+            _last_quote_write_by_market_bucket.pop(key, None)
+
+    _last_quote_cache_pruned_at = current_m
 
 
 def bucket_start(
