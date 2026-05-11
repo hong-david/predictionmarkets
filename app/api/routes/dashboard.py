@@ -61,7 +61,9 @@ from app.db.models import (
     NewsEvent,
     PipelineHeartbeat,
     Trade,
+    TradeEvidence,
     TradeFlag,
+    AnomalyEvidence,
 )
 from app.services.historical_signal_qa import historical_signal_report
 from app.services.news_correlation import market_news_search_query, profile_for_market
@@ -113,7 +115,7 @@ _DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", 
 _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
     os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
 )
-_DASHBOARD_CACHE_SCHEMA_VERSION = "v2"
+_DASHBOARD_CACHE_SCHEMA_VERSION = "v3"
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 # Match `frontend/src/routes/Overview.tsx` granular limits for cache/warm alignment.
@@ -123,6 +125,9 @@ _PIPELINE_WS_STALE_AFTER = timedelta(hours=4)
 _PIPELINE_MARKET_POLLER_STALE_AFTER = timedelta(hours=6)
 _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
 _CLICKHOUSE_COUNT_TIMEOUT_SEC = float(os.getenv("CLICKHOUSE_COUNT_TIMEOUT_SEC", "0.75"))
+_SERIES_SNAPSHOT_LIMIT_CAP = 1000
+_SERIES_CHART_HISTORY_QUERY_MULTIPLIER = 2
+_SERIES_FALLBACK_GAP_WINDOW_CAP = 25
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
@@ -585,6 +590,7 @@ def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
         "open_interest": float(snapshot.open_interest_fp)
         if snapshot.open_interest_fp is not None
         else None,
+        "source": "market_snapshot",
     }
 
 
@@ -613,6 +619,124 @@ def _chart_history_snapshot_payload(row: MarketPriceHistory) -> dict:
         "trade_count": int(row.trade_count or 0),
         "quote_count": int(row.quote_count or 0),
     }
+
+
+def _payload_timestamp(payload: dict) -> datetime | None:
+    raw_ts = payload.get("ts")
+    if raw_ts is None:
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00")))
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_preference(payload: dict) -> tuple[int, int]:
+    source_rank = 1 if payload.get("source") == "chart_history" else 0
+    try:
+        interval_rank = -int(payload.get("interval_sec") or 0)
+    except (TypeError, ValueError):
+        interval_rank = 0
+    return (source_rank, interval_rank)
+
+
+def _merge_series_snapshot_payloads(
+    chart_history_payloads: list[dict],
+    fallback_payloads: list[dict],
+    *,
+    limit: int,
+) -> list[dict]:
+    """Merge chart buckets with raw fallback snapshots, preferring chart history."""
+    ranked: list[tuple[datetime, tuple[int, int], dict]] = []
+    for payload in fallback_payloads:
+        ts = _payload_timestamp(payload)
+        if ts is not None:
+            ranked.append((ts, _payload_preference(payload), payload))
+    for payload in chart_history_payloads:
+        ts = _payload_timestamp(payload)
+        if ts is not None:
+            ranked.append((ts, _payload_preference(payload), payload))
+
+    by_timestamp: dict[datetime, tuple[tuple[int, int], dict]] = {}
+    for ts, rank, payload in sorted(ranked, key=lambda item: (item[0], item[1])):
+        current = by_timestamp.get(ts)
+        if current is None or rank >= current[0]:
+            by_timestamp[ts] = (rank, payload)
+
+    merged = [by_timestamp[ts][1] for ts in sorted(by_timestamp)]
+    return merged[-limit:] if limit > 0 else merged
+
+
+def _history_coverage_windows(
+    history_rows: list[MarketPriceHistory],
+) -> list[tuple[datetime, datetime]]:
+    windows: list[tuple[datetime, datetime]] = []
+    for row in history_rows:
+        start = _as_utc(row.bucket_start)
+        if start is None:
+            continue
+        interval_sec = max(
+            1,
+            int(row.interval_sec or DEFAULT_CHART_HISTORY_INTERVAL_SEC),
+        )
+        windows.append((start, start + timedelta(seconds=interval_sec)))
+
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in sorted(windows):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        elif end > merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+    return merged
+
+
+def _fallback_snapshot_rows_for_series(
+    db: Session,
+    *,
+    market_pk: int,
+    since_dt: datetime | None,
+    history_rows: list[MarketPriceHistory],
+    limit: int,
+) -> list[MarketSnapshot]:
+    if limit <= 0:
+        return []
+
+    snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market_pk)
+    if since_dt is not None:
+        snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
+
+    if history_rows:
+        coverage_windows = _history_coverage_windows(history_rows)
+        if not coverage_windows:
+            return []
+
+        filters = []
+
+        if len(history_rows) < limit:
+            filters.append(MarketSnapshot.ts < coverage_windows[0][0])
+
+        filters.append(MarketSnapshot.ts >= coverage_windows[-1][1])
+
+        gap_windows: list[tuple[datetime, datetime]] = []
+        for left_window, right_window in zip(coverage_windows, coverage_windows[1:]):
+            if right_window[0] > left_window[1]:
+                gap_windows.append((left_window[1], right_window[0]))
+
+        for gap_start, gap_end in gap_windows[-_SERIES_FALLBACK_GAP_WINDOW_CAP:]:
+            filters.append(
+                and_(MarketSnapshot.ts >= gap_start, MarketSnapshot.ts < gap_end)
+            )
+
+        if not filters:
+            return []
+        snap_query = snap_query.filter(or_(*filters))
+
+    rows = (
+        snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(rows))
 
 
 def _peer_baseline_rows_for_market(
@@ -2167,7 +2291,6 @@ def _diversify_suspicious_trades(items: list[dict], limit: int) -> list[dict]:
     if limit <= 0:
         return []
 
-    sports_cap = min(limit, 4)
     category_cap = 3
 
     out: list[dict] = []
@@ -2355,6 +2478,107 @@ def _diversify_suspicious_trades(items: list[dict], limit: int) -> list[dict]:
 
     return out[:limit]
 
+def _suspicious_trade_flag_payload(
+    flag: TradeFlag,
+    trade: Trade,
+    market: Market,
+) -> dict:
+    return {
+        "market_id": market.market_id,
+        "event_id": market.event_id,
+        "title": market.title,
+        "subtitle": market.subtitle,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
+        "manipulability_prior": market.manipulability_prior,
+        "trade_id": trade.trade_id,
+        "ts": trade.ts.isoformat() if trade.ts else None,
+        "yes_price": (
+            float(trade.yes_price_dollars)
+            if trade.yes_price_dollars is not None
+            else None
+        ),
+        "no_price": (
+            float(trade.no_price_dollars)
+            if trade.no_price_dollars is not None
+            else None
+        ),
+        "count": float(trade.count_fp) if trade.count_fp is not None else None,
+        "trade_dollar_amount": _trade_notional_dollars(
+            yes_price=trade.yes_price_dollars,
+            no_price=trade.no_price_dollars,
+            count=trade.count_fp,
+            taker_side=trade.taker_side,
+        ),
+        "taker_side": trade.taker_side,
+        "suspicion": float(flag.score),
+        "local_suspicion": float(flag.local_score),
+        "context_score": float(flag.context_score),
+        "reasons": flag.reasons or [],
+        "features": {
+            "context": flag.features or {},
+            "components": flag.components or {},
+        },
+        "severity": flag.severity,
+        "promoted_storage_tier": flag.promoted_storage_tier,
+        "source": "trade_flags",
+    }
+
+
+def _suspicious_trade_evidence_payload(
+    evidence: TradeEvidence,
+    market: Market,
+) -> dict:
+    return {
+        "market_id": market.market_id,
+        "event_id": market.event_id,
+        "title": market.title,
+        "subtitle": market.subtitle,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
+        "manipulability_prior": market.manipulability_prior,
+        "trade_id": evidence.trade_id,
+        "ts": evidence.ts.isoformat() if evidence.ts else None,
+        "yes_price": (
+            float(evidence.yes_price_dollars)
+            if evidence.yes_price_dollars is not None
+            else None
+        ),
+        "no_price": (
+            float(evidence.no_price_dollars)
+            if evidence.no_price_dollars is not None
+            else None
+        ),
+        "count": float(evidence.count_fp) if evidence.count_fp is not None else None,
+        "trade_dollar_amount": _trade_notional_dollars(
+            yes_price=evidence.yes_price_dollars,
+            no_price=evidence.no_price_dollars,
+            count=evidence.count_fp,
+            taker_side=evidence.taker_side,
+        ),
+        "taker_side": evidence.taker_side,
+        "suspicion": float(evidence.score),
+        "local_suspicion": float(evidence.local_score),
+        "context_score": float(evidence.context_score),
+        "reasons": evidence.reasons or [],
+        "features": {
+            "context": evidence.features or {},
+            "components": evidence.components or {},
+        },
+        "severity": evidence.severity,
+        "promoted_storage_tier": evidence.storage_tier,
+        "retention_reason": evidence.retention_reason,
+        "source": "trade_evidence",
+    }
+
+
+def _suspicious_trade_dedupe_key(item: dict) -> str:
+    return str(
+        item.get("trade_id")
+        or f"{item.get('market_id')}:{item.get('ts')}:{item.get('suspicion')}"
+    )
 
 def _suspicious_trades_payload(
     db: Session,
@@ -2377,53 +2601,55 @@ def _suspicious_trades_payload(
         .all()
     )
 
-    if persisted:
-        trades = [
-            {
-                "market_id": market.market_id,
-                "event_id": market.event_id,
-                "title": market.title,
-                "subtitle": market.subtitle,
-                "category": _dashboard_market_category(market),
-                "raw_category": market.category,
-                "category_family": _dashboard_market_family(market),
-                "manipulability_prior": market.manipulability_prior,
-                "trade_id": trade.trade_id,
-                "ts": trade.ts.isoformat() if trade.ts else None,
-                "yes_price": float(trade.yes_price_dollars)
-                if trade.yes_price_dollars is not None
-                else None,
-                "no_price": float(trade.no_price_dollars)
-                if trade.no_price_dollars is not None
-                else None,
-                "count": float(trade.count_fp) if trade.count_fp is not None else None,
-                "trade_dollar_amount": _trade_notional_dollars(
-                    yes_price=trade.yes_price_dollars,
-                    no_price=trade.no_price_dollars,
-                    count=trade.count_fp,
-                    taker_side=trade.taker_side,
-                ),
-                "taker_side": trade.taker_side,
-                "suspicion": float(flag.score),
-                "local_suspicion": float(flag.local_score),
-                "context_score": float(flag.context_score),
-                "reasons": flag.reasons or [],
-                "features": {
-                    "context": flag.features or {},
-                    "components": flag.components or {},
-                },
-                "severity": flag.severity,
-                "promoted_storage_tier": flag.promoted_storage_tier,
-            }
-            for flag, trade, market in persisted
-        ]
-        trades = _diversify_suspicious_trades(trades, limit)
+    evidence_rows = (
+        db.query(TradeEvidence, Market)
+        .join(Market, Market.id == TradeEvidence.market_pk)
+        .filter(*(_hydrated_market_filters() + scope_filters))
+        .filter(TradeEvidence.scorer_version == TRADE_SCORER_VERSION)
+        .order_by(TradeEvidence.score.desc(), TradeEvidence.ts.desc())
+        .limit(candidate_limit)
+        .all()
+    )
+
+    if persisted or evidence_rows:
+        by_trade: dict[str, dict] = {}
+
+        # Prefer live raw TradeFlag rows when both sources describe the same trade.
+        for flag, trade, market in persisted:
+            item = _suspicious_trade_flag_payload(flag, trade, market)
+            by_trade[_suspicious_trade_dedupe_key(item)] = item
+
+        for evidence, market in evidence_rows:
+            item = _suspicious_trade_evidence_payload(evidence, market)
+            key = _suspicious_trade_dedupe_key(item)
+            if key not in by_trade:
+                by_trade[key] = item
+
+        candidates = sorted(
+            by_trade.values(),
+            key=lambda item: (
+                float(item.get("suspicion") or 0.0),
+                item.get("ts") or "",
+            ),
+            reverse=True,
+        )
+        trades = _diversify_suspicious_trades(candidates, limit)
+
+        if persisted and evidence_rows:
+            source = "trade_flags+trade_evidence"
+        elif persisted:
+            source = "trade_flags"
+        else:
+            source = "trade_evidence"
+
         return {
             "count": len(trades),
             "trades": trades,
             "sample": sample,
-            "candidate_count": len(persisted),
-            "source": "trade_flags",
+            "candidate_count": len(candidates),
+            "raw_candidate_count": len(persisted),
+            "evidence_candidate_count": len(evidence_rows),
+            "source": source,
             "diversified": True,
         }
 
@@ -3355,6 +3581,7 @@ def get_market_series(
     directly. Snapshots are returned alongside for top-of-book context.
     """
     market = _get_market_or_404(db, market_id)
+    snapshot_limit = min(limit, _SERIES_SNAPSHOT_LIMIT_CAP)
     since_dt: datetime | None = None
     if since:
         try:
@@ -3368,30 +3595,51 @@ def get_market_series(
     trade_rows = trade_query.order_by(Trade.ts.desc(), Trade.id.desc()).limit(limit).all()
     trade_rows = list(reversed(trade_rows))
 
-    history_query = db.query(MarketPriceHistory).filter(
+    base_history_query = db.query(MarketPriceHistory).filter(
         MarketPriceHistory.market_pk == market.id,
-        MarketPriceHistory.interval_sec == DEFAULT_CHART_HISTORY_INTERVAL_SEC,
     )
     if since_dt is not None:
-        history_query = history_query.filter(MarketPriceHistory.bucket_start > since_dt)
+        base_history_query = base_history_query.filter(
+            MarketPriceHistory.bucket_start > since_dt
+        )
     history_rows = (
-        history_query.order_by(MarketPriceHistory.bucket_start.desc())
-        .limit(min(limit, 1000))
+        base_history_query.filter(
+            MarketPriceHistory.interval_sec == DEFAULT_CHART_HISTORY_INTERVAL_SEC,
+        )
+        .order_by(MarketPriceHistory.bucket_start.desc())
+        .limit(snapshot_limit)
         .all()
     )
-    history_rows = list(reversed(history_rows))
-
-    snap_rows: list[MarketSnapshot] = []
-    if not history_rows:
-        snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market.id)
-        if since_dt is not None:
-            snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
-        snap_rows = (
-            snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-            .limit(min(limit, 1000))
+    if len(history_rows) < snapshot_limit:
+        compacted_limit = (
+            snapshot_limit - len(history_rows)
+        ) * _SERIES_CHART_HISTORY_QUERY_MULTIPLIER
+        history_rows.extend(
+            base_history_query.filter(
+                MarketPriceHistory.interval_sec != DEFAULT_CHART_HISTORY_INTERVAL_SEC,
+            )
+            .order_by(
+                MarketPriceHistory.bucket_start.desc(),
+                MarketPriceHistory.interval_sec.asc(),
+            )
+            .limit(compacted_limit)
             .all()
         )
-        snap_rows = list(reversed(snap_rows))
+    history_rows = sorted(
+        history_rows,
+        key=lambda row: (
+            _as_utc(row.bucket_start) or datetime.min.replace(tzinfo=timezone.utc),
+            int(row.interval_sec or DEFAULT_CHART_HISTORY_INTERVAL_SEC),
+        ),
+    )
+
+    snap_rows = _fallback_snapshot_rows_for_series(
+        db,
+        market_pk=market.id,
+        since_dt=since_dt,
+        history_rows=history_rows,
+        limit=snapshot_limit,
+    )
 
     trade_payloads = [
         {
@@ -3409,10 +3657,10 @@ def get_market_series(
         }
         for t in trade_rows
     ]
-    snapshot_payloads = (
-        [_chart_history_snapshot_payload(row) for row in history_rows]
-        if history_rows
-        else [_snapshot_payload(s) for s in snap_rows]
+    snapshot_payloads = _merge_series_snapshot_payloads(
+        [_chart_history_snapshot_payload(row) for row in history_rows],
+        [_snapshot_payload(s) for s in snap_rows],
+        limit=snapshot_limit,
     )
     explanations = explain_trades_against_window(trade_payloads, window=50)
     contextual: list[dict | None] = []
@@ -3502,11 +3750,21 @@ def get_market_anomalies(
         .limit(limit)
         .all()
     )
+    evidence_rows: list[AnomalyEvidence] = []
+    if len(rows) < limit:
+        evidence_rows = (
+            db.query(AnomalyEvidence)
+            .filter(AnomalyEvidence.market_pk == market.id)
+            .order_by(AnomalyEvidence.ts.desc(), AnomalyEvidence.id.desc())
+            .limit(limit - len(rows))
+            .all()
+        )
     return {
-        "count": len(rows),
+        "count": len(rows) + len(evidence_rows),
         "anomalies": [
             {
                 "id": a.id,
+                "source": "anomalies",
                 "score": float(a.score),
                 "severity": a.severity,
                 "reasons": a.reasons,
@@ -3514,6 +3772,20 @@ def get_market_anomalies(
                 "created_at": a.created_at.isoformat() if a.created_at else None,
             }
             for a in rows
+        ]
+        + [
+            {
+                "id": a.id,
+                "source": "anomaly_evidence",
+                "source_anomaly_id": a.source_anomaly_pk,
+                "score": float(a.score),
+                "severity": a.severity,
+                "reasons": a.reasons,
+                "signals": a.signals,
+                "created_at": a.ts.isoformat() if a.ts else None,
+                "retention_reason": a.retention_reason,
+            }
+            for a in evidence_rows
         ],
     }
 

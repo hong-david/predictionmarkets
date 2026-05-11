@@ -1,8 +1,8 @@
-"""Disabled pruning strategy for raw and evidence tables.
+"""Pruning strategy for raw and evidence tables.
 
-This module is a planning artifact, not an executor. It defines the intended
-guards before we delete/summarize more raw production data now that
-``market_price_history`` exists as the durable chart source.
+This module documents the guardrails used by the retention executors now that
+``market_price_history`` and durable evidence tables are the long-term serving
+artifacts.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ class TablePruningPolicy:
     rationale: str
 
 
-RAW_PRUNING_ENABLED = False
+RAW_PRUNING_ENABLED = True
 
 
 RAW_PRUNING_POLICIES: tuple[TablePruningPolicy, ...] = (
@@ -52,20 +52,20 @@ RAW_PRUNING_POLICIES: tuple[TablePruningPolicy, ...] = (
     ),
     TablePruningPolicy(
         table="trades",
-        enabled=False,
+        enabled=True,
         action=(
-            "Keep raw trades through active life plus review window; later compact "
-            "low-value closed-market tape to aggregate counts/notional while "
-            "preserving flagged/case trades."
+            "Keep raw trades through active life plus the tier review window; "
+            "then delete closed-market low-value tape only when chart-history "
+            "coverage exists and trade evidence has been materialized."
         ),
         minimum_age_days=30,
         prerequisites=(
             "market_price_history contains price buckets for the market",
-            "trade_flags and anomaly references have been materialized",
+            "trade_evidence has been materialized for flagged prints",
             "market is closed/resolved beyond the review window",
         ),
         preserve=(
-            "trades referenced by trade_flags",
+            "trades referenced by trade_flags unless evidence-backed deletion is explicitly enabled",
             "trades used in news/trade correlations",
             "case/triggered market evidence windows",
             "high-prior or high-notional review windows",
@@ -77,14 +77,16 @@ RAW_PRUNING_POLICIES: tuple[TablePruningPolicy, ...] = (
     ),
     TablePruningPolicy(
         table="anomalies",
-        enabled=False,
+        enabled=True,
         action=(
-            "Continue summarizing low/none anomalies into daily summaries before "
-            "deleting raw rows; keep high/critical and case-linked rows."
+            "Summarize low/none anomalies into daily summaries before deleting "
+            "raw rows; materialize qualifying rows into anomaly_evidence before "
+            "any raw anomaly deletion."
         ),
         minimum_age_days=7,
         prerequisites=(
             "anomaly_daily_summaries row exists for deleted raw anomalies",
+            "anomaly_evidence row exists for evidence-threshold candidates",
             "market_metrics anomaly counts are updated",
             "operator has reviewed dry-run counts",
         ),

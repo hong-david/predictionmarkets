@@ -1,66 +1,71 @@
 # Prediction Market Surveillance
 
-A public-data surveillance system for Kalshi markets. It ingests market metadata,
-quotes, public trades, order-book updates, and news. It then builds compact
-evidence rows that help a reviewer answer:
+A public-data surveillance system for Kalshi markets. It ingests market
+metadata, public quotes, public trades, selected order-book updates, and public
+news. It turns those streams into compact evidence rows that help a reviewer
+answer:
 
-- Which markets are worth watching?
+- Which markets deserve attention?
 - Which markets have unusual activity?
 - Did the activity happen near relevant public news?
-- Can we explain the flag without reading millions of raw events?
+- Can the flag be explained without scanning millions of raw events?
 
-The system does **not** know who traded. Kalshi's public feeds do not include
-account ids, so this project does not prove intent, collusion, wash trading, or
-illegal conduct. It highlights patterns that deserve review.
+The system does not know who traded. Kalshi public feeds do not include account
+ids, so this project cannot prove intent, collusion, wash trading, or illegal
+conduct. It highlights public patterns that deserve review.
 
-## Plain-English Terms
+## Terms
 
 | Term | Meaning |
 | --- | --- |
-| **Market contract** | One tradable Kalshi ticker. One event can contain many contracts. |
-| **Event group** | Contracts with the same Kalshi `event_ticker`, grouped for comparison. |
-| **Active/open market** | A market still live enough to monitor. Resolved sports/event markets are aged out even if stale exchange metadata says they are active. |
-| **Watch priority** | A classifier bucket for how sensitive the market type is. It is not evidence by itself. |
-| **Snapshot** | A saved quote update: bid/ask, last price, volume, open interest, and liquidity when available. |
-| **Order-book event** | A saved visible depth change at one or more book levels. This is noisier and grows faster than snapshots. |
-| **Trade print** | One public trade: price, contract count, side, event time, and ingest time. |
-| **Estimated dollars** | `contracts * side price`. This is approximate money paid for that print, not profit or account exposure. |
-| **Market activity alert** | A saved quote, volume, spread, or order-book alert in `anomalies`. |
-| **Read model / projection** | A compact serving row, such as `market_metrics`, built from raw events so the dashboard does not scan huge raw tables. |
-| **Local trade outlier** | A score for one trade compared with nearby trades in the same market. |
-| **Trade flag** | A durable row in `trade_flags` that combines a local trade outlier with context such as liquidity, follow-through, peer baselines, and news timing. |
-| **News-linked signal** | A market/news link that passed relevance and timing checks. It suggests review context, not causality. |
-| **News-linked trade flag** | A market that has both a current trade flag and retained related news. |
-| **Retention** | The policy that keeps useful evidence and drops low-value raw noise before storage grows out of control. |
+| Market contract | One tradable Kalshi ticker. One event can contain many contracts. |
+| Event group | Contracts with the same Kalshi `event_ticker`, grouped for comparison. |
+| Active/open market | A market still live enough to monitor. Stale sports/event markets are aged out by lifecycle rules even if exchange metadata lags. |
+| Watch priority | A classifier bucket for market sensitivity. It is context, not evidence. |
+| Market snapshot | A raw quote/market-state row: bid, ask, last price, volume, open interest, and liquidity when available. |
+| Chart history | The compact `market_price_history` read model used by price charts. Current buckets are 5 minutes; old closed markets can be compacted to 1 hour. |
+| Order-book event | A selected visible depth snapshot or delta. This is high-volume and short-retention by default. |
+| Trade print | One public trade: price, contract count, side, event time, and ingest time. |
+| Estimated dollars | `contracts * side price`. It approximates money paid for that print, not profit or account exposure. |
+| Market activity alert | A saved quote, spread, volume, or book-behavior alert in `anomalies`. |
+| Trade flag | A durable row in `trade_flags` combining local trade outlier behavior with liquidity, follow-through, peer baselines, and news timing. |
+| News-linked signal | A market/news link that passed relevance and timing gates. It suggests review context, not causality. |
+| Projection/read model | A compact serving table such as `market_metrics` or `market_price_history`, built so the dashboard avoids raw-table scans. |
+| Retention | Policies that preserve useful evidence and prune or compact low-value raw noise. |
 
-## System Overview
+## Architecture
 
 ```mermaid
 flowchart LR
-  subgraph External["External data"]
+  subgraph Sources["Public sources"]
     KREST["Kalshi REST"]
     KWS["Kalshi WebSocket"]
     NEWS["GDELT, RSS/Atom, official APIs"]
   end
 
-  subgraph Ingest["Ingest jobs"]
+  subgraph Runtime["Long-running jobs"]
+    SUP["Pipeline supervisor"]
     POLLER["Market poller"]
     WS["WebSocket consumer"]
-    NEWSJOB["News ingestor"]
+    NEWSJOB["News pipeline"]
+    RET["Retention maintenance"]
+    COMPACT["Chart-history compaction"]
+    WARM["Dashboard cache warmer"]
   end
 
-  subgraph Core["Core processing"]
-    CLASSIFIER["Market classifier"]
+  subgraph Processing["Processing"]
+    CLASSIFY["Market classifier"]
+    QUEUE["Bounded WS queue"]
     ALERTS["Activity alert engine"]
     FLAGS["Trade flag scorer"]
     LINKER["News linker"]
-    RETENTION["Retention policy"]
   end
 
   subgraph Storage["Storage"]
-    PG["Postgres: source of truth"]
-    CH["ClickHouse: optional hot raw store"]
-    OS["OpenSearch: optional search index"]
+    PG["Postgres source of truth"]
+    CH["ClickHouse optional raw hot store"]
+    OS["OpenSearch optional search index"]
+    REDIS["Redis cache and rate limits"]
   end
 
   subgraph Serving["Serving"]
@@ -68,148 +73,104 @@ flowchart LR
     UI["React dashboard"]
   end
 
-  KREST --> POLLER
-  KWS --> WS
-  NEWS --> NEWSJOB
-
-  POLLER --> CLASSIFIER
-  WS --> ALERTS
-  WS --> FLAGS
-  NEWSJOB --> LINKER
-  LINKER --> FLAGS
-
-  CLASSIFIER --> PG
-  ALERTS --> PG
-  FLAGS --> PG
-  LINKER --> PG
-  RETENTION --> PG
-
-  WS --> CH
+  KREST --> POLLER --> CLASSIFY --> PG
+  KWS --> WS --> QUEUE --> ALERTS --> PG
+  QUEUE --> FLAGS --> PG
+  QUEUE --> PG
+  QUEUE -. optional .-> CH
+  NEWS --> NEWSJOB --> LINKER --> PG
+  RET --> PG
+  COMPACT --> PG
+  WARM --> REDIS
+  SUP --> POLLER
+  SUP --> WS
+  SUP --> NEWSJOB
+  SUP --> RET
+  SUP --> COMPACT
   PG --> OS
   PG --> API
   OS --> API
+  REDIS --> API
   API --> UI
 ```
 
-The main idea is simple:
+Postgres is the source of truth. ClickHouse and OpenSearch are optional
+accelerators. The dashboard must still work when both are off.
 
-1. **Collect public data** from Kalshi and public news sources.
-2. **Normalize it** into Postgres tables.
-3. **Classify markets** so the system knows which topics deserve more attention.
-4. **Score activity** using explainable rules, not a trained black-box model.
-5. **Keep compact evidence** instead of storing every raw tick forever.
-6. **Serve review screens** through a React dashboard and FastAPI API.
+## Data Paths
 
-Postgres is the source of truth. ClickHouse and OpenSearch are optional helpers:
-ClickHouse can hold short-lived high-volume raw events, and OpenSearch can speed
-up search. The dashboard must still work when both are off.
+### Market Metadata
 
-## Processing Paths
+The REST poller fetches Kalshi markets and writes one row per contract to
+`markets`. It also classifies each market into:
 
-The system has three main paths. They share the same Postgres market ids and
-timestamps so a reviewer can line up price moves, trades, book behavior, and
-news in one market detail view.
-
-```mermaid
-flowchart TD
-  subgraph MarketPath["Market metadata path"]
-    REST["Kalshi REST pages"] --> INGEST["market_ingestor"]
-    INGEST --> CLASSIFY["classifier"]
-    CLASSIFY --> MKT["markets"]
-    INGEST --> SNAP["market_snapshots"]
-  end
-
-  subgraph ActivityPath["Quote and book path"]
-    WS1["WS ticker updates"] --> SNAP
-    WS2["WS book updates"] --> BOOK["book_events"]
-    SNAP --> ALERT["market_state_alert_engine"]
-    BOOK --> ALERT
-    ALERT --> ANOM["anomalies"]
-    ALERT --> MET["market_metrics"]
-  end
-
-  subgraph TradePath["Trade and news path"]
-    WST["WS public trades"] --> TR["trades"]
-    TR --> LOCAL["local outlier + burst scoring"]
-    NEWS["news_articles + news_events"] --> CONTEXT["contextual trade scorer"]
-    LOCAL --> CONTEXT
-    SNAP --> CONTEXT
-    CONTEXT --> TF["trade_flags"]
-    TF --> CASE["case_evidence"]
-    TF --> MET
-  end
-
-  MKT --> API["dashboard API"]
-  MET --> API
-  ANOM --> API
-  TF --> API
-  NEWS --> API
-```
-
-Each path can run independently. For example, if news ingest is down, quote
-alerts and trade flags still work from market data. If OpenSearch is off, search
-falls back to Postgres. If ClickHouse is off, Postgres still stores the core
-records needed by the dashboard.
-
-## How Data Moves Through The System
-
-### 1. Market Metadata
-
-The REST poller fetches Kalshi markets and writes one row per market to
-`markets`. Each market is also classified into:
-
-- `category`, such as macro, corporate, sports, judicial, crypto, weather
-- `subcategory`, such as Fed decision, FDA, fight winner, player prop
-- `manipulability_prior`, shown in the UI as watch priority
+- `category`, such as macro, corporate, judicial, sports, crypto, or weather
+- `subcategory`, such as Fed decision, FDA, fight winner, or player prop
+- `manipulability_prior`, displayed as watch priority
 - classifier audit fields: layer, rule, confidence, and version
 
-The classifier is layered:
+The classifier is layered: Kalshi taxonomy and tags, ticker-prefix rules, local
+text matching, and an optional LLM fallback that is disabled by default.
 
-1. Kalshi taxonomy and tags
-2. Ticker prefix rules
-3. Small local text matcher over seed examples
-4. Optional LLM fallback, disabled by default
+Why this exists: a Supreme Court ruling, an FDA decision, and a player prop do
+not deserve the same review budget. Priority lets the system allocate attention
+without hard-coding one-off rules throughout the pipeline.
 
-The priority map lives in `app/services/classifier/priorities.py`. It is the
-human judgment table. The classifiers themselves are mechanical mappings.
+### Live Market Data
 
-Why this exists: not every market deserves the same review effort. A Supreme
-Court ruling, an FDA decision, and a celebrity TV rating market have very
-different information risks. The classifier lets the rest of the system use that
-context without hard-coding one-off rules for every ticker.
+The WebSocket consumer listens for ticker updates, public trades, and selected
+order-book updates.
 
-### 2. Live Market Data
+Important resource controls:
 
-The WebSocket consumer listens for:
+- A bounded asyncio queue prevents unbounded memory growth during spikes.
+- `KALSHI_WS_WORKER_COUNT` controls database writer concurrency. Budget default
+  is one worker to avoid lock contention on compact projection rows.
+- Ticker writes are coalesced and batched so a burst becomes fewer database
+  round-trips.
+- Known-market gating limits writes to active/open/in-scope tickers and skips
+  categories/priorities that are intentionally out of scope.
+- Unknown WS tickers can be inserted as stubs, then hydrated by later REST
+  sweeps.
+- Duplicate trades are rejected by a database uniqueness rule.
+- Postgres deadlocks on hot projection upserts are retried once in the worker.
 
-- ticker updates
-- public trades
-- selected order-book updates
+Budget deployments collect chart history from ticker and trade messages. They
+also keep raw ticker snapshots enabled, but gated by retention tier so the
+system keeps evidence without storing every quote tick:
 
-It writes compact projections to Postgres and can also write retained raw events
-to ClickHouse. Unknown market tickers are lazily inserted as stubs so live data
-is not dropped just because metadata has not arrived yet. A later REST hydration
-job fills in human-readable titles and classifier fields.
+```text
+KALSHI_CHART_HISTORY_ENABLED=1
+KALSHI_WS_TICKER_SNAPSHOTS_ENABLED=1
+KALSHI_POLLER_QUOTE_SNAPSHOTS_ENABLED=0
+```
 
-Order-book subscriptions are deliberately narrow. `KALSHI_BOOK_MARKET_LIMIT`
-controls how many markets receive book updates, and the resolver chooses those
-markets from compact `market_metrics` rows instead of scanning the full
-`market_snapshots` history at startup. That keeps the WebSocket job responsive
-even when snapshots have grown into the millions of rows.
+Raw snapshots remain useful as fallback evidence for alerts, trade context, and
+pre-chart-history gaps. The long-term chart source is still
+`market_price_history`, and snapshot retention is guarded by chart-history
+coverage plus latest-snapshot/anomaly references.
 
-The WebSocket path is intentionally defensive:
+### Chart History
 
-- duplicate trades are ignored by a database uniqueness rule
-- book events are stamped with session and sequence data
-- workers read from a bounded queue so a spike does not create unlimited memory
-  growth
-- high-volume raw storage can be narrowed by retention settings
-- `book_events` is treated as the fastest-growing raw table and should stay on a
-  short retention window unless a specific investigation needs more depth
+`market_price_history` is the durable chart read model. It stores OHLC-style
+price buckets plus close bid/ask, volume, open interest, and source counts.
+Current live buckets default to 5 minutes; scheduled compaction can roll old
+closed markets to hourly and, later, daily buckets without a new table.
 
-### 3. Market Activity Alerts
+Chart reads use a hybrid path:
 
-The market activity alert engine watches quote and book behavior:
+1. Read 5-minute chart-history buckets first.
+2. If needed, read compacted chart-history intervals such as 1-hour buckets.
+3. Fall back to raw `market_snapshots` only for periods not covered by chart
+   history, such as pre-collection history or internal gaps.
+
+That means charts can move to the compacted table without losing older data
+that was only available as raw snapshots.
+
+### Activity Alerts
+
+Market activity alerts are stored in `anomalies`. They cover market-state
+behavior, not account-level behavior:
 
 - sudden price changes
 - unusually wide spreads
@@ -217,272 +178,203 @@ The market activity alert engine watches quote and book behavior:
 - high book update rates
 - sustained cancel/pull behavior
 
-These rows are stored in `anomalies`. The name is historical; in the UI these
-are called **Market activity alerts** or **Alert history**. They are about the
-state of the market, not about a specific trade.
+Continuing alerts are compacted in place. The materializer inserts a new row for
+first alert, severity upgrade, or cooldown sample; otherwise it updates the
+existing alert. This keeps the UI readable and avoids hundreds of near-duplicate
+rows during a sustained condition.
 
-Continuing alerts are compacted. A row is updated instead of inserting a new
-near-duplicate every few seconds. New rows are kept for first alert, severity
-upgrade, or a cooldown sample.
+### Trade Flags
 
-This keeps the UI readable. A market with a wide spread for ten minutes should
-not create hundreds of identical rows. It should create a small trail that says
-when the alert started, how it changed, and why it mattered.
+Trade flags are about individual public prints. The scorer asks:
 
-### 4. Trade Flags
-
-Trade flags are about individual public trades. The scorer asks:
-
-- Was this trade large for this market?
+- Was this trade large for the market?
 - Was it large compared with similar markets?
 - Did price move after the trade?
-- Did the move persist or quickly reverse?
-- Did related markets move too?
-- Was there relevant news before or after the trade?
-- Is this a market type where early information could matter?
+- Did the move persist or revert?
+- Did related contracts move too?
+- Was relevant public news already available?
+- Is this market type sensitive to early information?
 
-Tiny one-off trades are discounted unless they are part of a fast same-side
-cluster. Public news seen before a trade discounts the score, because a move
-after public news is less surprising than a move before news.
+Durable flags are written to `trade_flags`. Higher-value flags can promote the
+market storage tier and create a `case_evidence` window for later review.
+Before raw trade retention removes old tape, flagged prints are copied to
+`trade_evidence`, which is independent of the raw `trades` row lifetime.
 
-Durable flags are written to `trade_flags`. High-value flags can promote the
-market's storage tier and create a `case_evidence` window for later review.
-
-Trade flags are separate from market activity alerts:
-
-- a **market activity alert** says the market state looked unusual
-- a **trade flag** says one public trade looked unusual after context was added
-- a **news-linked trade flag** says a market has a current trade flag and
-  retained related news
-
-That separation keeps the UI from implying that every quote alert is a suspicious
-trade, or that every trade outlier is meaningful without context.
-
-### 5. News Linking
+### News Linking
 
 The news pipeline pulls from GDELT, RSS/Atom feeds, and official APIs such as
 Federal Register, SEC EDGAR current 8-K filings, and FDA MedWatch alerts.
 
-News is handled in four steps:
+The path is global-first:
 
 1. Normalize and URL-dedupe articles into `news_articles`.
-2. Generate candidate markets using market profiles.
-3. Score article/market relevance and likely YES/NO direction.
-4. Apply a category-aware gate before saving a `news_events` link.
+2. Build market candidates from `market_news_profiles`.
+3. Score relevance and likely YES/NO direction.
+4. Apply category-aware gates before saving `news_events`.
 
-The category gate exists to avoid noisy links. Broad business headlines should
-not attach to a narrow company-specific market unless the article names a direct
-anchor. Broad factor news is allowed for categories where that makes sense,
-such as macro, crypto, and official weather.
+If news ingest is unavailable, quote alerts and trade flags still work. The
+scorer simply has less public-news context until the next successful ingest.
 
-If GDELT is slow or unavailable, the rest of the system continues. The trade
-scorer simply has less news context until the next successful ingest.
+### Retention And Compaction
 
-The news path is deliberately global-first. Instead of searching only when a
-user opens one market page, the background pipeline stores reusable article
-metadata and market links. Market detail pages can still do search-backed
-fallbacks, but the main dashboard should be able to explain signals from stored
-data.
-
-### 6. Retention And Storage Control
-
-This project is a surveillance dashboard, not a permanent raw-data lake. The
-valuable artifact is a small, explainable evidence trail:
+This project is not a permanent raw-data lake. The valuable artifact is a small,
+explainable evidence trail:
 
 - market metadata
+- chart history
 - latest serving projections
 - market activity alerts
-- trade flags
+- durable trade flags
+- historical trade/anomaly evidence highlights
 - relevant news links
 - promoted case windows
 
-Low-value raw events are pruned or compacted. This keeps a budget deployment
-small enough to run on one EC2 instance.
+Retention prunes bulky raw tables. Chart-history compaction can run a policy
+list such as `300:3600:7,3600:86400:180`, meaning 5-minute rows compact to
+hourly after 7 days closed, and hourly rows compact to daily after 180 days
+closed:
 
-Retention has two jobs:
+```text
+python -m scripts.run_chart_history_compaction --watch --execute --replace-source-rows --policies 300:3600:7,3600:86400:180
+```
 
-1. Keep enough detail to explain a flag.
-2. Stop raw quote/book/trade tables from turning the project into a storage bill.
+The compaction job:
 
-When a market has stronger evidence, its retention tier can rise. That lets the
-system keep more context around the markets that matter while being aggressive
-about low-value background noise.
+- selects closed/resolved markets whose source buckets are older than the grace
+  period
+- writes target buckets with the requested interval
+- deletes source rows only when `--replace-source-rows` is set
+- writes pipeline heartbeats
+- uses a Postgres advisory lock so overlapping schedules do not compact the same
+  market at the same time
 
-Retention affects what the app can show. Old low-value raw rows can disappear,
-but compact evidence rows should remain: latest market metrics, alerts, trade
-flags, news links, and promoted case windows. This is why the dashboard reads
-`market_metrics`, `anomalies`, `trade_flags`, and `news_events` first instead of
-depending on raw snapshots or book rows for every page load.
+Raw trade retention is tier-aware and closed-market-only by default. It requires
+matching chart-history coverage and preserves flagged raw trades unless
+`--delete-flagged-trades-with-evidence` is explicitly set. The budget profile
+keeps a 1-day observe window, 14-day sampled window, 30-day hot window, 90-day
+triggered window, and 365-day case window after close.
 
-## Storage Model
+Anomaly retention summarizes low-signal rows into `anomaly_daily_summaries`.
+Rows above the evidence threshold, or any medium/high/critical rows included by
+an operator, are materialized into `anomaly_evidence` before deletion.
+
+The budget compose profile runs chart compaction every 6 hours with
+`max_markets=250`.
+
+## Storage Schema
+
+```mermaid
+flowchart TD
+  M["markets"] --> MM["market_metrics"]
+  M --> MPH["market_price_history"]
+  M --> MS["market_snapshots"]
+  M --> T["trades"]
+  M --> BE["book_events"]
+  M --> MNP["market_news_profiles"]
+  MS --> A["anomalies"]
+  BE --> A
+  T --> TF["trade_flags"]
+  TF --> CE["case_evidence"]
+  T --> TB["trade_baselines"]
+  NA["news_articles"] --> NE["news_events"]
+  M --> NE
+  MNP --> NE
+  A --> ADS["anomaly_daily_summaries"]
+  PH["pipeline_heartbeats"] --> API["dashboard API"]
+  MM --> API
+  MPH --> API
+  A --> API
+  TF --> API
+  NE --> API
+```
 
 | Table | Purpose |
 | --- | --- |
-| `markets` | One row per Kalshi ticker, including status, event id, title, timing, and classifier output. |
-| `market_snapshots` | Quote and market-state updates over time. |
-| `trades` | Public trade tape: trade id, side, count, prices, event time, ingest time. |
-| `book_events` | Selected order-book snapshots and deltas. This table can grow fastest and is retained for short-window book analysis. |
-| `anomalies` | Saved market activity alerts. |
-| `market_metrics` | Compact read model for lists, counters, latest quote hints, total volume, retention tier, and dashboard scores. |
+| `markets` | One row per Kalshi ticker, including status, timing, event id, title, and classifier output. |
+| `market_metrics` | Compact market projection for lists, latest price hints, retention tier, alert counts, trade counts, and scores. |
+| `market_price_history` | Bucketed chart history. Live 5-minute rows can be compacted to hourly or daily rows after close. |
+| `market_snapshots` | Raw quote/market-state evidence rows. Optional for WS ticker updates in budget mode. |
+| `trades` | Public trade tape with uniqueness on exchange trade id. |
+| `trade_flags` | Recent trade-level review candidates with scores, reasons, and components. |
+| `trade_evidence` | Durable suspicious-trade highlights copied before raw trade pruning. |
 | `trade_baselines` | Peer baselines by category/subcategory. |
-| `trade_flags` | Durable trade-level review candidates with scores, reasons, and components. |
+| `book_events` | Selected order-book snapshots and deltas. Highest growth raw table. |
+| `anomalies` | Saved market activity alerts. |
+| `anomaly_daily_summaries` | Compacted low-signal alert summaries. |
+| `anomaly_evidence` | Durable anomaly highlights copied before raw anomaly pruning. |
+| `market_features_1m` | Derived per-minute market features for scoring/research paths. |
 | `news_articles` | Deduped article metadata. |
-| `market_news_profiles` | Market keywords and anchors used for candidate news matching. |
-| `news_events` | Saved article-to-market links and pre-news trade scores. |
+| `market_news_profiles` | Market-specific anchors and keywords for news matching. |
+| `news_events` | Saved article-to-market links and timing features. |
 | `case_evidence` | Promoted evidence windows around important flags. |
+| `pipeline_heartbeats` | Durable status, count, and metadata for background jobs. |
 
 Optional stores:
 
-- **ClickHouse**: short-lived high-volume raw trades, quote changes, and book
-  events. Controlled by `KALSHI_RAW_BACKEND`.
-- **OpenSearch**: fuzzy market/news search. Rebuildable from Postgres.
+- ClickHouse: short-lived high-volume raw events when `KALSHI_RAW_BACKEND` is
+  `clickhouse` or `dual`.
+- OpenSearch: fuzzy market/news search. Rebuildable from Postgres.
+- Redis: dashboard response cache and API rate-limit counters.
 
-## Code Map
-
-| Area | Main files |
-| --- | --- |
-| App composition | `app/main.py`, `app/core/config.py`, `app/core/rate_limit.py` |
-| Database | `app/db/models.py`, `app/db/session.py`, `alembic/versions/*` |
-| Dashboard API | `app/api/routes/dashboard.py` |
-| Kalshi REST/WS | `app/services/kalshi_rest.py`, `app/services/kalshi_ws.py`, `app/services/kalshi_auth.py` |
-| Market lifecycle | `app/services/market_lifecycle.py`, `app/services/market_ingestor.py` |
-| Classification | `app/services/classifier/*` |
-| Activity alerts | `app/services/market_state_alert_engine.py`, `app/services/anomaly_materializer.py`, `app/services/book_activity_signals.py` |
-| Trade scoring | `app/services/trade_suspicion.py`, `app/services/trade_burst.py`, `app/services/trade_context.py`, `app/services/trade_flag_materializer.py`, `app/services/trade_baselines.py` |
-| News | `app/services/news_ingestor.py`, `app/services/news_sources.py`, `app/services/news_link_scoring.py`, `app/services/news_category_gate.py`, `app/services/news_trade_correlation.py` |
-| Search | `app/services/search_index.py`, `scripts/rebuild_search_index.py` |
-| Retention and storage | `app/services/retention.py`, `app/services/storage_health.py`, `scripts/run_retention_maintenance.py` |
-| Frontend | `frontend/src/routes/*`, `frontend/src/components/*`, `frontend/src/api/*` |
-
-## Dashboard And API
+## Dashboard API
 
 ```mermaid
 flowchart LR
-  subgraph Pages["React pages"]
+  subgraph Frontend["React dashboard"]
     O["Overview"]
-    MB["Markets"]
-    EG["Event group"]
-    MD["Market detail"]
+    L["Markets"]
+    E["Event group"]
+    D["Market detail"]
   end
 
-  Q["TanStack Query cache"]
+  Q["TanStack Query"]
   API["FastAPI /api/dashboard/*"]
-  PG["Postgres projections and flags"]
-  OS["OpenSearch optional"]
+  R["Redis cache"]
+  P["Postgres projections"]
+  S["OpenSearch optional"]
 
   O --> Q
-  MB --> Q
-  EG --> Q
-  MD --> Q
+  L --> Q
+  E --> Q
+  D --> Q
   Q --> API
-  API --> PG
-  API --> OS
+  API --> R
+  API --> P
+  API --> S
 ```
 
-Important API surfaces:
+Important endpoints:
 
-- `GET /api/dashboard/overview` bundles stats, breakdown, top markets, recent
-  anomalies, suspicious trades, and news signals in one JSON response (Redis
-  cache key `overview:{top}:{anomalies}:{severity}:{scope}`). The Overview page
-  in `frontend/src/routes/Overview.tsx` uses this as **first paint** (`top=10`,
-  `anomalies=10`, current `market_scope`); the cache warmer primes the same
-  keys per scope. News diagnostics, historical QA, and **pipeline health** load
-  afterward so the first round-trip is not competing with those heavier reads.
-- `GET /api/dashboard/stats`, `/breakdown`, `/top-markets`, `/anomalies`,
-  `/suspicious-trades`, and `/news-signals` remain available for granular refresh
-  or other clients.
-- `GET /api/dashboard/markets` lists active or historical markets with filters.
-  It defaults to cheap pagination with `counts_exact=false` and `has_more`.
-  Exact counts are optional with `include_counts=true`.
-- `GET /api/dashboard/markets/{market_id}` returns detail data.
-- `GET /api/dashboard/markets/{market_id}/series` returns chart data. It
-  defaults to a bounded recent window, supports `since`, and only includes
-  context scoring when `include_context=true`.
-- `GET /api/dashboard/markets/{market_id}/news` returns stored and search-backed
-  related news.
-- `GET /api/dashboard/search` searches markets and stored news.
-- `GET /api/dashboard/pipeline-health` shows freshness and counts for jobs. It
-  is cached with `DASHBOARD_STATIC_CACHE_TTL_SEC` because the handler aggregates
-  many counts; the Overview UI only requests it after the user expands the
-  pipeline health control.
-- `GET /api/dashboard/storage-health` reports disk and table pressure.
+| Endpoint | Use |
+| --- | --- |
+| `GET /api/dashboard/overview` | First-paint bundle: stats, top markets, alerts, flags, and news signals. |
+| `GET /api/dashboard/markets` | Filterable market table with cheap pagination by default. |
+| `GET /api/dashboard/markets/{market_id}` | Market detail payload. |
+| `GET /api/dashboard/markets/{market_id}/series` | Trades and chart points. Uses chart history first, raw snapshots as fallback. |
+| `GET /api/dashboard/markets/{market_id}/news` | Stored and search-backed related news. |
+| `GET /api/dashboard/search` | Market and news search. |
+| `GET /api/dashboard/pipeline-health` | Job freshness from `pipeline_heartbeats`. |
+| `GET /api/dashboard/storage-health` | Disk and table-pressure snapshot. |
 
 The frontend uses URL search params on `/markets` so filtered views can be
-shared. The event page groups related contracts by Kalshi `event_ticker`.
+shared. Market detail charts clamp probability-like values to `[0, 1]`, show
+selected alert/outlier markers, and do not need to know whether a point came
+from a live bucket, compacted bucket, or raw fallback snapshot.
 
-The market detail chart clamps probability-like prices to `[0, 1]` both in the
-API payload and before rendering. Chart arrows are reserved for stronger saved
-market activity alerts, so low-level alert history does not crowd the chart.
-
-The dashboard favors small, cacheable reads. The home **Overview** uses one
-bundled read first, then secondary panels; market lists read compact projections
-first, event pages batch latest snapshots for related contracts, and market
-detail pages poll less often. Historical market pages do not poll live endpoints.
-
-Dashboard pages:
-
-| Page | Purpose |
-| --- | --- |
-| **Overview** | High-level counts, active leaderboards, pipeline health, news diagnostics, top trade flags, and recent market activity alerts. |
-| **Markets** | Filterable market table with priority, evidence scores, trade counts, total volume, alert counts, and sort modes. |
-| **Event group** | Shows all contracts in one Kalshi event, useful for comparing related outcomes. |
-| **Market detail** | Price chart, recent trades, local outlier scores, alert history, related news, and classifier metadata. |
-
-The list sort names are intentionally plain in the UI:
-
-- **News-linked trade flags**: markets with a current trade flag and retained
-  related news, ranked by top flag score
-- **Highest trade flag**: all markets with durable trade flags, ranked by top
-  score
-- **Activity alerts first**: markets with saved quote/book/volume alerts first
-- **Watch priority, then trades**: classifier priority first, trade count second
-
-## Active vs Historical Markets
-
-Most dashboard views default to active markets. A market is treated as active
-when it is open/active and not past `close_time`. Some sports and scheduled
-event markets keep stale exchange metadata, so `app/services/market_lifecycle.py`
-also reads ticker dates and event prefixes to age out resolved games, fights,
-and similar contracts.
-
-Historical markets stay queryable for post-mortem review. They do not mix into
-the live monitoring lists unless `market_scope=historical` or `market_scope=all`
-is requested.
-
-## Priority vs Evidence
-
-The UI intentionally separates two ideas:
-
-- **Watch priority**: the type of market may react to early information.
-- **Evidence**: this specific market has data worth reviewing.
-
-High priority alone is not suspicious. Evidence comes from saved market activity
-alerts, trade flags, local trade outlier scores, and news timing.
-
-The highest priority bucket is intentionally narrow. It includes markets such as
-Fed decision windows, judicial rulings, mergers, FDA-style corporate events,
-and combat-sports winners. Broad macro data, scheduled earnings, player props,
-and major sports outcomes generally sit lower so the top watchlist stays
-reviewable.
-
-Scores are also separated:
-
-- `evidence_score`: how much saved evidence exists for this market
-- `urgency_score`: evidence plus priority, used for review ordering
-- local trade outlier score: a market-detail inspection aid for recent trades
-- trade flag score: durable contextual score written by the materializer
-
-## Design Choices
+## Operational Design Tradeoffs
 
 | Choice | Why it matters | Tradeoff |
 | --- | --- | --- |
-| Public data only | The project can run from public Kalshi feeds and public news. | It cannot identify accounts or prove intent. |
-| Explainable rules | Every flag has score components and reasons. | Less adaptive than a trained model. |
-| Market-specific baselines | A trade is compared with local and peer behavior. | Requires background materializers. |
-| Append-only raw events | Rules can be replayed on retained history. | Raw tables need retention controls. |
-| Compact projections | The dashboard reads small serving rows first. | Backfills are needed after some scoring changes. |
-| Optional hot stores | ClickHouse/OpenSearch help when available. | Postgres remains responsible for correctness. |
-| Retention-first design | Budget deployments stay manageable. | Some low-value raw detail is intentionally discarded. |
+| Public data only | Anyone can run the system from public Kalshi/news data. | It cannot identify accounts or prove intent. |
+| Postgres source of truth | Simpler budget deployment and transactional correctness for projections. | Requires retention and careful indexes as raw tables grow. |
+| Compact chart history | Charts no longer depend on keeping every raw quote snapshot. | Needs backfill/compaction jobs and fallback logic for old gaps. |
+| Bounded WS queue | Protects memory during market-data bursts. | If downstream writes are too slow, the system must shed or coalesce work. |
+| Coalesced ticker writes | Reduces CPU and lock pressure during quote storms. | Intermediate quote ticks are summarized into buckets/projections. |
+| Low worker count by default | Avoids Postgres deadlocks on hot upserts in small deployments. | Higher-throughput deployments may tune worker count upward. |
+| Exponential supervisor backoff | Failed child jobs restart without tight crash loops. | A repeatedly failing job may lag until fixed. |
+| Advisory locks for maintenance | Scheduled maintenance can overlap safely. | A stuck DB session can delay the next sweep until the connection is gone. |
+| Explainable scoring | Every flag has reasons and components. | Less adaptive than a trained black-box model. |
+| Optional ClickHouse/OpenSearch | Adds scale paths without making them correctness dependencies. | More moving parts when enabled. |
 
 ## Changelog
 
@@ -496,79 +388,6 @@ Scores are also separated:
 - Unit tests in `tests/test_dashboard_helpers.py` cover Redis hit (no rebuild)
   vs `force_refresh` (rebuild without `GET`).
 
-### 2026-05-07
-
-- Market detail chart overlays now show up to three saved market alerts and up to
-  three local trade outliers at once, each snapped to chart time with arrow
-  markers for faster visual triage.
-- Marker labels are now source-colored and non-overlapping in the chart overlay:
-  market alerts render orange; local trade outliers render red.
-- Trade-outlier chart labels now include estimated trade dollars plus the local
-  outlier score so analysts can compare magnitude and score in one glance.
-- Reverted `dedd3fa` so ongoing changes build from `c7a6c40` as the branch base.
-- Reverted `dedd3fa` on `main` (`Revert "Disable scheduled retention deletes"`)
-  so scheduled retention flags in `docker-compose.budget.yml` are restored.
-- Hardened deploy step in `.github/workflows/ci-cd.yml` to clean stale app/pipeline
-  containers and remove compose orphans before `up -d`, preventing EC2 deploy
-  failures such as `container name "/predictionmarkets-pipeline-1" is already in use`.
-
-### 2026-05-01
-
-- `warm_dashboard_cache_once` now primes Redis for `GET /api/dashboard/overview`
-  using keys `overview:10:10::{market_scope}` (aligned with the home page’s
-  `top=10` / `anomalies=10` granular calls), in addition to existing per-route keys.
-- The overview bundle is built via `_dashboard_overview_payload`; `top_markets`
-  and `recent_anomalies` inside the bundle now use the request `market_scope`
-  instead of being hard-coded to `active`.
-- Overview first paint uses `api.overview` (one request); news diagnostics,
-  historical QA, and pipeline health load after the bundle succeeds. Pipeline
-  health fetches only when the user expands the widget; `GET /pipeline-health`
-  uses the static dashboard Redis TTL to cut repeat DB load.
-- Budget Redis (`docker-compose.budget.yml`): **128 MB cap** and **`allkeys-lru`**
-  mean any key (including `dashboard:*`) can be evicted when memory is full;
-  see **Redis (budget)** in `docs/deployment.md`.
-
-## Operational Shape
-
-The budget deployment is one small AWS instance running Docker Compose:
-
-- Postgres
-- Redis
-- FastAPI + built React dashboard
-- Pipeline worker
-- Caddy in front for HTTPS and access logs
-
-The production Dockerfile builds the React frontend and serves it from the same
-FastAPI container. `docker-compose.budget.yml` binds the app to
-`127.0.0.1:8000`; public traffic should go through Caddy on ports `80` and
-`443`.
-
-Rate limiting is enabled for `/api/*`:
-
-```text
-RATE_LIMIT_DEFAULT_PER_MINUTE=120
-RATE_LIMIT_EXPENSIVE_PER_MINUTE=30
-RATE_LIMIT_HEALTH_PER_MINUTE=600
-```
-
-Static frontend assets are not app-rate-limited. Search and news endpoints use
-the lower "expensive" bucket.
-
-Detailed deployment notes live in `docs/deployment.md`.
-
-Alembic migrations include dashboard performance indexes for hot read paths such
-as latest snapshots, retained trades, anomalies, book events, market metrics,
-and market search filters. Production deploys run migrations automatically.
-Some indexes are created concurrently so large raw tables can stay usable while
-the migration is running.
-
-The budget pipeline can also run `scripts.warm_dashboard_cache` as a lightweight
-cache warmer. It pre-populates Redis for the home page sections (including
-`GET /api/dashboard/overview` with `top=10` and `anomalies=10` per warmed
-`market_scope`, matching the granular Overview limits), the default markets page,
-pipeline/news diagnostics, and historical QA so the first browser request does
-not pay the full query cost.
-
 ## Runtime Configuration
 
 Most configuration comes from `.env` through `app/core/config.py`.
@@ -577,14 +396,17 @@ Most configuration comes from `.env` through `app/core/config.py`.
 | --- | --- |
 | `POSTGRES_*` | Main Postgres connection. |
 | `REDIS_HOST`, `REDIS_PORT` | Dashboard cache and API rate limiter. |
-| `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM` | Kalshi API authentication. |
+| `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM`, `KALSHI_PRIVATE_KEY_PATH` | Kalshi API authentication. |
 | `KALSHI_RAW_BACKEND` | Raw event target: `postgres`, `clickhouse`, or `dual`. |
-| `KALSHI_BOOK_MARKET_LIMIT` | How many markets get order-book subscriptions by default. |
-| `KALSHI_WS_WORKER_COUNT` | Number of worker tasks draining the WebSocket queue. |
-| `DASHBOARD_CACHE_TTL_SEC` | Default Redis cache TTL for dashboard API reads. |
-| `DASHBOARD_STATS_CACHE_TTL_SEC` | Short TTL for frequently refreshed counters and health-adjacent sections. |
-| `DASHBOARD_LIST_CACHE_TTL_SEC` | Medium TTL for list endpoints such as markets, top markets, alerts, and flags. |
-| `DASHBOARD_STATIC_CACHE_TTL_SEC` | Longer TTL for slower-moving sections, grouped detail reads, and `GET /api/dashboard/pipeline-health` (expensive aggregate). |
+| `KALSHI_BOOK_MARKET_LIMIT` | How many markets receive order-book subscriptions. |
+| `KALSHI_WS_WORKER_COUNT` | Number of worker tasks draining the WS queue. |
+| `KALSHI_WS_QUEUE_SIZE` | Maximum pending WS messages before backpressure/shedding decisions matter. |
+| `KALSHI_CHART_HISTORY_ENABLED` | Enables bucketed chart-history writes. |
+| `KALSHI_CHART_HISTORY_INTERVAL_SEC` | Live chart bucket width, default `300`. |
+| `KALSHI_WS_TICKER_SNAPSHOTS_ENABLED` | Enables raw `market_snapshots` rows from WS ticker updates. Budget default is `1`, with storage-tier sampling. |
+| `KALSHI_POLLER_QUOTE_SNAPSHOTS_ENABLED` | Enables raw REST quote snapshots from the poller. Budget default is `0`. |
+| `KALSHI_REST_RETRY_*` | REST retry attempts and exponential backoff base. |
+| `DASHBOARD_*_CACHE_TTL_SEC` | Redis TTLs for dashboard API payloads. |
 | `RETENTION_*` | Raw event age limits and pruning batch size. |
 | `OPENSEARCH_URL` | Optional OpenSearch endpoint. Empty means Postgres fallback. |
 | `CLICKHOUSE_URL` | Optional ClickHouse endpoint. |
@@ -596,9 +418,9 @@ Budget defaults favor low storage growth:
 KALSHI_RAW_BACKEND=postgres
 KALSHI_BOOK_MARKET_LIMIT=5
 KALSHI_WS_WORKER_COUNT=1
-DASHBOARD_STATS_CACHE_TTL_SEC=20
-DASHBOARD_LIST_CACHE_TTL_SEC=60
-DASHBOARD_STATIC_CACHE_TTL_SEC=300
+KALSHI_WS_QUEUE_SIZE=2500
+KALSHI_CHART_HISTORY_ENABLED=1
+KALSHI_WS_TICKER_SNAPSHOTS_ENABLED=1
 RETENTION_BOOK_EVENTS_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_OBSERVE_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_SAMPLED_MAX_AGE_DAYS=3
@@ -609,37 +431,24 @@ RETENTION_SNAPSHOT_HOT_MAX_AGE_DAYS=14
 
 | Script | Use |
 | --- | --- |
+| `scripts.run_pipeline` | Lightweight supervisor for API, poller, WS, news, retention, compaction, and cache warmer. |
 | `scripts.bootstrap_markets` | One-shot market universe load from Kalshi REST. |
 | `scripts.poll_markets` | Periodic REST sweep and metadata refresh. |
 | `scripts.run_ws_ticker_consumer` | Live ticker, trade, and selected book ingest. |
 | `scripts.hydrate_unknown_markets` | Fill titles/status/classification for WS-discovered stubs. |
-| `scripts.classify_markets` | Reclassify rows after classifier version changes. |
+| `scripts.classify_markets` | Reclassify rows after classifier changes. |
+| `scripts.backfill_market_price_history` | Build chart-history buckets from retained raw trades/snapshots. |
+| `scripts.run_chart_history_compaction` | Compact old closed-market chart buckets using interval policies such as 5 minutes to 1 hour and 1 hour to 1 day. |
 | `scripts.materialize_anomalies` | Write market activity alerts from recent snapshots/book data. |
 | `scripts.materialize_trade_baselines` | Build peer baselines used by trade flag scoring. |
 | `scripts.materialize_trade_flags` | Write durable trade flags. |
-| `scripts.ingest_news` | One-shot news ingest. |
-| `scripts.run_news_surveillance_pipeline` | Main news + trade-flag + news-correlation loop. |
+| `scripts.run_news_surveillance_pipeline` | Main news, trade-flag, and news-correlation loop. |
 | `scripts.relink_stored_news_articles` | Re-score stored articles against current market profiles. |
 | `scripts.revalidate_news_links` | Update or remove older links using current guardrails. |
 | `scripts.rebuild_search_index` | Rebuild OpenSearch from Postgres. |
-| `scripts.run_retention_maintenance` | Prune or compact raw data according to retention policy. |
-| `scripts.warm_dashboard_cache` | Precompute and cache dashboard first-paint payloads in Redis. |
-
-## Common Failure Modes
-
-| Symptom | Likely cause | What to check |
-| --- | --- | --- |
-| Dashboard loads but counts are flat | Pipeline worker is stopped or stale. | Expand pipeline health on Overview (or call `/api/dashboard/pipeline-health`), `docker compose logs pipeline` |
-| Dashboard keys missing in Redis | Budget Redis is 128 MB with `allkeys-lru`; keys compete with rate limits and can be evicted. | `redis-cli --scan --pattern 'dashboard:*'`, `INFO memory`; see **Redis (budget)** in `docs/deployment.md`. |
-| Markets show raw tickers as titles | WS discovered stubs before REST hydration. | Run `scripts.hydrate_unknown_markets --top-by-trades`. |
-| News panels are empty | News source failed, links were filtered, or no relevant news exists. | `/api/dashboard/news-diagnostics`, pipeline logs. |
-| Search is weak | OpenSearch is off or index is empty. | Run `scripts.rebuild_search_index`; Postgres fallback still works. |
-| Disk usage grows quickly | Raw retention is too loose or book market limit is too high. | `/api/dashboard/storage-health`, retention settings. |
-| Order-book event count is zero | Book subscriptions are disabled, resolver found no eligible markets, WebSocket auth failed, or retention pruned the short raw window. | `KALSHI_BOOK_MARKET_LIMIT`, `.pipeline-logs/ws_trade_feed.*`, `book_events`, and pipeline heartbeats. |
-| Markets total looks approximate | `/markets` defaults to cheap pagination for speed. | Check `counts_exact`; request `include_counts=true` only when an exact total is needed. |
-| Market chart only shows recent data | Series endpoints default to a bounded recent window. | Increase `limit`, pass `since`, or set `include_context=true` when trade context scoring is needed. |
-| Public API receives many requests | Crawler or refresh loop. | Rate-limit headers, Caddy access log. |
-| `WinError 10013` on local Uvicorn | Windows reserved port range. | Run Uvicorn on another port, such as `8001`. |
+| `scripts.run_retention_maintenance` | Prune bulky raw tables according to tiered retention policy, including guarded raw trade retention. |
+| `scripts.run_anomaly_retention` | Compact or delete low-signal alert history while preserving qualifying evidence. |
+| `scripts.warm_dashboard_cache` | Precompute dashboard first-paint payloads in Redis. |
 
 ## Running Locally
 
@@ -652,42 +461,45 @@ Prerequisites:
 
 Install Python dependencies:
 
-```bash
+```powershell
 python -m venv .venv
-.venv/Scripts/pip install -r requirements.txt
+.\.venv\Scripts\pip.exe install -r requirements.txt
 ```
 
-Create `.env` from your local or budget example and set the Postgres, Redis, and
-Kalshi values:
-
-```bash
-cp .env.budget.example .env
-```
-
-Start local services:
-
-```bash
-docker compose up -d postgres redis clickhouse opensearch
-.venv/Scripts/python -m alembic upgrade head
-```
-
-Optional ClickHouse schema:
+Create `.env`:
 
 ```powershell
+Copy-Item .env.budget.example .env
+```
+
+Start local services and run migrations:
+
+```powershell
+docker compose up -d postgres redis
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+Optional services:
+
+```powershell
+docker compose up -d clickhouse opensearch
 Get-Content sql/clickhouse_kalshi.sql | docker compose exec -T clickhouse clickhouse-client --multiquery
 ```
 
 Bootstrap markets and build the UI:
 
-```bash
-PYTHONPATH=. .venv/Scripts/python -m scripts.bootstrap_markets --status open
-cd frontend && npm install && npm run build && cd ..
+```powershell
+.\.venv\Scripts\python.exe -m scripts.bootstrap_markets --status open
+Set-Location frontend
+npm install
+npm run build
+Set-Location ..
 ```
 
-Run the API and dashboard:
+Run the API:
 
-```bash
-.venv/Scripts/python -m uvicorn app.main:app --reload
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
 Open:
@@ -697,64 +509,88 @@ http://127.0.0.1:8000/
 http://127.0.0.1:8000/docs
 ```
 
-For frontend hot reload, run Vite separately:
+Run the local supervisor without the API:
 
-```bash
-cd frontend
-npm run dev
+```powershell
+.\.venv\Scripts\python.exe -m scripts.run_pipeline --skip-api --with-retention-maintenance --with-chart-history-compaction --with-dashboard-cache-warmer
 ```
 
-Then open:
+Useful one-off jobs:
 
-```text
-http://127.0.0.1:5173
+```powershell
+.\.venv\Scripts\python.exe -m scripts.run_ws_ticker_consumer
+.\.venv\Scripts\python.exe -m scripts.poll_markets
+.\.venv\Scripts\python.exe -m scripts.hydrate_unknown_markets --top-by-trades
+.\.venv\Scripts\python.exe -m scripts.classify_markets --top-by-trades
+.\.venv\Scripts\python.exe -m scripts.run_news_surveillance_pipeline --rescore-news
+.\.venv\Scripts\python.exe -m scripts.run_chart_history_compaction
 ```
 
-Useful local background jobs:
+## Budget Deployment
 
-```bash
-PYTHONPATH=. .venv/Scripts/python -m scripts.run_ws_ticker_consumer
-PYTHONPATH=. .venv/Scripts/python -m scripts.poll_markets
-PYTHONPATH=. .venv/Scripts/python -m scripts.hydrate_unknown_markets --top-by-trades
-PYTHONPATH=. .venv/Scripts/python -m scripts.classify_markets --top-by-trades
-PYTHONPATH=. .venv/Scripts/python -m scripts.run_news_surveillance_pipeline --rescore-news
-PYTHONPATH=. .venv/Scripts/python -m scripts.materialize_anomalies
-```
+`docker-compose.budget.yml` runs:
+
+- Postgres
+- Redis with `128mb` and `allkeys-lru`
+- FastAPI serving the built React dashboard
+- Pipeline supervisor
+
+The pipeline supervisor starts poller, WebSocket ingest, news ingest, retention
+maintenance, anomaly retention, chart-history compaction, and cache warming.
+It writes child logs to `.pipeline-logs`, records heartbeats, and restarts
+failed children with exponential backoff.
+
+The budget profile keeps raw storage narrow:
+
+- book subscriptions are limited
+- raw WS ticker snapshots are sampled or preserved by storage tier
+- chart history is on
+- retention runs frequently
+- closed-market chart history compacts after a 7-day grace
+
+Public traffic should go through Caddy or another reverse proxy. The app binds
+to `127.0.0.1:8000` in the budget compose file.
+
+Detailed deployment notes live in `docs/deployment.md`.
+
+## Common Failure Modes
+
+| Symptom | Likely cause | What to check |
+| --- | --- | --- |
+| Dashboard counts are flat | Pipeline worker is stopped or stale. | `/api/dashboard/pipeline-health`, `.pipeline-logs/*`, `docker compose logs pipeline`. |
+| Market charts have gaps | Chart history was not collecting, old data only exists in raw snapshots, or compaction removed fine buckets. | `market_price_history`, `market_snapshots`, series endpoint payload `source`. |
+| Raw snapshot count is flat | WS ticker snapshots are disabled, no known in-scope markets are receiving ticks, or sampling skipped a quiet interval. | `KALSHI_WS_TICKER_SNAPSHOTS_ENABLED`, known-market gate logs; chart history should still grow. |
+| Disk usage grows quickly | Raw retention is too loose, book market limit is too high, or compaction is not running. | `/api/dashboard/storage-health`, retention settings, `chart_history_compaction` heartbeat. |
+| Order-book event count is zero | Book subscriptions are disabled, no eligible markets were selected, WS auth failed, or retention pruned the window. | `KALSHI_BOOK_MARKET_LIMIT`, WS logs, `book_events`, pipeline health. |
+| News panels are empty | News source failed, links were gated out, or no relevant public news exists. | `/api/dashboard/news-diagnostics`, news pipeline logs. |
+| Search is weak | OpenSearch is off or empty. | Run `scripts.rebuild_search_index`; Postgres fallback still works. |
+| Markets show raw tickers as titles | WS saw the ticker before REST hydration. | Run `scripts.hydrate_unknown_markets --top-by-trades`. |
+| Markets total looks approximate | `/markets` defaults to cheap pagination. | Request `include_counts=true` only when exact totals are needed. |
+| `WinError 10013` on local Uvicorn | Windows reserved port range. | Use another port, such as `8001`. |
 
 ## Tests And Checks
 
-```bash
-# Unit tests
-.venv/Scripts/python -m pytest tests/
-
-# Integration tests against a real Postgres test DB
-docker compose up -d postgres
-docker compose exec -T postgres psql -U postgres -c "CREATE DATABASE surveillance_test"
-RUN_INTEGRATION=1 .venv/Scripts/python -m pytest tests/test_migrations_integration.py -v
-
-# Static checks
-.venv/Scripts/python -m ruff check app/ tests/
-.venv/Scripts/python -m mypy app/
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\
+.\.venv\Scripts\python.exe -m ruff check app\ scripts\ tests\
+.\.venv\Scripts\python.exe -m mypy app\
 ```
 
-## Current State
+Integration migrations against a real Postgres test database:
 
-The current system includes:
+```powershell
+docker compose up -d postgres
+docker compose exec -T postgres psql -U postgres -c "CREATE DATABASE surveillance_test"
+$env:RUN_INTEGRATION="1"
+.\.venv\Scripts\python.exe -m pytest tests/test_migrations_integration.py -v
+```
 
-- market metadata ingestion and hydration
-- live public trade and quote ingest
-- selected order-book ingest
-- layered market classification
-- market activity alerts
-- local trade outlier scoring
-- durable trade flags
-- global news ingest and article-to-market linking
-- news/trade timing correlation
-- retention and storage-health guardrails
-- React dashboard served by FastAPI
-- optional ClickHouse and OpenSearch paths
-- Redis-backed dashboard caching and API rate limiting
+## Current Limits
 
-The most important remaining limitation is still the public-data boundary:
-without account-level data, the system can find suspicious-looking public
-patterns, but it cannot prove who traded or why.
+The public-data boundary is the core limit. The system can identify
+suspicious-looking public patterns, but it cannot know who traded, whether
+accounts are related, or why a trader acted.
+
+The design keeps that boundary explicit: it stores explainable evidence,
+separates watch priority from observed evidence, and favors compact read models
+over indefinite raw-event storage.

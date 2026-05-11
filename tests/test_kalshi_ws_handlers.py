@@ -221,6 +221,52 @@ def test_handle_trade_message_dual_writes_clickhouse_batch():
 # ---------- ticker batching / gates ----------------------------------------
 
 
+def test_sampled_ticker_snapshot_uses_sample_rate_gate():
+    market = _FakeMarket(pk=42, market_id="KXTEST-25")
+    decision = kalshi_ws.StorageDecision(
+        tier="sampled",
+        score=20,
+        process_realtime=True,
+        store_raw_hot=True,
+        raw_ttl_hours=24,
+        store_features=True,
+        store_case_evidence=False,
+        sample_rate=0.1,
+        reasons=("closing_soon",),
+    )
+
+    with patch.object(kalshi_ws, "should_sample_event", return_value=False) as sample:
+        assert (
+            kalshi_ws._should_store_ticker_snapshot(market, "ticker:KXTEST-25", decision)
+            is False
+        )
+
+    sample.assert_called_once_with("ticker:KXTEST-25", 0.1)
+
+
+def test_hot_ticker_snapshot_bypasses_sample_rate_gate():
+    market = _FakeMarket(pk=42, market_id="KXTEST-25")
+    decision = kalshi_ws.StorageDecision(
+        tier="hot",
+        score=50,
+        process_realtime=True,
+        store_raw_hot=True,
+        raw_ttl_hours=168,
+        store_features=True,
+        store_case_evidence=False,
+        sample_rate=0.1,
+        reasons=("high_prior",),
+    )
+
+    with patch.object(kalshi_ws, "should_sample_event", return_value=False) as sample:
+        assert (
+            kalshi_ws._should_store_ticker_snapshot(market, "ticker:KXTEST-25", decision)
+            is True
+        )
+
+    sample.assert_not_called()
+
+
 def test_ticker_metric_gate_skips_recent_nonprice_update():
     now = datetime.now(timezone.utc)
     metric = type(

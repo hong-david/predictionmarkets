@@ -23,6 +23,10 @@ from app.services.pipeline_heartbeat import (
     new_run_id,
     record_pipeline_heartbeat,
 )
+from app.services.market_price_history import DEFAULT_CHART_HISTORY_INTERVAL_SEC
+
+
+CHART_HISTORY_COMPACTION_TARGET_INTERVAL_SEC = 3600
 
 
 @dataclass
@@ -233,7 +237,31 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
             str(args.retention_hot_snapshot_days),
             "--batch-size",
             str(args.retention_batch_size),
+            "--max-batches",
+            str(args.retention_max_batches),
         ]
+        if getattr(args, "retention_with_trade_retention", False):
+            retention_command.extend(
+                [
+                    "--with-trade-retention",
+                    "--trade-observe-days-after-close",
+                    str(getattr(args, "retention_trade_observe_days_after_close", 1)),
+                    "--trade-sampled-days-after-close",
+                    str(getattr(args, "retention_trade_sampled_days_after_close", 14)),
+                    "--trade-hot-days-after-close",
+                    str(getattr(args, "retention_trade_hot_days_after_close", 30)),
+                    "--trade-triggered-days-after-close",
+                    str(getattr(args, "retention_trade_triggered_days_after_close", 90)),
+                    "--trade-case-days-after-close",
+                    str(getattr(args, "retention_trade_case_days_after_close", 365)),
+                ]
+            )
+        if getattr(args, "retention_delete_flagged_trades_with_evidence", False):
+            retention_command.append("--delete-flagged-trades-with-evidence")
+        if getattr(args, "retention_allow_uncovered_trade_delete", False):
+            retention_command.append("--allow-uncovered-trade-delete")
+        if getattr(args, "retention_exact_trade_dry_run_counts", False):
+            retention_command.append("--exact-trade-dry-run-counts")
         if args.retention_execute:
             retention_command.append("--execute")
         if args.retention_analyze:
@@ -264,6 +292,8 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
             str(args.anomaly_retention_batch_size),
             "--max-batches",
             str(args.anomaly_retention_max_batches),
+            "--evidence-min-score",
+            str(getattr(args, "anomaly_retention_evidence_min_score", 50.0)),
         ]
         if args.anomaly_retention_execute:
             anomaly_retention_command.append("--execute")
@@ -277,6 +307,47 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                 cwd=root,
                 log_dir=log_dir,
                 forward_output=True,
+            )
+        )
+    if args.with_chart_history_compaction:
+        chart_history_compaction_command = [
+            py,
+            "-m",
+            "scripts.run_chart_history_compaction",
+            "--watch",
+            "--interval-seconds",
+            str(args.chart_history_compaction_interval_seconds),
+            "--grace-days-after-close",
+            str(args.chart_history_compaction_grace_days_after_close),
+            "--source-interval-sec",
+            str(args.chart_history_compaction_source_interval_sec),
+            "--target-interval-sec",
+            str(args.chart_history_compaction_target_interval_sec),
+            "--max-markets",
+            str(args.chart_history_compaction_max_markets),
+            "--offset",
+            str(args.chart_history_compaction_offset),
+            "--max-source-rows-per-market",
+            str(args.chart_history_compaction_max_source_rows_per_market),
+        ]
+        if getattr(args, "chart_history_compaction_policies", ""):
+            chart_history_compaction_command.extend(
+                [
+                    "--policies",
+                    str(args.chart_history_compaction_policies),
+                ]
+            )
+        if args.chart_history_compaction_execute:
+            chart_history_compaction_command.append("--execute")
+        if args.chart_history_compaction_replace_source_rows:
+            chart_history_compaction_command.append("--replace-source-rows")
+        processes.append(
+            ManagedProcess(
+                key="chart_history_compaction",
+                label="Chart history compaction",
+                command=chart_history_compaction_command,
+                cwd=root,
+                log_dir=log_dir,
             )
         )
     if args.with_dashboard_cache_warmer:
@@ -349,6 +420,22 @@ def main() -> None:
     parser.add_argument("--retention-sampled-snapshot-days", type=int, default=7)
     parser.add_argument("--retention-hot-snapshot-days", type=int, default=30)
     parser.add_argument("--retention-batch-size", type=int, default=5000)
+    parser.add_argument("--retention-max-batches", type=int, default=20)
+    parser.add_argument("--retention-with-trade-retention", action="store_true")
+    parser.add_argument("--retention-trade-observe-days-after-close", type=int, default=1)
+    parser.add_argument("--retention-trade-sampled-days-after-close", type=int, default=14)
+    parser.add_argument("--retention-trade-hot-days-after-close", type=int, default=30)
+    parser.add_argument("--retention-trade-triggered-days-after-close", type=int, default=90)
+    parser.add_argument("--retention-trade-case-days-after-close", type=int, default=365)
+    parser.add_argument(
+        "--retention-delete-flagged-trades-with-evidence",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--retention-allow-uncovered-trade-delete",
+        action="store_true",
+    )
+    parser.add_argument("--retention-exact-trade-dry-run-counts", action="store_true")
     parser.add_argument("--with-anomaly-retention", action="store_true")
     parser.add_argument("--anomaly-retention-execute", action="store_true")
     parser.add_argument("--anomaly-retention-analyze", action="store_true")
@@ -357,6 +444,41 @@ def main() -> None:
     parser.add_argument("--anomaly-retention-severities", default="none,low")
     parser.add_argument("--anomaly-retention-batch-size", type=int, default=5000)
     parser.add_argument("--anomaly-retention-max-batches", type=int, default=100)
+    parser.add_argument("--anomaly-retention-evidence-min-score", type=float, default=50.0)
+    parser.add_argument("--with-chart-history-compaction", action="store_true")
+    parser.add_argument("--chart-history-compaction-execute", action="store_true")
+    parser.add_argument(
+        "--chart-history-compaction-replace-source-rows",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--chart-history-compaction-interval-seconds",
+        type=float,
+        default=21_600.0,
+    )
+    parser.add_argument(
+        "--chart-history-compaction-grace-days-after-close",
+        type=int,
+        default=7,
+    )
+    parser.add_argument(
+        "--chart-history-compaction-source-interval-sec",
+        type=int,
+        default=DEFAULT_CHART_HISTORY_INTERVAL_SEC,
+    )
+    parser.add_argument(
+        "--chart-history-compaction-target-interval-sec",
+        type=int,
+        default=CHART_HISTORY_COMPACTION_TARGET_INTERVAL_SEC,
+    )
+    parser.add_argument("--chart-history-compaction-max-markets", type=int, default=100)
+    parser.add_argument("--chart-history-compaction-offset", type=int, default=0)
+    parser.add_argument(
+        "--chart-history-compaction-max-source-rows-per-market",
+        type=int,
+        default=0,
+    )
+    parser.add_argument("--chart-history-compaction-policies", default="")
     parser.add_argument("--with-dashboard-cache-warmer", action="store_true")
     parser.add_argument("--dashboard-cache-warm-interval-seconds", type=float, default=60.0)
     parser.add_argument("--dashboard-cache-warm-market-scopes", default="active")

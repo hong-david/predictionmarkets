@@ -18,12 +18,18 @@ target together.
 | API + dashboard | Repo Docker image | The `Dockerfile` builds the Vite frontend into the FastAPI image. |
 | Database | Postgres container on a gp3 EBS volume | RDS is easier, but compute, storage, and backups push the bill past budget. |
 | Cache | Local Redis container, capped at 128 MB | Good enough for dashboard cache without ElastiCache. |
+| Search | Postgres fallback search | OpenSearch is an upgrade path, not a budget default. |
+| Raw analytics | Postgres projections with short retention | ClickHouse is valuable later, but raw tape must be aggressively compacted first. |
+| TLS | Caddy or nginx on the same EC2 host | Avoid the monthly ALB floor. |
+| Backups | Nightly compressed `pg_dump` to S3 | Cheap and easy to inspect/restore. |
+| Secrets | `.env` on the host or SSM Parameter Store standard parameters | Avoid Secrets Manager per-secret charges for the demo. |
+| Logs | Local log rotation, optional minimal CloudWatch | Keep noisy worker logs from becoming a surprise bill. |
 
 ### Redis (budget)
 
 `docker-compose.budget.yml` runs Redis with `--maxmemory 128mb` and
-`--maxmemory-policy allkeys-lru` (no AOF/RDB persistence in that profile). **Any**
-key—including `dashboard:*` cache entries and rate-limit counters—can be evicted
+`--maxmemory-policy allkeys-lru` (no AOF/RDB persistence in that profile). Any
+key, including `dashboard:*` cache entries and rate-limit counters, can be evicted
 when usage approaches the cap. Symptoms: first dashboard paint is slow even
 though the cache warmer runs, or `redis-cli --scan --pattern 'dashboard:*'`
 returns nothing until traffic repopulates keys. Mitigations: raise `maxmemory`,
@@ -34,12 +40,6 @@ Dashboard `dashboard:*` keys: user requests that hit Redis return cached bytes
 without extending TTL; the pipeline’s `warm_dashboard_cache_once` path forces
 rebuild + `SETEX` each warm so tiles and pipeline health stay current between
 TTL expirations.
-| Search | Postgres fallback search | OpenSearch is an upgrade path, not a budget default. |
-| Raw analytics | Postgres projections with short retention | ClickHouse is valuable later, but raw tape must be aggressively compacted first. |
-| TLS | Caddy or nginx on the same EC2 host | Avoid the monthly ALB floor. |
-| Backups | Nightly compressed `pg_dump` to S3 | Cheap and easy to inspect/restore. |
-| Secrets | `.env` on the host or SSM Parameter Store standard parameters | Avoid Secrets Manager per-secret charges for the demo. |
-| Logs | Local log rotation, optional minimal CloudWatch | Keep noisy worker logs from becoming a surprise bill. |
 
 `docker-compose.budget.yml` is the budget profile. It runs:
 
@@ -49,8 +49,10 @@ TTL expirations.
 - `pipeline`
 
 The `pipeline` service runs poller, WebSocket ingest, news ingest, scoring
-materializers, and retention maintenance under the lightweight supervisor. It
-keeps L2/order-book subscriptions narrow and runs retention hourly.
+materializers, retention maintenance, anomaly retention, chart-history
+compaction, and dashboard cache warming under the lightweight supervisor. It
+keeps L2/order-book subscriptions narrow, keeps raw ticker snapshots gated by
+storage tier, and compacts old closed-market chart buckets after a 7-day grace.
 
 ## Budget Environment
 
@@ -74,6 +76,8 @@ Important budget defaults:
 KALSHI_RAW_BACKEND=postgres
 KALSHI_BOOK_MARKET_LIMIT=5
 KALSHI_WS_WORKER_COUNT=1
+KALSHI_CHART_HISTORY_ENABLED=1
+KALSHI_WS_TICKER_SNAPSHOTS_ENABLED=1
 RETENTION_BOOK_EVENTS_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_OBSERVE_MAX_AGE_DAYS=1
 RETENTION_SNAPSHOT_SAMPLED_MAX_AGE_DAYS=3
@@ -176,7 +180,11 @@ raw tables are allowed to run without pruning. Keep these rules strict:
 - Keep book events around for about one day unless a case is promoted.
 - Keep observe/sample snapshot history short; store durable conclusions, not
   every tick.
-- Run retention maintenance hourly.
+- Run retention maintenance frequently with bounded batches. Snapshot pruning
+  should require matching `market_price_history` coverage and must preserve
+  latest-snapshot/anomaly references.
+- Run chart-history compaction for closed/resolved markets after the 7-day
+  grace so price charts can use compact buckets instead of raw snapshots.
 - Send compressed Postgres dumps to S3 and expire old backups after 7-14 days.
 - Prefer retained evidence, market metrics, news links, trade flags, and anomaly
   summaries for demos.
@@ -256,6 +264,7 @@ Use one image with different commands:
 | `ws-trade-feed` service | `python -m scripts.run_ws_ticker_consumer` |
 | `news-pipeline` service | `python -m scripts.run_news_surveillance_pipeline --watch --interval-seconds 300` |
 | scheduled `retention-maintenance` task | `python -m scripts.run_retention_maintenance --execute --analyze` |
+| scheduled `chart-history-compaction` task | `python -m scripts.run_chart_history_compaction --execute --replace-source-rows` |
 | scheduled `clickhouse-retention-check` task | `python -m scripts.verify_clickhouse_retention --strict` |
 | one-shot migration task | `python -m alembic upgrade head` |
 | one-shot projection backfill | `python -m scripts.backfill_market_metrics` |

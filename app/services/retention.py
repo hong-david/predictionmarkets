@@ -74,7 +74,7 @@ from app.services.classifier import Classification, classify
 
 # Categories that are entirely dropped from the surveillance universe.
 # Adding a category here must be paired with a scope-justification entry
-# in the README design-choices section (see "Retention / scope policy").
+# in the README operational tradeoffs and storage-retention sections.
 EXCLUDED_CATEGORIES: frozenset[str] = frozenset({"exotic_combo", "crypto_strike"})
 
 # Manipulability priors below which markets are dropped. `very_low`

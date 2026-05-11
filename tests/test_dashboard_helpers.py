@@ -8,6 +8,8 @@ from app.api.routes.dashboard import (
     _cached_dashboard_payload,
     _clickhouse_table_count,
     _DASHBOARD_CACHE_SCHEMA_VERSION,
+    _history_coverage_windows,
+    _merge_series_snapshot_payloads,
     _metric_probability_float,
     _probability_float,
 )
@@ -153,6 +155,105 @@ def test_metric_probability_uses_latest_or_bid_ask_midpoint() -> None:
         )
         == 0.35
     )
+
+
+def test_series_snapshot_merge_uses_raw_fallback_before_chart_history() -> None:
+    merged = _merge_series_snapshot_payloads(
+        chart_history_payloads=[
+            {
+                "ts": "2026-05-08T16:10:00+00:00",
+                "last_price": 0.51,
+                "source": "chart_history",
+            }
+        ],
+        fallback_payloads=[
+            {
+                "ts": "2026-05-08T16:05:00+00:00",
+                "last_price": 0.49,
+                "source": "market_snapshot",
+            }
+        ],
+        limit=10,
+    )
+
+    assert [row["source"] for row in merged] == ["market_snapshot", "chart_history"]
+
+
+def test_series_snapshot_merge_prefers_chart_history_for_duplicate_timestamp() -> None:
+    merged = _merge_series_snapshot_payloads(
+        chart_history_payloads=[
+            {
+                "ts": "2026-05-08T16:10:00+00:00",
+                "last_price": 0.51,
+                "source": "chart_history",
+            }
+        ],
+        fallback_payloads=[
+            {
+                "ts": "2026-05-08T16:10:00+00:00",
+                "last_price": 0.49,
+                "source": "market_snapshot",
+            }
+        ],
+        limit=10,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["source"] == "chart_history"
+    assert merged[0]["last_price"] == 0.51
+
+
+def test_series_snapshot_merge_prefers_finer_chart_interval() -> None:
+    merged = _merge_series_snapshot_payloads(
+        chart_history_payloads=[
+            {
+                "ts": "2026-05-08T16:00:00+00:00",
+                "last_price": 0.48,
+                "source": "chart_history",
+                "interval_sec": 3600,
+            },
+            {
+                "ts": "2026-05-08T16:00:00+00:00",
+                "last_price": 0.52,
+                "source": "chart_history",
+                "interval_sec": 300,
+            },
+        ],
+        fallback_payloads=[],
+        limit=10,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["interval_sec"] == 300
+    assert merged[0]["last_price"] == 0.52
+
+
+def test_history_coverage_windows_merge_mixed_intervals() -> None:
+    rows = [
+        SimpleNamespace(
+            bucket_start=datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
+            interval_sec=3600,
+        ),
+        SimpleNamespace(
+            bucket_start=datetime(2026, 5, 8, 16, 5, tzinfo=timezone.utc),
+            interval_sec=300,
+        ),
+        SimpleNamespace(
+            bucket_start=datetime(2026, 5, 8, 17, 30, tzinfo=timezone.utc),
+            interval_sec=300,
+        ),
+    ]
+
+    assert _history_coverage_windows(rows) == [
+        (
+            datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
+            datetime(2026, 5, 8, 17, 0, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 5, 8, 17, 30, tzinfo=timezone.utc),
+            datetime(2026, 5, 8, 17, 35, tzinfo=timezone.utc),
+        ),
+    ]
 
 
 def test_clickhouse_table_count_reads_supported_table(monkeypatch) -> None:
