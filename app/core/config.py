@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     kalshi_book_market_tickers: list[str] = []
     kalshi_book_market_limit: int = 50
     kalshi_ws_queue_size: int = 10000
-    kalshi_ws_worker_count: int = 4
+    kalshi_ws_worker_count: int = 1
 
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     retention_snapshot_observe_max_age_days: int = 2
     retention_snapshot_sampled_max_age_days: int = 7
     retention_snapshot_hot_max_age_days: int = 30
-    retention_batch_size: int = 500
+    retention_batch_size: int = 5000
 
     model_config = SettingsConfigDict(
         env_file=".env",

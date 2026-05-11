@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import delete
+from sqlalchemy import delete, text
 from sqlalchemy.orm import Session
 
 from app.db.models import Market, MarketPriceHistory
@@ -35,6 +37,8 @@ from app.services.pipeline_heartbeat import (
 
 
 TARGET_INTERVAL_SEC = 3600
+CHART_HISTORY_COMPACTION_LOCK_KEY = "predictionmarkets:chart_history_compaction"
+logger = logging.getLogger(__name__)
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
@@ -169,6 +173,22 @@ def _delete_source_rows(
     return int(result.rowcount or 0)
 
 
+def _try_chart_history_compaction_lock(db: Session) -> bool:
+    return bool(
+        db.execute(
+            text("select pg_try_advisory_lock(hashtext(:key))"),
+            {"key": CHART_HISTORY_COMPACTION_LOCK_KEY},
+        ).scalar()
+    )
+
+
+def _release_chart_history_compaction_lock(db: Session) -> None:
+    db.execute(
+        text("select pg_advisory_unlock(hashtext(:key))"),
+        {"key": CHART_HISTORY_COMPACTION_LOCK_KEY},
+    )
+
+
 def compact_chart_history(
     db: Session,
     *,
@@ -181,6 +201,13 @@ def compact_chart_history(
     execute: bool,
     replace_source_rows: bool,
 ) -> dict[str, Any]:
+    if execute and not replace_source_rows:
+        raise ValueError(
+            "Unsafe chart-history compaction: --execute must be paired with "
+            "--replace-source-rows. bulk_upsert_chart_history adds aggregate "
+            "counts on conflict, so executing without deleting compacted source "
+            "rows can double-count on the next run."
+        )
     cutoff = datetime.now(timezone.utc) - timedelta(days=grace_days_after_close)
     markets = _candidate_markets(
         db,
@@ -245,8 +272,119 @@ def compact_chart_history(
         db.rollback()
     return result
 
+def _compaction_policies_from_args(args: argparse.Namespace) -> list[dict[str, int]]:
+    raw = str(getattr(args, "policies", "") or "").strip()
+    if not raw:
+        return [
+            {
+                "source_interval_sec": max(1, args.source_interval_sec),
+                "target_interval_sec": max(1, args.target_interval_sec),
+                "grace_days_after_close": max(0, args.grace_days_after_close),
+            }
+        ]
+
+    policies: list[dict[str, int]] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        fields = [field.strip() for field in value.split(":")]
+        if len(fields) != 3:
+            raise ValueError(
+                "chart compaction policies must be source:target:grace_days entries"
+            )
+        source, target, grace = (int(field) for field in fields)
+        policies.append(
+            {
+                "source_interval_sec": max(1, source),
+                "target_interval_sec": max(1, target),
+                "grace_days_after_close": max(0, grace),
+            }
+        )
+    if not policies:
+        raise ValueError("at least one chart compaction policy is required")
+    return policies
+
+
+def _run_once(args: argparse.Namespace) -> dict[str, Any]:
+    db = SessionLocal()
+    locked = False
+    try:
+        locked = _try_chart_history_compaction_lock(db)
+        if not locked:
+            logger.info("chart-history compaction lock skipped")
+            return {
+                "dry_run": not args.execute,
+                "replace_source_rows": False,
+                "skipped": True,
+                "reason": "another_chart_history_compaction_running",
+                "lock_acquired": False,
+                "grace_days_after_close": args.grace_days_after_close,
+                "source_interval_sec": args.source_interval_sec,
+                "target_interval_sec": args.target_interval_sec,
+                "markets": 0,
+                "source_rows": 0,
+                "target_buckets": 0,
+                "target_rows_upserted": 0,
+                "source_rows_deleted": 0,
+            }
+
+        logger.info("chart-history compaction lock acquired")
+        policies = _compaction_policies_from_args(args)
+        policy_results = []
+        for policy in policies:
+            policy_results.append(
+                compact_chart_history(
+                    db,
+                    grace_days_after_close=policy["grace_days_after_close"],
+                    source_interval_sec=policy["source_interval_sec"],
+                    target_interval_sec=policy["target_interval_sec"],
+                    max_markets=max(1, args.max_markets),
+                    offset=max(0, args.offset),
+                    max_source_rows_per_market=max(0, args.max_source_rows_per_market),
+                    execute=bool(args.execute),
+                    replace_source_rows=bool(args.replace_source_rows),
+                )
+            )
+        first_policy = policies[0]
+        result = {
+            "dry_run": not args.execute,
+            "replace_source_rows": bool(args.replace_source_rows and args.execute),
+            "grace_days_after_close": first_policy["grace_days_after_close"],
+            "source_interval_sec": first_policy["source_interval_sec"],
+            "target_interval_sec": first_policy["target_interval_sec"],
+            "policies": policy_results,
+            "markets": sum(int(item.get("markets") or 0) for item in policy_results),
+            "source_rows": sum(
+                int(item.get("source_rows") or 0) for item in policy_results
+            ),
+            "target_buckets": sum(
+                int(item.get("target_buckets") or 0) for item in policy_results
+            ),
+            "target_rows_upserted": sum(
+                int(item.get("target_rows_upserted") or 0) for item in policy_results
+            ),
+            "source_rows_deleted": sum(
+                int(item.get("source_rows_deleted") or 0) for item in policy_results
+            ),
+            "lock_acquired": True,
+        }
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if locked:
+            _release_chart_history_compaction_lock(db)
+            logger.info("chart-history compaction lock released")
+        db.close()
+
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--replace-source-rows", action="store_true")
@@ -257,56 +395,69 @@ def main() -> None:
         default=DEFAULT_CHART_HISTORY_INTERVAL_SEC,
     )
     parser.add_argument("--target-interval-sec", type=int, default=TARGET_INTERVAL_SEC)
+    parser.add_argument(
+        "--policies",
+        default="",
+        help=(
+            "Optional comma-separated source:target:grace_days policies, e.g. "
+            "300:3600:7,3600:86400:180."
+        ),
+    )
     parser.add_argument("--max-markets", type=int, default=100)
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--max-source-rows-per-market", type=int, default=0)
+    parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--interval-seconds", type=float, default=21_600.0)
     args = parser.parse_args()
 
-    run_id = new_run_id("chart-history-compaction")
-    mark_pipeline_start(
-        "chart_history_compaction",
-        detail="Starting chart-history compaction.",
-        run_id=run_id,
-        metadata={
-            "dry_run": not args.execute,
-            "replace_source_rows": bool(args.replace_source_rows and args.execute),
-        },
-    )
-    db = SessionLocal()
-    try:
-        result = compact_chart_history(
-            db,
-            grace_days_after_close=max(0, args.grace_days_after_close),
-            source_interval_sec=max(1, args.source_interval_sec),
-            target_interval_sec=max(1, args.target_interval_sec),
-            max_markets=max(1, args.max_markets),
-            offset=max(0, args.offset),
-            max_source_rows_per_market=max(0, args.max_source_rows_per_market),
-            execute=bool(args.execute),
-            replace_source_rows=bool(args.replace_source_rows),
-        )
-        mark_pipeline_success(
+    while True:
+        run_id = new_run_id("chart-history-compaction")
+        mark_pipeline_start(
             "chart_history_compaction",
-            detail=(
-                f"Chart-history compaction examined {result['source_rows']} "
-                f"source rows into {result['target_buckets']} target buckets."
-            ),
+            detail="Starting chart-history compaction.",
             run_id=run_id,
-            count=int(result["target_buckets"]),
-            metadata=result,
+            metadata={
+                "dry_run": not args.execute,
+                "replace_source_rows": bool(args.replace_source_rows and args.execute),
+                "watch": bool(args.watch),
+            },
         )
-        print(json.dumps(result, indent=2, sort_keys=True))
-    except Exception as exc:
-        db.rollback()
-        mark_pipeline_error(
-            "chart_history_compaction",
-            exc,
-            detail="chart-history compaction failed.",
-            run_id=run_id,
-        )
-        raise
-    finally:
-        db.close()
+        try:
+            result = _run_once(args)
+            if result.get("skipped"):
+                detail = (
+                    "Skipped chart-history compaction; another sweep is already "
+                    "running."
+                )
+                count = 0
+            else:
+                detail = (
+                    f"Chart-history compaction examined {result['source_rows']} "
+                    f"source rows into {result['target_buckets']} target buckets."
+                )
+                count = int(result["target_buckets"])
+            mark_pipeline_success(
+                "chart_history_compaction",
+                detail=detail,
+                run_id=run_id,
+                count=count,
+                metadata=result,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+        except Exception as exc:
+            logger.exception("chart-history compaction failed")
+            mark_pipeline_error(
+                "chart_history_compaction",
+                exc,
+                detail="chart-history compaction failed.",
+                run_id=run_id,
+            )
+            if not args.watch:
+                raise
+
+        if not args.watch:
+            return
+        time.sleep(max(60.0, args.interval_seconds))
 
 
 if __name__ == "__main__":

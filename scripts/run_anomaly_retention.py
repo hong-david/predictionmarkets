@@ -68,15 +68,60 @@ def _execute_batch_stmt():
             SELECT
                 id,
                 market_pk,
+                latest_snapshot_id,
                 date_trunc('day', created_at)::date AS summary_date,
                 severity,
                 score::numeric AS score,
+                reasons,
+                signals,
                 created_at
             FROM anomalies
             WHERE created_at < :cutoff
               AND severity IN :severities
             ORDER BY severity ASC, created_at DESC, id DESC
             LIMIT :batch_size
+        ),
+        evidence AS (
+            INSERT INTO anomaly_evidence (
+                market_pk,
+                source_anomaly_pk,
+                source_snapshot_pk,
+                ts,
+                score,
+                severity,
+                reasons,
+                signals,
+                storage_tier,
+                retention_reason,
+                created_at,
+                updated_at
+            )
+            SELECT
+                v.market_pk,
+                v.id,
+                v.latest_snapshot_id,
+                v.created_at,
+                v.score,
+                v.severity,
+                coalesce(v.reasons, '[]'::json),
+                coalesce(v.signals, '{}'::json),
+                mm.storage_tier,
+                'anomaly_retention',
+                now(),
+                now()
+            FROM victims v
+            LEFT JOIN market_metrics mm ON mm.market_pk = v.market_pk
+            WHERE v.severity NOT IN ('none', 'low')
+               OR v.score >= :evidence_min_score
+            ON CONFLICT (source_anomaly_pk) DO UPDATE SET
+                source_snapshot_pk = excluded.source_snapshot_pk,
+                score = greatest(anomaly_evidence.score, excluded.score),
+                severity = excluded.severity,
+                reasons = excluded.reasons,
+                signals = excluded.signals,
+                storage_tier = excluded.storage_tier,
+                updated_at = now()
+            RETURNING id
         ),
         rolled AS (
             INSERT INTO anomaly_daily_summaries (
@@ -168,6 +213,7 @@ def _execute_batch_stmt():
         )
         SELECT
             (SELECT count(*) FROM victims)::bigint AS victim_count,
+            (SELECT count(*) FROM evidence)::bigint AS evidence_count,
             (SELECT count(*) FROM deleted)::bigint AS deleted_count,
             (SELECT count(DISTINCT market_pk) FROM deleted)::bigint
                 AS affected_markets,
@@ -199,6 +245,7 @@ def run_anomaly_retention(
     severities: tuple[str, ...] = DEFAULT_SEVERITIES,
     batch_size: int = 5_000,
     max_batches: int = 100,
+    evidence_min_score: float = 50.0,
     analyze: bool = False,
     sleep_seconds: float = 0.0,
 ) -> dict[str, Any]:
@@ -220,6 +267,7 @@ def run_anomaly_retention(
     deleted_total = 0
     affected_total = 0
     metrics_updated_total = 0
+    evidence_total = 0
     batches = 0
 
     if execute:
@@ -233,6 +281,7 @@ def run_anomaly_retention(
                             "cutoff": cutoff,
                             "severities": severities,
                             "batch_size": batch_size,
+                            "evidence_min_score": evidence_min_score,
                         },
                     )
                     .mappings()
@@ -252,6 +301,7 @@ def run_anomaly_retention(
             deleted_total += deleted
             affected_total += int(row["affected_markets"] or 0)
             metrics_updated_total += int(row["metrics_updated"] or 0)
+            evidence_total += int(row["evidence_count"] or 0)
             logger.info(
                 "anomaly retention batch=%s deleted=%s affected_markets=%s "
                 "metrics_updated=%s",
@@ -267,6 +317,7 @@ def run_anomaly_retention(
             db = SessionLocal()
             try:
                 db.execute(text("ANALYZE anomalies"))
+                db.execute(text("ANALYZE anomaly_evidence"))
                 db.execute(text("ANALYZE anomaly_daily_summaries"))
                 db.execute(text("ANALYZE market_metrics"))
                 db.commit()
@@ -283,11 +334,13 @@ def run_anomaly_retention(
         "candidate_count_before": int(before["candidate_count"] or 0),
         "candidate_count_after": int(after["candidate_count"] or 0),
         "deleted_total": deleted_total,
+        "evidence_upserted": evidence_total,
         "affected_market_batches": affected_total,
         "metrics_updated_batches": metrics_updated_total,
         "batches": batches,
         "batch_size": batch_size,
         "max_batches": max_batches,
+        "evidence_min_score": evidence_min_score,
         "duration_seconds": round(duration, 3),
     }
     logger.info("anomaly retention finished result=%s", result)
@@ -306,6 +359,7 @@ def _run_once(args: argparse.Namespace, *, run_id: str) -> dict[str, Any]:
             "severities": list(severities),
             "batch_size": args.batch_size,
             "max_batches": args.max_batches,
+            "evidence_min_score": args.evidence_min_score,
         },
     )
     result = run_anomaly_retention(
@@ -314,6 +368,7 @@ def _run_once(args: argparse.Namespace, *, run_id: str) -> dict[str, Any]:
         severities=severities,
         batch_size=args.batch_size,
         max_batches=args.max_batches,
+        evidence_min_score=args.evidence_min_score,
         analyze=args.analyze,
         sleep_seconds=args.sleep_seconds,
     )
@@ -339,6 +394,7 @@ def main() -> None:
     parser.add_argument("--severities", default=",".join(DEFAULT_SEVERITIES))
     parser.add_argument("--batch-size", type=int, default=5_000)
     parser.add_argument("--max-batches", type=int, default=100)
+    parser.add_argument("--evidence-min-score", type=float, default=50.0)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
     parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--watch", action="store_true")

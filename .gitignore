@@ -10,6 +10,7 @@ __pycache__/
 .codex-*.log
 .codex-*.out
 .pipeline-logs/
+.monitor-logs/
 
 # Frontend
 frontend/node_modules/
