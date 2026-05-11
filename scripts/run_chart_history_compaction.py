@@ -201,6 +201,13 @@ def compact_chart_history(
     execute: bool,
     replace_source_rows: bool,
 ) -> dict[str, Any]:
+    if execute and not replace_source_rows:
+        raise ValueError(
+            "Unsafe chart-history compaction: --execute must be paired with "
+            "--replace-source-rows. bulk_upsert_chart_history adds aggregate "
+            "counts on conflict, so executing without deleting compacted source "
+            "rows can double-count on the next run."
+        )
     cutoff = datetime.now(timezone.utc) - timedelta(days=grace_days_after_close)
     markets = _candidate_markets(
         db,

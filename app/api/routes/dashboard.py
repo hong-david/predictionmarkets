@@ -115,7 +115,7 @@ _DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", 
 _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
     os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
 )
-_DASHBOARD_CACHE_SCHEMA_VERSION = "v2"
+_DASHBOARD_CACHE_SCHEMA_VERSION = "v3"
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 # Match `frontend/src/routes/Overview.tsx` granular limits for cache/warm alignment.
@@ -2473,6 +2473,107 @@ def _diversify_suspicious_trades(items: list[dict], limit: int) -> list[dict]:
 
     return out[:limit]
 
+def _suspicious_trade_flag_payload(
+    flag: TradeFlag,
+    trade: Trade,
+    market: Market,
+) -> dict:
+    return {
+        "market_id": market.market_id,
+        "event_id": market.event_id,
+        "title": market.title,
+        "subtitle": market.subtitle,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
+        "manipulability_prior": market.manipulability_prior,
+        "trade_id": trade.trade_id,
+        "ts": trade.ts.isoformat() if trade.ts else None,
+        "yes_price": (
+            float(trade.yes_price_dollars)
+            if trade.yes_price_dollars is not None
+            else None
+        ),
+        "no_price": (
+            float(trade.no_price_dollars)
+            if trade.no_price_dollars is not None
+            else None
+        ),
+        "count": float(trade.count_fp) if trade.count_fp is not None else None,
+        "trade_dollar_amount": _trade_notional_dollars(
+            yes_price=trade.yes_price_dollars,
+            no_price=trade.no_price_dollars,
+            count=trade.count_fp,
+            taker_side=trade.taker_side,
+        ),
+        "taker_side": trade.taker_side,
+        "suspicion": float(flag.score),
+        "local_suspicion": float(flag.local_score),
+        "context_score": float(flag.context_score),
+        "reasons": flag.reasons or [],
+        "features": {
+            "context": flag.features or {},
+            "components": flag.components or {},
+        },
+        "severity": flag.severity,
+        "promoted_storage_tier": flag.promoted_storage_tier,
+        "source": "trade_flags",
+    }
+
+
+def _suspicious_trade_evidence_payload(
+    evidence: TradeEvidence,
+    market: Market,
+) -> dict:
+    return {
+        "market_id": market.market_id,
+        "event_id": market.event_id,
+        "title": market.title,
+        "subtitle": market.subtitle,
+        "category": _dashboard_market_category(market),
+        "raw_category": market.category,
+        "category_family": _dashboard_market_family(market),
+        "manipulability_prior": market.manipulability_prior,
+        "trade_id": evidence.trade_id,
+        "ts": evidence.ts.isoformat() if evidence.ts else None,
+        "yes_price": (
+            float(evidence.yes_price_dollars)
+            if evidence.yes_price_dollars is not None
+            else None
+        ),
+        "no_price": (
+            float(evidence.no_price_dollars)
+            if evidence.no_price_dollars is not None
+            else None
+        ),
+        "count": float(evidence.count_fp) if evidence.count_fp is not None else None,
+        "trade_dollar_amount": _trade_notional_dollars(
+            yes_price=evidence.yes_price_dollars,
+            no_price=evidence.no_price_dollars,
+            count=evidence.count_fp,
+            taker_side=evidence.taker_side,
+        ),
+        "taker_side": evidence.taker_side,
+        "suspicion": float(evidence.score),
+        "local_suspicion": float(evidence.local_score),
+        "context_score": float(evidence.context_score),
+        "reasons": evidence.reasons or [],
+        "features": {
+            "context": evidence.features or {},
+            "components": evidence.components or {},
+        },
+        "severity": evidence.severity,
+        "promoted_storage_tier": evidence.storage_tier,
+        "retention_reason": evidence.retention_reason,
+        "source": "trade_evidence",
+    }
+
+
+def _suspicious_trade_dedupe_key(item: dict) -> str:
+    return str(
+        item.get("trade_id")
+        or f"{item.get('market_id')}:{item.get('ts')}:{item.get('suspicion')}"
+    )
 
 def _suspicious_trades_payload(
     db: Session,
@@ -2495,56 +2596,6 @@ def _suspicious_trades_payload(
         .all()
     )
 
-    if persisted:
-        trades = [
-            {
-                "market_id": market.market_id,
-                "event_id": market.event_id,
-                "title": market.title,
-                "subtitle": market.subtitle,
-                "category": _dashboard_market_category(market),
-                "raw_category": market.category,
-                "category_family": _dashboard_market_family(market),
-                "manipulability_prior": market.manipulability_prior,
-                "trade_id": trade.trade_id,
-                "ts": trade.ts.isoformat() if trade.ts else None,
-                "yes_price": float(trade.yes_price_dollars)
-                if trade.yes_price_dollars is not None
-                else None,
-                "no_price": float(trade.no_price_dollars)
-                if trade.no_price_dollars is not None
-                else None,
-                "count": float(trade.count_fp) if trade.count_fp is not None else None,
-                "trade_dollar_amount": _trade_notional_dollars(
-                    yes_price=trade.yes_price_dollars,
-                    no_price=trade.no_price_dollars,
-                    count=trade.count_fp,
-                    taker_side=trade.taker_side,
-                ),
-                "taker_side": trade.taker_side,
-                "suspicion": float(flag.score),
-                "local_suspicion": float(flag.local_score),
-                "context_score": float(flag.context_score),
-                "reasons": flag.reasons or [],
-                "features": {
-                    "context": flag.features or {},
-                    "components": flag.components or {},
-                },
-                "severity": flag.severity,
-                "promoted_storage_tier": flag.promoted_storage_tier,
-            }
-            for flag, trade, market in persisted
-        ]
-        trades = _diversify_suspicious_trades(trades, limit)
-        return {
-            "count": len(trades),
-            "trades": trades,
-            "sample": sample,
-            "candidate_count": len(persisted),
-            "source": "trade_flags",
-            "diversified": True,
-        }
-
     evidence_rows = (
         db.query(TradeEvidence, Market)
         .join(Market, Market.id == TradeEvidence.market_pk)
@@ -2554,56 +2605,46 @@ def _suspicious_trades_payload(
         .limit(candidate_limit)
         .all()
     )
-    if evidence_rows:
-        trades = [
-            {
-                "market_id": market.market_id,
-                "event_id": market.event_id,
-                "title": market.title,
-                "subtitle": market.subtitle,
-                "category": _dashboard_market_category(market),
-                "raw_category": market.category,
-                "category_family": _dashboard_market_family(market),
-                "manipulability_prior": market.manipulability_prior,
-                "trade_id": evidence.trade_id,
-                "ts": evidence.ts.isoformat() if evidence.ts else None,
-                "yes_price": float(evidence.yes_price_dollars)
-                if evidence.yes_price_dollars is not None
-                else None,
-                "no_price": float(evidence.no_price_dollars)
-                if evidence.no_price_dollars is not None
-                else None,
-                "count": float(evidence.count_fp)
-                if evidence.count_fp is not None
-                else None,
-                "trade_dollar_amount": _trade_notional_dollars(
-                    yes_price=evidence.yes_price_dollars,
-                    no_price=evidence.no_price_dollars,
-                    count=evidence.count_fp,
-                    taker_side=evidence.taker_side,
-                ),
-                "taker_side": evidence.taker_side,
-                "suspicion": float(evidence.score),
-                "local_suspicion": float(evidence.local_score),
-                "context_score": float(evidence.context_score),
-                "reasons": evidence.reasons or [],
-                "features": {
-                    "context": evidence.features or {},
-                    "components": evidence.components or {},
-                },
-                "severity": evidence.severity,
-                "promoted_storage_tier": evidence.storage_tier,
-                "retention_reason": evidence.retention_reason,
-            }
-            for evidence, market in evidence_rows
-        ]
-        trades = _diversify_suspicious_trades(trades, limit)
+
+    if persisted or evidence_rows:
+        by_trade: dict[str, dict] = {}
+
+        # Prefer live raw TradeFlag rows when both sources describe the same trade.
+        for flag, trade, market in persisted:
+            item = _suspicious_trade_flag_payload(flag, trade, market)
+            by_trade[_suspicious_trade_dedupe_key(item)] = item
+
+        for evidence, market in evidence_rows:
+            item = _suspicious_trade_evidence_payload(evidence, market)
+            key = _suspicious_trade_dedupe_key(item)
+            if key not in by_trade:
+                by_trade[key] = item
+
+        candidates = sorted(
+            by_trade.values(),
+            key=lambda item: (
+                float(item.get("suspicion") or 0.0),
+                item.get("ts") or "",
+            ),
+            reverse=True,
+        )
+        trades = _diversify_suspicious_trades(candidates, limit)
+
+        if persisted and evidence_rows:
+            source = "trade_flags+trade_evidence"
+        elif persisted:
+            source = "trade_flags"
+        else:
+            source = "trade_evidence"
+
         return {
             "count": len(trades),
             "trades": trades,
             "sample": sample,
-            "candidate_count": len(evidence_rows),
-            "source": "trade_evidence",
+            "candidate_count": len(candidates),
+            "raw_candidate_count": len(persisted),
+            "evidence_candidate_count": len(evidence_rows),
+            "source": source,
             "diversified": True,
         }
 
