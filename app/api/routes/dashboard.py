@@ -159,10 +159,11 @@ def _cached_dashboard_payload(
             if cached and now - cached[0] < ttl:
                 if r is not None:
                     try:
-                        r.setex(redis_key, max(1, int(ttl)), orjson.dumps(cached[1]))
+                        remaining_ttl = max(1, int(ttl - (now - cached[0])))
+                        r.setex(redis_key, remaining_ttl, orjson.dumps(cached[1]))
                     except Exception as exc:
                         logger.debug("dashboard redis cache write failed: %s", exc)
-                return cached[1]  # type: ignore[return-value]
+                return cached[1]
 
     payload = build()
     if r is not None:
