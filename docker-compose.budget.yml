@@ -122,9 +122,9 @@ services:
       - --retention-hot-snapshot-days
       - "14"
       - --retention-batch-size
-      - "5000"
+      - "2500"
       - --retention-max-batches
-      - "20"
+      - "60"
       - --retention-with-trade-retention
       - --retention-trade-observe-days-after-close
       - "1"

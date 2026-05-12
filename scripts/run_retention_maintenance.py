@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_COMPACT_CHART_HISTORY_INTERVAL_SEC = int(
     os.getenv("KALSHI_CHART_HISTORY_COMPACT_INTERVAL_SEC", "3600")
 )
-DEFAULT_RETENTION_MAX_BATCHES = int(os.getenv("KALSHI_RETENTION_MAX_BATCHES", "20"))
+DEFAULT_RETENTION_MAX_BATCHES = int(os.getenv("KALSHI_RETENTION_MAX_BATCHES", "60"))
 TRADE_RETENTION_DAYS_BY_TIER = {
     "observe_only": 1,
     "sampled": 14,
@@ -523,8 +523,8 @@ def _run_batched_delete(
     execute: bool,
     batch_size: int,
     delete_batch,
-    sleep_seconds: float = 0.25,
-    max_batches: int = 20,
+    sleep_seconds: float = 0.0,
+    max_batches: int = 60,
     stop_on_partial_batch: bool = True,
 ) -> dict[str, int]:
     # In dry-run mode, we can report the pre-count if the caller chose to compute it.

@@ -380,6 +380,7 @@ from a live bucket, compacted bucket, or raw fallback snapshot.
 
 ### 2026-05-11
 
+- Raw retention batching (`scripts/run_retention_maintenance.py`, `scripts/run_pipeline.py`, `app/core/config.py`, `docker-compose.budget.yml`): removed the fixed sleep between delete batches (`sleep_seconds` default `0`); default **`retention_batch_size` is 2500** and **`max_batches` is 60** (same cap per sweep as before: 60×2500 = 20×5000 rows per tier when batches are full). Env override remains `KALSHI_RETENTION_MAX_BATCHES`. Snapshot sweeps still use `stop_on_partial_batch=False` so a short batch does **not** end the tier early (partial batches are normal given the per-market lateral cap).
 - Dashboard Redis cache (`_cached_dashboard_payload` in `app/api/routes/dashboard.py`):
   normal API reads no longer call `EXPIRE` on hits, so user traffic cannot keep
   stale JSON alive past the original `SETEX` TTL. `warm_dashboard_cache_once`
@@ -407,7 +408,8 @@ Most configuration comes from `.env` through `app/core/config.py`.
 | `KALSHI_POLLER_QUOTE_SNAPSHOTS_ENABLED` | Enables raw REST quote snapshots from the poller. Budget default is `0`. |
 | `KALSHI_REST_RETRY_*` | REST retry attempts and exponential backoff base. |
 | `DASHBOARD_*_CACHE_TTL_SEC` | Redis TTLs for dashboard API payloads. |
-| `RETENTION_*` | Raw event age limits and pruning batch size. |
+| `RETENTION_*` | Raw event age limits and pruning batch size (`retention_batch_size` default `2500` in `app/core/config.py`). |
+| `KALSHI_RETENTION_MAX_BATCHES` | Caps retention delete loops per table tier (default `60` in `scripts/run_retention_maintenance.py`). |
 | `OPENSEARCH_URL` | Optional OpenSearch endpoint. Empty means Postgres fallback. |
 | `CLICKHOUSE_URL` | Optional ClickHouse endpoint. |
 | `RATE_LIMIT_*` | API request caps by route type. |
