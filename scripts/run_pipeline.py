@@ -260,6 +260,8 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
             retention_command.append("--delete-flagged-trades-with-evidence")
         if getattr(args, "retention_allow_uncovered_trade_delete", False):
             retention_command.append("--allow-uncovered-trade-delete")
+        if getattr(args, "retention_allow_uncovered_snapshot_delete", False):
+            retention_command.append("--allow-uncovered-snapshot-delete")
         if getattr(args, "retention_exact_trade_dry_run_counts", False):
             retention_command.append("--exact-trade-dry-run-counts")
         if args.retention_execute:
@@ -440,6 +442,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--retention-allow-uncovered-trade-delete",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--retention-allow-uncovered-snapshot-delete",
         action="store_true",
     )
     parser.add_argument("--retention-exact-trade-dry-run-counts", action="store_true")

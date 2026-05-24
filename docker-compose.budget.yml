@@ -125,6 +125,7 @@ services:
       - "2500"
       - --retention-max-batches
       - "60"
+      - --retention-allow-uncovered-snapshot-delete
       - --retention-with-trade-retention
       - --retention-trade-observe-days-after-close
       - "1"

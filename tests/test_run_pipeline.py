@@ -102,6 +102,7 @@ def test_build_processes_passes_retention_max_batches(tmp_path) -> None:
         retention_trade_case_days_after_close=365,
         retention_delete_flagged_trades_with_evidence=False,
         retention_allow_uncovered_trade_delete=False,
+        retention_allow_uncovered_snapshot_delete=True,
         with_anomaly_retention=False,
         with_dashboard_cache_warmer=False,
         with_chart_history_compaction=False,
@@ -116,4 +117,5 @@ def test_build_processes_passes_retention_max_batches(tmp_path) -> None:
     assert process.command[process.command.index("--batch-size") + 1] == "10000"
     assert process.command[process.command.index("--max-batches") + 1] == "100"
     assert "--with-trade-retention" in process.command
+    assert "--allow-uncovered-snapshot-delete" in process.command
     assert process.command[process.command.index("--trade-sampled-days-after-close") + 1] == "14"
