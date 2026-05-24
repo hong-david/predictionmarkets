@@ -109,7 +109,6 @@ services:
       - "500"
       - --news-batch-size
       - "50"
-      - --with-retention-maintenance
       - --retention-execute
       - --retention-interval-seconds
       - "450"
