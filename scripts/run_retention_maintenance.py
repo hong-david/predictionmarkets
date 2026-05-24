@@ -89,6 +89,39 @@ def _delete_book_events_batch(db: Session, cutoff: datetime, *, batch_size: int)
     return int(result.rowcount or 0)
 
 
+def _snapshot_chart_coverage_sql(
+    *,
+    require_chart_history: bool,
+    snapshot_alias: str,
+) -> str:
+    if not require_chart_history:
+        return ""
+    return f"""
+                  AND (
+                    EXISTS (
+                      SELECT 1
+                      FROM market_price_history h
+                      WHERE h.market_pk = {snapshot_alias}.market_pk
+                        AND h.interval_sec = :live_chart_interval_sec
+                        AND h.bucket_start = to_timestamp(
+                          floor(extract(epoch FROM {snapshot_alias}.ts) / :live_chart_interval_sec)
+                          * :live_chart_interval_sec
+                        )
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM market_price_history h
+                      WHERE h.market_pk = {snapshot_alias}.market_pk
+                        AND h.interval_sec = :compact_chart_interval_sec
+                        AND h.bucket_start = to_timestamp(
+                          floor(extract(epoch FROM {snapshot_alias}.ts) / :compact_chart_interval_sec)
+                          * :compact_chart_interval_sec
+                        )
+                    )
+                  )
+    """
+
+
 def _count_snapshots(
     db: Session,
     tier: str,
@@ -98,10 +131,14 @@ def _count_snapshots(
     live_chart_interval_sec: int,
     compact_chart_interval_sec: int,
 ) -> int:
+    coverage_sql = _snapshot_chart_coverage_sql(
+        require_chart_history=require_chart_history,
+        snapshot_alias="ms",
+    )
     return int(
         db.execute(
             text(
-                """
+                f"""
                 SELECT count(*)::bigint
                 FROM market_snapshots ms
                 JOIN market_metrics mm ON mm.market_pk = ms.market_pk
@@ -116,35 +153,12 @@ def _count_snapshots(
                     FROM anomalies a
                     WHERE a.latest_snapshot_id = ms.id
                   )
-                  AND (
-                    NOT :require_chart_history
-                    OR EXISTS (
-                      SELECT 1
-                      FROM market_price_history h
-                      WHERE h.market_pk = ms.market_pk
-                        AND h.interval_sec = :live_chart_interval_sec
-                        AND h.bucket_start = to_timestamp(
-                          floor(extract(epoch FROM ms.ts) / :live_chart_interval_sec)
-                          * :live_chart_interval_sec
-                        )
-                    )
-                    OR EXISTS (
-                      SELECT 1
-                      FROM market_price_history h
-                      WHERE h.market_pk = ms.market_pk
-                        AND h.interval_sec = :compact_chart_interval_sec
-                        AND h.bucket_start = to_timestamp(
-                          floor(extract(epoch FROM ms.ts) / :compact_chart_interval_sec)
-                          * :compact_chart_interval_sec
-                        )
-                    )
-                  )
+                  {coverage_sql}
                 """
             ),
             {
                 "tier": tier,
                 "cutoff": cutoff,
-                "require_chart_history": require_chart_history,
                 "live_chart_interval_sec": live_chart_interval_sec,
                 "compact_chart_interval_sec": compact_chart_interval_sec,
             },
@@ -163,9 +177,13 @@ def _delete_snapshots_batch(
     live_chart_interval_sec: int,
     compact_chart_interval_sec: int,
 ) -> int:
+    coverage_sql = _snapshot_chart_coverage_sql(
+        require_chart_history=require_chart_history,
+        snapshot_alias="ms",
+    )
     result = db.execute(
         text(
-            """
+            f"""
             WITH tier_markets AS MATERIALIZED (
                 SELECT market_pk, latest_snapshot_id
                 FROM market_metrics
@@ -188,29 +206,7 @@ def _delete_snapshots_batch(
                         FROM anomalies a
                         WHERE a.latest_snapshot_id = ms.id
                       )
-                      AND (
-                        NOT :require_chart_history
-                        OR EXISTS (
-                          SELECT 1
-                          FROM market_price_history h
-                          WHERE h.market_pk = ms.market_pk
-                            AND h.interval_sec = :live_chart_interval_sec
-                            AND h.bucket_start = to_timestamp(
-                              floor(extract(epoch FROM ms.ts) / :live_chart_interval_sec)
-                              * :live_chart_interval_sec
-                            )
-                        )
-                        OR EXISTS (
-                          SELECT 1
-                          FROM market_price_history h
-                          WHERE h.market_pk = ms.market_pk
-                            AND h.interval_sec = :compact_chart_interval_sec
-                            AND h.bucket_start = to_timestamp(
-                              floor(extract(epoch FROM ms.ts) / :compact_chart_interval_sec)
-                              * :compact_chart_interval_sec
-                            )
-                        )
-                      )
+                      {coverage_sql}
                     ORDER BY ms.ts ASC, ms.id ASC
                     LIMIT 8
                 ) s ON TRUE
@@ -225,7 +221,6 @@ def _delete_snapshots_batch(
             "tier": tier,
             "cutoff": cutoff,
             "batch_size": batch_size,
-            "require_chart_history": require_chart_history,
             "live_chart_interval_sec": live_chart_interval_sec,
             "compact_chart_interval_sec": compact_chart_interval_sec,
         },

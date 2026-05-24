@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Anomaly, Market
+from app.db.models import Anomaly, Market, MarketMetric
 from app.services.market_state_alert_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
 from app.services.market_metrics import bump_anomaly_metrics
@@ -201,7 +201,17 @@ def materialize_anomalies(
     deleted = 0
     compacted = 0
 
-    markets = db.query(Market).order_by(Market.id.desc()).limit(market_limit).all()
+    markets = (
+        db.query(Market)
+        .outerjoin(MarketMetric, MarketMetric.market_pk == Market.id)
+        .order_by(
+            MarketMetric.updated_at.desc().nullslast(),
+            Market.updated_at.desc().nullslast(),
+            Market.id.desc(),
+        )
+        .limit(market_limit)
+        .all()
+    )
 
     for market in markets:
         result = materialize_market_anomaly(db, market, lookback=lookback)
