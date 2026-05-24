@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import Anomaly, Market, MarketMetric
@@ -19,6 +21,7 @@ from app.services.quote_series import history_points_for_market
 _MIN_SCORE_TO_PERSIST = 3.0
 _COMPACTION_COOLDOWN = timedelta(minutes=30)
 _SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+logger = logging.getLogger(__name__)
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -37,6 +40,10 @@ def _reason_signature(reasons: object) -> tuple[str, ...]:
     if not isinstance(reasons, list):
         return ()
     return tuple(sorted({str(reason) for reason in reasons}))
+
+
+def _is_deadlock_error(exc: OperationalError) -> bool:
+    return "deadlock detected" in str(getattr(exc, "orig", exc)).lower()
 
 
 def _should_create_new_row(
@@ -200,6 +207,7 @@ def materialize_anomalies(
     updated = 0
     deleted = 0
     compacted = 0
+    errored = 0
 
     markets = (
         db.query(Market)
@@ -214,7 +222,19 @@ def materialize_anomalies(
     )
 
     for market in markets:
-        result = materialize_market_anomaly(db, market, lookback=lookback)
+        try:
+            result = materialize_market_anomaly(db, market, lookback=lookback)
+            db.commit()
+        except OperationalError as exc:
+            db.rollback()
+            if not _is_deadlock_error(exc):
+                raise
+            errored += 1
+            logger.warning(
+                "quote/book anomaly materialization skipped market_pk=%s after deadlock",
+                market.id,
+            )
+            continue
         created += result["created_anomalies"]
         updated += result["updated_anomalies"]
         deleted += result["deleted_anomalies"]
@@ -225,7 +245,7 @@ def materialize_anomalies(
         "quote_book_anomalies",
         detail=(
             f"Scanned {len(markets)} markets; created {created}, updated {updated}, "
-            f"compacted {compacted}, deleted {deleted}."
+            f"compacted {compacted}, deleted {deleted}, deadlocks {errored}."
         ),
         count=created + updated,
         metadata={
@@ -234,6 +254,7 @@ def materialize_anomalies(
             "updated": updated,
             "compacted": compacted,
             "deleted": deleted,
+            "deadlocks": errored,
         },
     )
 
@@ -242,4 +263,5 @@ def materialize_anomalies(
         "updated_anomalies": updated,
         "deleted_anomalies": deleted,
         "compacted_anomalies": compacted,
+        "deadlocked_markets": errored,
     }
