@@ -122,7 +122,7 @@ _DASHBOARD_LIST_CACHE_TTL_SEC = float(os.getenv("DASHBOARD_LIST_CACHE_TTL_SEC", 
 _DASHBOARD_STATIC_CACHE_TTL_SEC = float(
     os.getenv("DASHBOARD_STATIC_CACHE_TTL_SEC", "300")
 )
-_DASHBOARD_CACHE_SCHEMA_VERSION = "v3"
+_DASHBOARD_CACHE_SCHEMA_VERSION = "v4"
 _TOP_MARKETS_RECENT_TRADE_SAMPLE = 50_000
 _SUSPICIOUS_TRADE_SAMPLE = 20_000
 # Match `frontend/src/routes/Overview.tsx` granular limits for cache/warm alignment.
@@ -134,6 +134,7 @@ _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
 _CLICKHOUSE_COUNT_TIMEOUT_SEC = float(os.getenv("CLICKHOUSE_COUNT_TIMEOUT_SEC", "0.75"))
 _SERIES_SNAPSHOT_LIMIT_CAP = 1000
 _SERIES_CHART_HISTORY_QUERY_MULTIPLIER = 2
+_RESOLVED_QUOTE_EDGE_CENTS = 1
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
@@ -279,8 +280,8 @@ def _metric_notional_estimate(
     return max(0.0, float(price) * float(volume_24h_contracts))
 
 
-def _trade_dollar_volume_by_market_since(
-    db: Session, market_pks: list[int], *, since: datetime
+def _trade_dollar_volume_by_market(
+    db: Session, market_pks: list[int], *, since: datetime | None = None
 ) -> dict[int, float]:
     if not market_pks:
         return {}
@@ -291,7 +292,7 @@ def _trade_dollar_volume_by_market_since(
         ),
         else_=Trade.yes_price_dollars,
     )
-    rows = (
+    q = (
         db.query(
             Trade.market_pk,
             func.sum(
@@ -299,11 +300,103 @@ def _trade_dollar_volume_by_market_since(
             ).label("trade_dollar_volume"),
         )
         .filter(Trade.market_pk.in_(market_pks))
-        .filter(Trade.ts >= since)
-        .group_by(Trade.market_pk)
-        .all()
     )
+    if since is not None:
+        q = q.filter(Trade.ts >= since)
+    rows = q.group_by(Trade.market_pk).all()
     return {int(row.market_pk): float(row.trade_dollar_volume or 0.0) for row in rows}
+
+
+def _trade_dollar_volume_by_market_since(
+    db: Session, market_pks: list[int], *, since: datetime
+) -> dict[int, float]:
+    return _trade_dollar_volume_by_market(db, market_pks, since=since)
+
+
+def _resolved_quote_display_cents(
+    *,
+    last_price_cents: int | None,
+    yes_bid_cents: int | None,
+    yes_ask_cents: int | None,
+) -> float | None:
+    if last_price_cents is not None:
+        return float(last_price_cents)
+    if yes_bid_cents is not None and yes_ask_cents is not None:
+        return (float(yes_bid_cents) + float(yes_ask_cents)) / 2.0
+    if yes_bid_cents is not None:
+        return float(yes_bid_cents)
+    if yes_ask_cents is not None:
+        return float(yes_ask_cents)
+    return None
+
+
+def _is_likely_resolved_quote_values(
+    *,
+    last_price_cents: int | None,
+    yes_bid_cents: int | None,
+    yes_ask_cents: int | None,
+) -> bool:
+    display = _resolved_quote_display_cents(
+        last_price_cents=last_price_cents,
+        yes_bid_cents=yes_bid_cents,
+        yes_ask_cents=yes_ask_cents,
+    )
+    if display is not None and (
+        display <= _RESOLVED_QUOTE_EDGE_CENTS
+        or display >= 100 - _RESOLVED_QUOTE_EDGE_CENTS
+    ):
+        return True
+    if yes_bid_cents is None or yes_ask_cents is None:
+        return False
+    return (
+        yes_bid_cents <= _RESOLVED_QUOTE_EDGE_CENTS
+        and yes_ask_cents >= 100 - _RESOLVED_QUOTE_EDGE_CENTS
+    )
+
+
+def _metric_unresolved_quote_filter():
+    display = case(
+        (MarketMetric.last_price_cents.isnot(None), MarketMetric.last_price_cents),
+        (
+            and_(
+                MarketMetric.yes_bid_cents.isnot(None),
+                MarketMetric.yes_ask_cents.isnot(None),
+            ),
+            (MarketMetric.yes_bid_cents + MarketMetric.yes_ask_cents) / 2.0,
+        ),
+        (MarketMetric.yes_bid_cents.isnot(None), MarketMetric.yes_bid_cents),
+        else_=MarketMetric.yes_ask_cents,
+    )
+    full_width_endpoint = and_(
+        MarketMetric.yes_bid_cents.isnot(None),
+        MarketMetric.yes_ask_cents.isnot(None),
+        MarketMetric.yes_bid_cents <= _RESOLVED_QUOTE_EDGE_CENTS,
+        MarketMetric.yes_ask_cents >= 100 - _RESOLVED_QUOTE_EDGE_CENTS,
+    )
+    return or_(
+        display.is_(None),
+        and_(
+            display > _RESOLVED_QUOTE_EDGE_CENTS,
+            display < 100 - _RESOLVED_QUOTE_EDGE_CENTS,
+            ~full_width_endpoint,
+        ),
+    )
+
+
+def _active_unresolved_metric_exists(market_scope: str | None):
+    if _normalize_market_scope(market_scope) != "active":
+        return None
+    metric_exists = exists().where(MarketMetric.market_pk == Market.id)
+    unresolved_metric_exists = exists().where(
+        and_(
+            MarketMetric.market_pk == Market.id,
+            _metric_unresolved_quote_filter(),
+        )
+    )
+    return or_(
+        ~metric_exists,
+        unresolved_metric_exists,
+    )
 
 
 def _reason_codes_for_market_pks(
@@ -332,6 +425,8 @@ def _serialize_market_row(
     last_price: float | None = None,
     volume_24h: float | None = None,
     volume_total: float | None = None,
+    volume_24h_dollars: float | None = None,
+    volume_total_dollars: float | None = None,
     trade_dollar_volume: float | None = None,
     reason_codes: list[str] | None = None,
     event_market_count: int | None = None,
@@ -368,6 +463,12 @@ def _serialize_market_row(
         "last_price": _probability_float(last_price),
         "volume_24h": float(volume_24h) if volume_24h is not None else None,
         "volume_total": float(volume_total) if volume_total is not None else None,
+        "volume_24h_dollars": float(volume_24h_dollars)
+        if volume_24h_dollars is not None
+        else None,
+        "volume_total_dollars": float(volume_total_dollars)
+        if volume_total_dollars is not None
+        else None,
         "trade_dollar_volume": float(trade_dollar_volume)
         if trade_dollar_volume is not None
         else None,
@@ -1268,6 +1369,8 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
     )
 
     snapshots = _estimated_table_count(db, "market_snapshots")
+    chart_history_rows = _estimated_table_count(db, "market_price_history")
+    quote_history_rows = int(snapshots) + int(chart_history_rows)
 
     book_events = _estimated_table_count(db, "book_events")
     raw_backend = settings.kalshi_raw_backend.lower().strip()
@@ -1314,6 +1417,8 @@ def _stats_payload(db: Session, *, market_scope: str = "active") -> dict:
         "markets_with_flags": int(markets_with_flags),
         "trades": int(trades),
         "snapshots": int(snapshots),
+        "chart_history_rows": int(chart_history_rows),
+        "quote_history_rows": int(quote_history_rows),
         "book_events": int(book_events),
         "anomalies": int(anomalies),
         "news_articles": int(news_articles),
@@ -1630,12 +1735,18 @@ def search_dashboard(
 
 def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active") -> dict:
     if _market_metrics_available(db):
-        rows = (
+        base = (
             db.query(Market, MarketMetric)
             .join(MarketMetric, MarketMetric.market_pk == Market.id)
             .filter(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
             .filter(MarketMetric.trade_count > 0)
-            .order_by(MarketMetric.trade_count.desc(), MarketMetric.last_trade_ts.desc())
+        )
+        if _normalize_market_scope(market_scope) == "active":
+            base = base.filter(_metric_unresolved_quote_filter())
+        rows = (
+            base.order_by(
+                MarketMetric.trade_count.desc(), MarketMetric.last_trade_ts.desc()
+            )
             .limit(limit)
             .all()
         )
@@ -1646,6 +1757,7 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
             market_pks,
             since=_utc_now() - timedelta(hours=24),
         )
+        trade_dollars_total = _trade_dollar_volume_by_market(db, market_pks)
         return {
             "count": len(rows),
             "markets": [
@@ -1660,6 +1772,8 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                     ),
                     volume_24h=metric.volume_24h_contracts,
                     volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
+                    volume_24h_dollars=trade_dollars_24h.get(market.id, 0.0),
+                    volume_total_dollars=trade_dollars_total.get(market.id, 0.0),
                     trade_dollar_volume=trade_dollars_24h.get(market.id, 0.0),
                     evidence_score=float(metric.evidence_score or 0.0),
                     urgency_score=float(metric.urgency_score or 0.0),
@@ -1718,6 +1832,7 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
     }
     markets_by_pk = {m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()}
     latest_by_pk = _latest_quote_values_for_market_pks(db, pks)
+    trade_dollars_total = _trade_dollar_volume_by_market(db, pks)
 
     rows = [markets_by_pk[pk] for pk in pks if pk in markets_by_pk]
     return {
@@ -1729,6 +1844,8 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
                 last_price=latest_by_pk.get(market.id, {}).get("last_price"),
                 volume_24h=latest_by_pk.get(market.id, {}).get("volume_24h"),
                 volume_total=latest_by_pk.get(market.id, {}).get("volume_total"),
+                volume_24h_dollars=trade_dollars.get(market.id),
+                volume_total_dollars=trade_dollars_total.get(market.id),
                 trade_dollar_volume=trade_dollars.get(market.id),
             )
             for market in rows
@@ -1749,6 +1866,8 @@ def _recent_anomalies_payload(
         .join(MarketMetric, MarketMetric.market_pk == Market.id)
     )
     base = base.filter(*(_hydrated_market_filters() + _market_scope_filters(market_scope)))
+    if _normalize_market_scope(market_scope) == "active":
+        base = base.filter(_metric_unresolved_quote_filter())
     base = base.filter(
         or_(
             func.coalesce(MarketMetric.trade_count, 0) > 0,
@@ -2731,6 +2850,13 @@ def _list_markets_uncached(
     if not include_unhydrated:
         filters.extend(_hydrated_market_filters())
     filters.extend(_market_scope_filters(market_scope))
+    active_metric_filter = (
+        _active_unresolved_metric_exists(market_scope)
+        if metrics_available
+        else None
+    )
+    if active_metric_filter is not None:
+        filters.append(active_metric_filter)
     if q:
         like = f"%{q}%"
         filters.append(
@@ -2775,6 +2901,8 @@ def _list_markets_uncached(
     if include_counts:
         total_filters = [] if include_unhydrated else _hydrated_market_filters()
         total_filters.extend(_market_scope_filters(market_scope))
+        if active_metric_filter is not None:
+            total_filters.append(active_metric_filter)
         if data_only:
             if metrics_available:
                 total_filters.append(

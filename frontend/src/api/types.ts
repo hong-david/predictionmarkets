@@ -30,6 +30,8 @@ export interface SystemStats {
   markets_with_flags: number;
   trades: number;
   snapshots: number;
+  chart_history_rows?: number;
+  quote_history_rows?: number;
   book_events: number;
   anomalies: number;
   news_articles: number;
@@ -79,6 +81,10 @@ export interface MarketRow {
   volume_24h: number | null;
   /** Exchange-reported cumulative contract volume since market inception, when present. */
   volume_total: number | null;
+  /** Retained trade notional over the last 24 hours, in dollars. */
+  volume_24h_dollars?: number | null;
+  /** Retained trade notional over all stored trades, in dollars. */
+  volume_total_dollars?: number | null;
   /** Classifier `manipulability_prior` bucket; “unclassified” if unknown. */
   market_priority: string;
   /** 0–100 from stored `anomalies` row mass (not prior). */

@@ -72,6 +72,8 @@ def test_stats_returns_expected_keys(client: TestClient) -> None:
         "markets_with_flags",
         "trades",
         "snapshots",
+        "chart_history_rows",
+        "quote_history_rows",
         "book_events",
         "anomalies",
         "news_articles",

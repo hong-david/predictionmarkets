@@ -118,6 +118,10 @@ export default function OverviewPage() {
     staleTime: 12_000,
   });
   const st = overview.data?.stats;
+  const chartHistoryRows = st?.chart_history_rows ?? 0;
+  const rawQuoteSnapshots = st?.snapshots ?? 0;
+  const quoteHistoryRows =
+    st?.quote_history_rows ?? chartHistoryRows + rawQuoteSnapshots;
   const br = overview.data?.breakdown;
   const topM = overview.data?.top_markets;
   const recentFlags = overview.data?.recent_anomalies;
@@ -228,9 +232,9 @@ export default function OverviewPage() {
               sub={`${fmtInt(st.markets_active)} active/open · ${fmtInt(st.markets_historical)} historical retained · ${fmtInt(st.markets_status_unknown)} still hydrating.`}
             />
             <StatTile
-              label="Quote snapshots"
-              value={fmtInt(st.snapshots)}
-              sub="Retained ticker snapshots with latest price, bid/ask, volume, and open-interest fields. Used for chart display and market-state alerting."
+              label="Quote history rows"
+              value={fmtInt(quoteHistoryRows)}
+              sub={`${fmtInt(chartHistoryRows)} chart-history rows + ${fmtInt(rawQuoteSnapshots)} legacy snapshots. Chart history is now the primary quote source for charts and market-state alerting.`}
               tone="primary"
             />
             <StatTile
@@ -396,7 +400,7 @@ function MostTradedMarketsCard({
     <Card className="h-[32rem] overflow-hidden flex flex-col">
       <CardHeader
         title="Most traded markets"
-        subtitle="Active/open markets with the most retained execution prints, exchange-reported 24h volume, and exchange-reported lifetime volume."
+        subtitle="Active/open markets with the most retained execution prints and retained trade notional volume."
       />
       <div className="flex-1 overflow-x-auto">
         {loading ? (
@@ -411,8 +415,8 @@ function MostTradedMarketsCard({
               <tr className="text-[11px] uppercase tracking-wider text-muted-foreground border-b border-border">
                 <th className="text-left px-4 py-2 font-medium">Market</th>
                 <th className="text-right px-4 py-2 font-medium">Trades</th>
-                <th className="text-right px-4 py-2 font-medium">24h vol.</th>
-                <th className="text-right px-4 py-2 font-medium">Total $</th>
+                <th className="text-right px-4 py-2 font-medium">24Hr Vol</th>
+                <th className="text-right px-4 py-2 font-medium">Total Vol</th>
               </tr>
             </thead>
             <tbody>
@@ -428,10 +432,10 @@ function MostTradedMarketsCard({
                     {fmtInt(m.trade_count)}
                   </td>
                   <td className="px-4 py-2.5 text-right num text-sm">
-                    {fmtDollars(m.volume_24h)}
+                    {fmtDollars(m.volume_24h_dollars ?? m.trade_dollar_volume)}
                   </td>
                   <td className="px-4 py-2.5 text-right num text-sm">
-                    {fmtDollars(m.volume_total)}
+                    {fmtDollars(m.volume_total_dollars)}
                   </td>
                 </tr>
               ))}

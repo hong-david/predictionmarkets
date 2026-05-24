@@ -8,6 +8,7 @@ from app.api.routes.dashboard import (
     _cached_dashboard_payload,
     _clickhouse_table_count,
     _DASHBOARD_CACHE_SCHEMA_VERSION,
+    _is_likely_resolved_quote_values,
     _merge_series_snapshot_payloads,
     _metric_probability_float,
     _probability_float,
@@ -153,6 +154,24 @@ def test_metric_probability_uses_latest_or_bid_ask_midpoint() -> None:
             yes_ask_cents=40,
         )
         == 0.35
+    )
+
+
+def test_likely_resolved_quote_detection_catches_endpoint_markets() -> None:
+    assert _is_likely_resolved_quote_values(
+        last_price_cents=0,
+        yes_bid_cents=0,
+        yes_ask_cents=1,
+    )
+    assert _is_likely_resolved_quote_values(
+        last_price_cents=None,
+        yes_bid_cents=0,
+        yes_ask_cents=100,
+    )
+    assert not _is_likely_resolved_quote_values(
+        last_price_cents=None,
+        yes_bid_cents=23,
+        yes_ask_cents=26,
     )
 
 
