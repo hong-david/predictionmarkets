@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from scripts.run_chart_history_compaction import _parse_compaction_policies
 from scripts.run_pipeline import build_processes
 
 
@@ -30,6 +31,7 @@ def test_build_processes_adds_chart_history_compaction_job(tmp_path) -> None:
         chart_history_compaction_offset=0,
         chart_history_compaction_max_source_rows_per_market=0,
         chart_history_compaction_policies="300:3600:7,3600:86400:180",
+        chart_history_active_retention_policies="300:3600:14,3600:86400:180",
     )
 
     processes = build_processes(args)
@@ -45,6 +47,30 @@ def test_build_processes_adds_chart_history_compaction_job(tmp_path) -> None:
     assert process.command[process.command.index("--interval-seconds") + 1] == "21600.0"
     assert process.command[process.command.index("--max-markets") + 1] == "250"
     assert process.command[process.command.index("--policies") + 1] == "300:3600:7,3600:86400:180"
+    assert (
+        process.command[process.command.index("--active-retention-policies") + 1]
+        == "300:3600:14,3600:86400:180"
+    )
+
+
+def test_parse_chart_history_compaction_policies() -> None:
+    policies = _parse_compaction_policies(
+        "300:3600:14,3600:86400:180",
+        default=[],
+    )
+
+    assert policies == [
+        {
+            "source_interval_sec": 300,
+            "target_interval_sec": 3600,
+            "grace_days_after_close": 14,
+        },
+        {
+            "source_interval_sec": 3600,
+            "target_interval_sec": 86400,
+            "grace_days_after_close": 180,
+        },
+    ]
 
 
 def test_build_processes_passes_retention_max_batches(tmp_path) -> None:

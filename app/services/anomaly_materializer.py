@@ -6,11 +6,12 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Anomaly, Market, MarketSnapshot
+from app.db.models import Anomaly, Market
 from app.services.market_state_alert_engine import analyze_market
 from app.services.book_activity_signals import collect_book_activity_signals
 from app.services.market_metrics import bump_anomaly_metrics
 from app.services.pipeline_heartbeat import mark_pipeline_success
+from app.services.quote_series import history_points_for_market
 
 # Do not store or refresh rows for weak scores; they dominated the market-detail
 # chart. ~3.0 is a single "medium" rule firing with headroom, or a few stacked
@@ -64,12 +65,11 @@ def materialize_market_anomaly(
     latest_snapshot_id: int | None = None,
 ) -> dict[str, int]:
     """Score and persist one market-state alert if the latest state warrants it."""
-    snapshots = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-        .limit(lookback)
-        .all()
+    snapshots = history_points_for_market(
+        db,
+        int(market.id),
+        limit=lookback,
+        newest_first=True,
     )
 
     if not snapshots:
@@ -82,17 +82,34 @@ def materialize_market_anomaly(
 
     book_raw = collect_book_activity_signals(db, market.id)
     analysis = analyze_market(market, snapshots, book_activity=book_raw)
-    effective_latest_snapshot_id = latest_snapshot_id or snapshots[0].id
+    effective_latest_snapshot_id = latest_snapshot_id
+    latest_quote = snapshots[0]
+    latest_quote_key = getattr(latest_quote, "source_key", None)
     score = float(analysis["score"])
 
-    existing = (
-        db.query(Anomaly)
-        .filter(
-            Anomaly.market_pk == market.id,
-            Anomaly.latest_snapshot_id == effective_latest_snapshot_id,
+    existing = None
+    if effective_latest_snapshot_id is not None:
+        existing = (
+            db.query(Anomaly)
+            .filter(
+                Anomaly.market_pk == market.id,
+                Anomaly.latest_snapshot_id == effective_latest_snapshot_id,
+            )
+            .one_or_none()
         )
-        .one_or_none()
-    )
+    if existing is None and latest_quote_key is not None:
+        latest_existing = (
+            db.query(Anomaly)
+            .filter(Anomaly.market_pk == market.id)
+            .order_by(Anomaly.created_at.desc(), Anomaly.id.desc())
+            .first()
+        )
+        if (
+            latest_existing is not None
+            and (latest_existing.signals or {}).get("latest_quote_source_key")
+            == latest_quote_key
+        ):
+            existing = latest_existing
 
     if score < _MIN_SCORE_TO_PERSIST:
         if existing is not None:
@@ -140,6 +157,7 @@ def materialize_market_anomaly(
         latest_existing.signals = {
             **(analysis["signals"] or {}),
             "compacted_from_latest_snapshot_id": effective_latest_snapshot_id,
+            "compacted_from_latest_quote_source_key": latest_quote_key,
             "reason_signature": list(_reason_signature(analysis["reasons"])),
         }
         return {

@@ -27,27 +27,25 @@ RAW_PRUNING_ENABLED = True
 RAW_PRUNING_POLICIES: tuple[TablePruningPolicy, ...] = (
     TablePruningPolicy(
         table="market_snapshots",
-        enabled=False,
+        enabled=True,
         action=(
-            "After chart history is proven, prune closed/resolved-market raw "
-            "snapshots only when equivalent market_price_history coverage exists."
+            "Prune raw snapshots after compact quote/history coverage exists. "
+            "Runtime APIs and scoring should read market_metrics and "
+            "market_price_history, not this table."
         ),
         minimum_age_days=7,
         prerequisites=(
-            "market_price_history has 5-minute buckets for the market through close",
-            "market has been closed/resolved for at least 7 days",
-            "latest_snapshot_id is preserved",
-            "snapshots referenced by anomalies are preserved",
+            "market_price_history has replacement quote/price buckets",
+            "materialized anomaly/case rows carry denormalized quote context",
+            "legacy latest_snapshot_id references are no longer required",
         ),
         preserve=(
-            "MarketMetric.latest_snapshot_id",
-            "Anomaly.latest_snapshot_id",
-            "recent active-market raw snapshots",
-            "case/triggered market evidence windows",
+            "short rollback window during deploys",
+            "manually promoted evidence rows until denormalized",
         ),
         rationale=(
-            "Charts should read market_price_history; snapshots become raw "
-            "operational evidence and should not be the long-term chart store."
+            "market_snapshots grew at millions of rows per day. Compact history "
+            "and current metrics are the durable serving surfaces."
         ),
     ),
     TablePruningPolicy(
@@ -73,6 +71,29 @@ RAW_PRUNING_POLICIES: tuple[TablePruningPolicy, ...] = (
         rationale=(
             "Raw trades are evidence, not the chart source. They can be retained "
             "by risk/value once charting no longer depends on every print."
+        ),
+    ),
+    TablePruningPolicy(
+        table="market_price_history",
+        enabled=True,
+        action=(
+            "Keep recent active-market 5-minute buckets, then compact older "
+            "buckets to hourly/daily tiers with source rows replaced."
+        ),
+        minimum_age_days=14,
+        prerequisites=(
+            "hourly/daily target buckets are upserted before deleting source rows",
+            "recent active-market 5-minute window is preserved",
+            "operator reviewed dry-run source/target counts",
+        ),
+        preserve=(
+            "recent active 5-minute chart window",
+            "high-signal evidence windows when configured",
+            "trade and news evidence rows",
+        ),
+        rationale=(
+            "market_price_history replaces snapshots, but it must stay a bounded "
+            "read model rather than becoming the next unbounded raw table."
         ),
     ),
     TablePruningPolicy(

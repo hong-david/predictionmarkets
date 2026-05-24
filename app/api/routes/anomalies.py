@@ -2,16 +2,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
-from app.db.models import Anomaly, Market, MarketSnapshot
+from app.db.models import Anomaly, Market
 from app.services.book_activity_signals import collect_book_activity_signals
 from app.services.market_state_alert_engine import analyze_market
+from app.services.quote_series import history_points_for_market
 
 router = APIRouter(tags=["anomalies (legacy on-the-fly)"], deprecated=True)
 
 
 @router.get(
     "/markets/{market_id}/anomaly",
-    summary="Recompute anomaly from snapshots (legacy)",
+    summary="Recompute anomaly from quote history (legacy)",
     description="Prefer `GET /api/dashboard/markets/{id}/anomalies` for saved alert rows; "
     "this endpoint re-runs the engine for debugging.",
 )
@@ -24,12 +25,11 @@ def get_market_anomaly(
     if market is None:
         raise HTTPException(status_code=404, detail="Market not found")
 
-    snapshots = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-        .limit(lookback)
-        .all()
+    snapshots = history_points_for_market(
+        db,
+        int(market.id),
+        limit=lookback,
+        newest_first=True,
     )
 
     book_raw = collect_book_activity_signals(db, market.id)
@@ -83,7 +83,7 @@ def list_stored_anomalies(
     "/anomalies",
     summary="Scan + analyze markets (legacy, heavy)",
     description="Prefer the dashboard: `GET /api/dashboard/overview` and `GET /api/dashboard/anomalies` "
-    "read precomputed `anomalies` without scanning large snapshot windows per request.",
+    "read precomputed `anomalies` without scanning large quote-history windows per request.",
 )
 def list_anomalies(
     market_limit: int = Query(default=50, ge=1, le=200),
@@ -101,12 +101,11 @@ def list_anomalies(
     results = []
 
     for market in markets:
-        snapshots = (
-            db.query(MarketSnapshot)
-            .filter(MarketSnapshot.market_pk == market.id)
-            .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-            .limit(lookback)
-            .all()
+        snapshots = history_points_for_market(
+            db,
+            int(market.id),
+            limit=lookback,
+            newest_first=True,
         )
 
         if not snapshots:

@@ -56,7 +56,6 @@ from app.db.models import (
     MarketMetric,
     MarketNewsProfile,
     MarketPriceHistory,
-    MarketSnapshot,
     NewsArticle,
     NewsEvent,
     PipelineHeartbeat,
@@ -77,6 +76,14 @@ from app.services.market_lifecycle import (
     normalize_market_scope as _normalize_market_scope,
 )
 from app.services.market_price_history import DEFAULT_CHART_HISTORY_INTERVAL_SEC
+from app.services.quote_series import (
+    display_price as quote_display_price,
+    history_point,
+    latest_history_points,
+    latest_metric_values,
+    quote_payload,
+    sibling_history_payloads,
+)
 from app.services.market_taxonomy import (
     category_family_for_market,
     is_sports_market,
@@ -127,7 +134,6 @@ _PIPELINE_DAILY_STALE_AFTER = timedelta(hours=24)
 _CLICKHOUSE_COUNT_TIMEOUT_SEC = float(os.getenv("CLICKHOUSE_COUNT_TIMEOUT_SEC", "0.75"))
 _SERIES_SNAPSHOT_LIMIT_CAP = 1000
 _SERIES_CHART_HISTORY_QUERY_MULTIPLIER = 2
-_SERIES_FALLBACK_GAP_WINDOW_CAP = 25
 _dashboard_cache_lock = Lock()
 _dashboard_cache: dict[str, tuple[float, object]] = {}
 _redis_client: redis.Redis | None = None
@@ -397,155 +403,34 @@ def _market_context(market: Market) -> MarketContext:
     )
 
 
-def _latest_snapshot_values_for_market_pks(
+def _latest_quote_values_for_market_pks(
     db: Session, market_pks: list[int]
 ) -> dict[int, dict[str, float | None]]:
     if not market_pks:
         return {}
 
-    rows = (
-        db.query(
-            MarketMetric.market_pk,
-            MarketSnapshot.last_price_dollars.label("last_price"),
-            MarketSnapshot.yes_bid_dollars.label("yes_bid"),
-            MarketSnapshot.yes_ask_dollars.label("yes_ask"),
-            MarketSnapshot.volume_24h_fp.label("volume_24h"),
-            MarketSnapshot.volume_fp.label("volume_total"),
-        )
-        .join(MarketSnapshot, MarketSnapshot.id == MarketMetric.latest_snapshot_id)
-        .filter(MarketMetric.market_pk.in_(market_pks))
-        .all()
-    )
+    values = latest_metric_values(db, market_pks)
 
-    def _display_price(row) -> float | None:
-        if row.last_price is not None:
-            return _probability_float(row.last_price)
-        if row.yes_bid is not None and row.yes_ask is not None:
-            return _probability_float((float(row.yes_bid) + float(row.yes_ask)) / 2.0)
-        if row.yes_bid is not None:
-            return _probability_float(row.yes_bid)
-        if row.yes_ask is not None:
-            return _probability_float(row.yes_ask)
-        return None
-
-    values = {
-        int(row.market_pk): {
-            "last_price": _display_price(row),
-            "volume_24h": float(row.volume_24h)
-            if row.volume_24h is not None
-            else None,
-            "volume_total": float(row.volume_total)
-            if row.volume_total is not None
-            else None,
-        }
-        for row in rows
-    }
-
-    missing_or_blank = [
-        pk
-        for pk in market_pks
-        if pk not in values
-        or (
-            values[pk].get("last_price") is None
-            and values[pk].get("volume_24h") is None
-            and values[pk].get("volume_total") is None
-        )
-    ]
-
-    if missing_or_blank:
-        metric_rows = (
-            db.query(
-                MarketMetric.market_pk,
-                MarketMetric.last_price_cents,
-                MarketMetric.volume_24h_contracts,
-            )
-            .filter(MarketMetric.market_pk.in_(missing_or_blank))
-            .all()
-        )
-        for row in metric_rows:
-            current = values.setdefault(
-                int(row.market_pk),
-                {"last_price": None, "volume_24h": None, "volume_total": None},
-            )
-            if current["last_price"] is None and row.last_price_cents is not None:
-                current["last_price"] = _probability_float(
-                    float(row.last_price_cents) / 100.0
-                )
-            if current["volume_24h"] is None and row.volume_24h_contracts is not None:
-                current["volume_24h"] = float(row.volume_24h_contracts)
-
-    # Fallback for markets where market_metrics.latest_snapshot_id is missing,
-    # stale, or points to a snapshot without volume fields. This only runs for
-    # the small rendered market set, and the endpoint is dashboard-cached.
-    snapshot_missing = [
+    history_missing = [
         pk
         for pk in market_pks
         if pk not in values
         or values[pk].get("last_price") is None
         or values[pk].get("volume_24h") is None
-        or values[pk].get("volume_total") is None
     ]
-
-    if snapshot_missing:
-        has_useful_snapshot_fields = (
-            MarketSnapshot.last_price_dollars.isnot(None)
-            | MarketSnapshot.yes_bid_dollars.isnot(None)
-            | MarketSnapshot.yes_ask_dollars.isnot(None)
-            | MarketSnapshot.volume_24h_fp.isnot(None)
-            | MarketSnapshot.volume_fp.isnot(None)
-        )
-
-        snapshot_rows = []
-        for pk in snapshot_missing:
-            # Keep this as point lookups against (market_pk, ts, id) indexes. The
-            # previous row_number partition fallback could scan large snapshot
-            # ranges when compact metrics were missing or sparse.
-            row = (
-                db.query(
-                    MarketSnapshot.market_pk.label("market_pk"),
-                    MarketSnapshot.last_price_dollars.label("last_price"),
-                    MarketSnapshot.yes_bid_dollars.label("yes_bid"),
-                    MarketSnapshot.yes_ask_dollars.label("yes_ask"),
-                    MarketSnapshot.volume_24h_fp.label("volume_24h"),
-                    MarketSnapshot.volume_fp.label("volume_total"),
-                )
-                .filter(MarketSnapshot.market_pk == pk)
-                .filter(has_useful_snapshot_fields)
-                .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-                .limit(1)
-                .one_or_none()
-            )
-            if row is None:
-                row = (
-                    db.query(
-                        MarketSnapshot.market_pk.label("market_pk"),
-                        MarketSnapshot.last_price_dollars.label("last_price"),
-                        MarketSnapshot.yes_bid_dollars.label("yes_bid"),
-                        MarketSnapshot.yes_ask_dollars.label("yes_ask"),
-                        MarketSnapshot.volume_24h_fp.label("volume_24h"),
-                        MarketSnapshot.volume_fp.label("volume_total"),
-                    )
-                    .filter(MarketSnapshot.market_pk == pk)
-                    .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-                    .limit(1)
-                    .one_or_none()
-                )
-            if row is not None:
-                snapshot_rows.append(row)
-
-        for row in snapshot_rows:
+    if history_missing:
+        for pk, points in latest_history_points(db, history_missing).items():
+            if not points:
+                continue
+            point = points[0]
             current = values.setdefault(
-                int(row.market_pk),
+                int(pk),
                 {"last_price": None, "volume_24h": None, "volume_total": None},
             )
-            if current["last_price"] is None:
-                price = _display_price(row)
-                if price is not None:
-                    current["last_price"] = price
-            if current["volume_24h"] is None and row.volume_24h is not None:
-                current["volume_24h"] = float(row.volume_24h)
-            if current["volume_total"] is None and row.volume_total is not None:
-                current["volume_total"] = float(row.volume_total)
+            if current.get("last_price") is None:
+                current["last_price"] = quote_display_price(point)
+            if current.get("volume_24h") is None and point.volume_24h_fp is not None:
+                current["volume_24h"] = float(point.volume_24h_fp)
 
     price_missing = [
         pk for pk in market_pks if values.get(pk, {}).get("last_price") is None
@@ -577,48 +462,10 @@ def _latest_snapshot_values_for_market_pks(
 
     return values
 
-def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
-    return {
-        "ts": snapshot.ts.isoformat() if snapshot.ts else None,
-        "market_pk": snapshot.market_pk,
-        "yes_bid": _probability_float(snapshot.yes_bid_dollars),
-        "yes_ask": _probability_float(snapshot.yes_ask_dollars),
-        "last_price": _probability_float(snapshot.last_price_dollars),
-        "volume_24h": float(snapshot.volume_24h_fp)
-        if snapshot.volume_24h_fp is not None
-        else None,
-        "open_interest": float(snapshot.open_interest_fp)
-        if snapshot.open_interest_fp is not None
-        else None,
-        "source": "market_snapshot",
-    }
-
-
 def _chart_history_snapshot_payload(row: MarketPriceHistory) -> dict:
-    source = row.close_price_source
-    last_price = (
-        row.close_price_dollars
-        if source in {"trade", "last_price"}
-        else None
-    )
-    return {
-        "ts": row.bucket_start.isoformat() if row.bucket_start else None,
-        "market_pk": row.market_pk,
-        "yes_bid": _probability_float(row.close_yes_bid_dollars),
-        "yes_ask": _probability_float(row.close_yes_ask_dollars),
-        "last_price": _probability_float(last_price),
-        "volume_24h": float(row.close_volume_24h_fp)
-        if row.close_volume_24h_fp is not None
-        else None,
-        "open_interest": float(row.close_open_interest_fp)
-        if row.close_open_interest_fp is not None
-        else None,
-        "source": "chart_history",
-        "interval_sec": row.interval_sec,
-        "price_source": source,
-        "trade_count": int(row.trade_count or 0),
-        "quote_count": int(row.quote_count or 0),
-    }
+    payload = quote_payload(history_point(row))
+    payload["price_source"] = row.close_price_source
+    return payload
 
 
 def _payload_timestamp(payload: dict) -> datetime | None:
@@ -665,78 +512,6 @@ def _merge_series_snapshot_payloads(
 
     merged = [by_timestamp[ts][1] for ts in sorted(by_timestamp)]
     return merged[-limit:] if limit > 0 else merged
-
-
-def _history_coverage_windows(
-    history_rows: list[MarketPriceHistory],
-) -> list[tuple[datetime, datetime]]:
-    windows: list[tuple[datetime, datetime]] = []
-    for row in history_rows:
-        start = _as_utc(row.bucket_start)
-        if start is None:
-            continue
-        interval_sec = max(
-            1,
-            int(row.interval_sec or DEFAULT_CHART_HISTORY_INTERVAL_SEC),
-        )
-        windows.append((start, start + timedelta(seconds=interval_sec)))
-
-    merged: list[tuple[datetime, datetime]] = []
-    for start, end in sorted(windows):
-        if not merged or start > merged[-1][1]:
-            merged.append((start, end))
-        elif end > merged[-1][1]:
-            merged[-1] = (merged[-1][0], end)
-    return merged
-
-
-def _fallback_snapshot_rows_for_series(
-    db: Session,
-    *,
-    market_pk: int,
-    since_dt: datetime | None,
-    history_rows: list[MarketPriceHistory],
-    limit: int,
-) -> list[MarketSnapshot]:
-    if limit <= 0:
-        return []
-
-    snap_query = db.query(MarketSnapshot).filter(MarketSnapshot.market_pk == market_pk)
-    if since_dt is not None:
-        snap_query = snap_query.filter(MarketSnapshot.ts > since_dt)
-
-    if history_rows:
-        coverage_windows = _history_coverage_windows(history_rows)
-        if not coverage_windows:
-            return []
-
-        filters = []
-
-        if len(history_rows) < limit:
-            filters.append(MarketSnapshot.ts < coverage_windows[0][0])
-
-        filters.append(MarketSnapshot.ts >= coverage_windows[-1][1])
-
-        gap_windows: list[tuple[datetime, datetime]] = []
-        for left_window, right_window in zip(coverage_windows, coverage_windows[1:]):
-            if right_window[0] > left_window[1]:
-                gap_windows.append((left_window[1], right_window[0]))
-
-        for gap_start, gap_end in gap_windows[-_SERIES_FALLBACK_GAP_WINDOW_CAP:]:
-            filters.append(
-                and_(MarketSnapshot.ts >= gap_start, MarketSnapshot.ts < gap_end)
-            )
-
-        if not filters:
-            return []
-        snap_query = snap_query.filter(or_(*filters))
-
-    rows = (
-        snap_query.order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-        .limit(limit)
-        .all()
-    )
-    return list(reversed(rows))
 
 
 def _peer_baseline_rows_for_market(
@@ -807,28 +582,14 @@ def _sibling_snapshot_context(
 ) -> list[dict]:
     if not market.event_id or start is None or end is None:
         return []
-    sibling_pks = [
-        int(pk)
-        for (pk,) in (
-            db.query(Market.id)
-            .filter(Market.event_id == market.event_id)
-            .filter(Market.id != market.id)
-            .limit(25)
-            .all()
-        )
-    ]
-    if not sibling_pks:
-        return []
-    rows = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk.in_(sibling_pks))
-        .filter(MarketSnapshot.ts >= start - timedelta(minutes=15))
-        .filter(MarketSnapshot.ts <= end + timedelta(minutes=45))
-        .order_by(MarketSnapshot.ts.asc(), MarketSnapshot.id.asc())
-        .limit(limit)
-        .all()
+    return sibling_history_payloads(
+        db,
+        market,
+        start=start - timedelta(minutes=15),
+        end=end + timedelta(minutes=45),
+        sibling_limit=25,
+        row_limit=limit,
     )
-    return [_snapshot_payload(row) for row in rows]
 
 
 # --- /pipeline-health -------------------------------------------------------
@@ -1879,7 +1640,7 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
             .all()
         )
         market_pks = [int(market.id) for market, _metric in rows]
-        latest_by_pk = _latest_snapshot_values_for_market_pks(db, market_pks)
+        latest_by_pk = _latest_quote_values_for_market_pks(db, market_pks)
         trade_dollars_24h = _trade_dollar_volume_by_market_since(
             db,
             market_pks,
@@ -1956,7 +1717,7 @@ def _top_markets_payload(db: Session, limit: int, *, market_scope: str = "active
         int(r.market_pk): float(r.trade_dollar_volume or 0.0) for r in trade_rows
     }
     markets_by_pk = {m.id: m for m in db.query(Market).filter(Market.id.in_(pks)).all()}
-    latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
+    latest_by_pk = _latest_quote_values_for_market_pks(db, pks)
 
     rows = [markets_by_pk[pk] for pk in pks if pk in markets_by_pk]
     return {
@@ -3143,7 +2904,7 @@ def _list_markets_uncached(
     rows = base.offset(offset).limit(query_limit).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
-    latest_by_pk = _latest_snapshot_values_for_market_pks(
+    latest_by_pk = _latest_quote_values_for_market_pks(
         db, [int(r[0].id) for r in rows]
     )
 
@@ -3290,7 +3051,7 @@ def _list_markets_from_metric_projection(
     has_more = len(rows) > limit
     rows = rows[:limit]
     market_pks = [int(row[0].id) for row in rows]
-    latest_by_pk = _latest_snapshot_values_for_market_pks(db, market_pks)
+    latest_by_pk = _latest_quote_values_for_market_pks(db, market_pks)
 
     event_ids = [row[0].event_id for row in rows if row[0].event_id]
     event_counts = {}
@@ -3416,7 +3177,7 @@ def get_event_group(event_id: str, db: Session = Depends(get_db)) -> dict:
         pk: int(metric.anomaly_count or 0) for pk, metric in metrics.items()
     } or _anomaly_counts_by_market(db, pks)
     rmap = _reason_codes_for_market_pks(db, pks)
-    latest_by_pk = _latest_snapshot_values_for_market_pks(db, pks)
+    latest_by_pk = _latest_quote_values_for_market_pks(db, pks)
 
     market_payloads: list[dict] = []
     for m in markets_list:
@@ -3471,17 +3232,66 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
     """Detail bundle for the market drill-down page.
 
     Aggregates everything the detail page needs in one round trip:
-    market metadata, classifier verdict, latest snapshot prices, and
+    market metadata, classifier verdict, latest quote prices, and
     summary stats (trade window, price extrema, volume).
     """
     market = _get_market_or_404(db, market_id)
-
-    latest_snap = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.ts.desc(), MarketSnapshot.id.desc())
-        .first()
-    )
+    latest_quote = latest_metric_values(db, [market.id]).get(int(market.id))
+    if not latest_quote or latest_quote.get("last_price") is None:
+        history_points = latest_history_points(db, [market.id]).get(int(market.id), [])
+        if history_points:
+            point = history_points[0]
+            existing_last_price = (
+                latest_quote.get("last_price") if latest_quote else None
+            )
+            latest_quote = {
+                **(latest_quote or {}),
+                "last_price": (
+                    existing_last_price
+                    if existing_last_price is not None
+                    else quote_display_price(point)
+                ),
+                "volume_24h": (
+                    latest_quote.get("volume_24h")
+                    if latest_quote and latest_quote.get("volume_24h") is not None
+                    else (
+                        float(point.volume_24h_fp)
+                        if point.volume_24h_fp is not None
+                        else None
+                    )
+                ),
+                "yes_bid": (
+                    latest_quote.get("yes_bid")
+                    if latest_quote and latest_quote.get("yes_bid") is not None
+                    else _probability_float(point.yes_bid_dollars)
+                ),
+                "yes_ask": (
+                    latest_quote.get("yes_ask")
+                    if latest_quote and latest_quote.get("yes_ask") is not None
+                    else _probability_float(point.yes_ask_dollars)
+                ),
+                "open_interest": (
+                    latest_quote.get("open_interest")
+                    if latest_quote
+                    and latest_quote.get("open_interest") is not None
+                    else (
+                        float(point.open_interest_fp)
+                        if point.open_interest_fp is not None
+                        else None
+                    )
+                ),
+                "liquidity": latest_quote.get("liquidity") if latest_quote else None,
+                "ts": (
+                    latest_quote.get("ts")
+                    if latest_quote and latest_quote.get("ts") is not None
+                    else (point.ts.isoformat() if point.ts else None)
+                ),
+                "source": (
+                    latest_quote.get("source")
+                    if latest_quote and latest_quote.get("source") is not None
+                    else point.source
+                ),
+            }
 
     trade_stats = (
         db.query(
@@ -3508,12 +3318,8 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
             market,
             trade_count=trade_stats.c or 0,
             anomaly_count=anomaly_count,
-            last_price=float(latest_snap.last_price_dollars)
-            if latest_snap and latest_snap.last_price_dollars is not None
-            else None,
-            volume_24h=float(latest_snap.volume_24h_fp)
-            if latest_snap and latest_snap.volume_24h_fp is not None
-            else None,
+            last_price=(latest_quote or {}).get("last_price"),
+            volume_24h=(latest_quote or {}).get("volume_24h"),
             reason_codes=reason_codes,
         ),
         "classifier_tags": market.classifier_tags or [],
@@ -3538,25 +3344,19 @@ def get_market_detail(market_id: str, db: Session = Depends(get_db)) -> dict:
         },
         "latest_snapshot": (
             {
-                "ts": latest_snap.ts.isoformat() if latest_snap.ts else None,
-                "last_price_dollars": _probability_float(
-                    latest_snap.last_price_dollars
-                ),
-                "yes_bid_dollars": _probability_float(latest_snap.yes_bid_dollars),
-                "yes_ask_dollars": _probability_float(latest_snap.yes_ask_dollars),
-                "volume_24h_fp": float(latest_snap.volume_24h_fp)
-                if latest_snap.volume_24h_fp is not None
-                else None,
-                "open_interest_fp": float(latest_snap.open_interest_fp)
-                if latest_snap.open_interest_fp is not None
-                else None,
-                "liquidity_dollars": float(latest_snap.liquidity_dollars)
-                if latest_snap.liquidity_dollars is not None
-                else None,
+                "ts": latest_quote.get("ts"),
+                "last_price_dollars": latest_quote.get("last_price"),
+                "yes_bid_dollars": latest_quote.get("yes_bid"),
+                "yes_ask_dollars": latest_quote.get("yes_ask"),
+                "volume_24h_fp": latest_quote.get("volume_24h"),
+                "open_interest_fp": latest_quote.get("open_interest"),
+                "liquidity_dollars": latest_quote.get("liquidity"),
+                "source": latest_quote.get("source"),
             }
-            if latest_snap
+            if latest_quote
             else None
         ),
+        "latest_quote": latest_quote,
     }
 
 
@@ -3633,14 +3433,6 @@ def get_market_series(
         ),
     )
 
-    snap_rows = _fallback_snapshot_rows_for_series(
-        db,
-        market_pk=market.id,
-        since_dt=since_dt,
-        history_rows=history_rows,
-        limit=snapshot_limit,
-    )
-
     trade_payloads = [
         {
             "ts": t.ts.isoformat() if t.ts else None,
@@ -3659,7 +3451,7 @@ def get_market_series(
     ]
     snapshot_payloads = _merge_series_snapshot_payloads(
         [_chart_history_snapshot_payload(row) for row in history_rows],
-        [_snapshot_payload(s) for s in snap_rows],
+        [],
         limit=snapshot_limit,
     )
     explanations = explain_trades_against_window(trade_payloads, window=50)

@@ -16,6 +16,7 @@ def _snap(
     last: str | None,
     vol: str = "100",
     liq: str = "50",
+    source: str = "market_snapshot",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=1,
@@ -25,6 +26,7 @@ def _snap(
         last_price_dollars=Decimal(last) if last else None,
         volume_fp=Decimal(vol),
         liquidity_dollars=Decimal(liq),
+        source=source,
     )
 
 
@@ -52,6 +54,29 @@ def test_static_price_move_and_volume_delta_are_stable() -> None:
     assert out["signals"]["price_change"] == 0.2
     assert out["signals"]["abs_price_change"] == 0.2
     assert out["signals"]["volume_delta"] == 60.0
+
+
+def test_chart_history_volume_delta_uses_latest_bucket_volume() -> None:
+    latest = _snap(
+        bid="0.48",
+        ask="0.52",
+        last="0.50",
+        vol="25",
+        source="chart_history",
+    )
+    previous = _snap(
+        bid="0.48",
+        ask="0.52",
+        last="0.50",
+        vol="100",
+        source="chart_history",
+    )
+    market = SimpleNamespace(market_id="KXTEST-BUCKET", title="Bucket volume")
+
+    out = analyze_market(market, [latest, previous], book_activity=None)
+
+    assert out["signals"]["volume_delta"] == 25.0
+    assert "large volume jump (static threshold)" not in out["reasons"]
 
 
 def test_book_activity_bumps_score() -> None:

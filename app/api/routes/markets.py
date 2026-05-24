@@ -3,7 +3,8 @@ from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
 from app.api.serialization import decimal_to_float, isoformat_or_none
-from app.db.models import Market, MarketSnapshot
+from app.db.models import Market, MarketPriceHistory
+from app.services.quote_series import history_point, quote_payload
 
 router = APIRouter(
     prefix="/markets",
@@ -29,20 +30,27 @@ def serialize_market(market: Market) -> dict:
     }
 
 
-def serialize_snapshot(snapshot: MarketSnapshot) -> dict:
+def serialize_snapshot(row: MarketPriceHistory) -> dict:
+    point = history_point(row)
+    payload = quote_payload(point)
     return {
-        "id": snapshot.id,
-        "market_pk": snapshot.market_pk,
-        "ts": isoformat_or_none(snapshot.ts),
-        "last_price_dollars": decimal_to_float(snapshot.last_price_dollars),
-        "yes_bid_dollars": decimal_to_float(snapshot.yes_bid_dollars),
-        "yes_ask_dollars": decimal_to_float(snapshot.yes_ask_dollars),
-        "no_bid_dollars": decimal_to_float(snapshot.no_bid_dollars),
-        "no_ask_dollars": decimal_to_float(snapshot.no_ask_dollars),
-        "volume_fp": decimal_to_float(snapshot.volume_fp),
-        "volume_24h_fp": decimal_to_float(snapshot.volume_24h_fp),
-        "open_interest_fp": decimal_to_float(snapshot.open_interest_fp),
-        "liquidity_dollars": decimal_to_float(snapshot.liquidity_dollars),
+        "id": None,
+        "market_pk": payload["market_pk"],
+        "ts": payload["ts"],
+        "last_price_dollars": payload["last_price"],
+        "yes_bid_dollars": payload["yes_bid"],
+        "yes_ask_dollars": payload["yes_ask"],
+        "no_bid_dollars": None,
+        "no_ask_dollars": None,
+        "volume_fp": decimal_to_float(point.volume_fp),
+        "volume_24h_fp": payload["volume_24h"],
+        "open_interest_fp": payload["open_interest"],
+        "liquidity_dollars": None,
+        "source": payload["source"],
+        "source_key": payload["source_key"],
+        "interval_sec": payload["interval_sec"],
+        "trade_count": payload["trade_count"],
+        "quote_count": payload["quote_count"],
     }
 
 
@@ -92,9 +100,9 @@ def get_market_snapshots(
         raise HTTPException(status_code=404, detail="Market not found")
 
     snapshots = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market.id)
-        .order_by(MarketSnapshot.id.desc())
+        db.query(MarketPriceHistory)
+        .filter(MarketPriceHistory.market_pk == market.id)
+        .order_by(MarketPriceHistory.bucket_start.desc())
         .limit(limit)
         .all()
     )

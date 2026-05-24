@@ -42,6 +42,7 @@ from app.services.market_price_history import (
     trade_history_row,
     upsert_chart_history,
 )
+from app.services.quote_series import latest_history_points
 from app.services.pipeline_heartbeat import (
     mark_pipeline_error,
     mark_pipeline_start,
@@ -558,28 +559,27 @@ def _tape_hints_for_market(db, market: Market) -> tuple[Decimal | None, Decimal 
     ent = _tape_volume_cache.get(market.id)
     if ent and (now_m - ent[2]) < _TAPE_HINT_TTL_SEC:
         return ent[0], ent[1]
-    last = (
-        db.query(
-            MarketSnapshot.volume_24h_fp,
-            MarketSnapshot.open_interest_fp,
-        )
-        .join(MarketMetric, MarketMetric.latest_snapshot_id == MarketSnapshot.id)
+    metric = (
+        db.query(MarketMetric)
         .filter(MarketMetric.market_pk == market.id)
-        .first()
+        .one_or_none()
     )
-
-    # Fallback for markets whose metric row has not been initialized yet.
-    if last is None:
-        last = (
-            db.query(
-                MarketSnapshot.volume_24h_fp,
-                MarketSnapshot.open_interest_fp,
-            )
-            .filter(MarketSnapshot.market_pk == market.id)
-            .order_by(MarketSnapshot.id.desc())
-            .first()
+    if metric is not None:
+        v24 = (
+            Decimal(metric.volume_24h_contracts)
+            if metric.volume_24h_contracts is not None
+            else None
         )
+        oi = (
+            Decimal(metric.open_interest_contracts)
+            if metric.open_interest_contracts is not None
+            else None
+        )
+        _tape_volume_cache[market.id] = (v24, oi, now_m)
+        return v24, oi
 
+    history = latest_history_points(db, [int(market.id)]).get(int(market.id), [])
+    last = history[0] if history else None
     v24 = last.volume_24h_fp if last else None
     oi = last.open_interest_fp if last else None
     _tape_volume_cache[market.id] = (v24, oi, now_m)
@@ -1629,7 +1629,7 @@ def resolve_book_market_tickers() -> list[str]:
          projection. This avoids scanning the multi-million-row snapshot table
          during websocket startup.
       3. Cold-start fallback: most-recently-updated markets, used only when
-         no snapshots with positive volume exist yet (e.g. brand-new DB).
+         no compact metrics/history exists yet (e.g. brand-new DB).
 
     Smoke-test war story: the previous implementation was just (1) -> (3).
     On a fresh bootstrap of 50k markets, Kalshi's alphabetical pagination
@@ -1659,7 +1659,6 @@ def resolve_book_market_tickers() -> list[str]:
     )
     
     live_ranked_market = or_(
-        MarketMetric.latest_snapshot_ts >= recent_cutoff,
         MarketMetric.last_trade_ts >= recent_cutoff,
         recent_metric_update,
     )
@@ -1678,12 +1677,11 @@ def resolve_book_market_tickers() -> list[str]:
             .where(live_ranked_market)
             .where(
                 positive_metric_activity
-                | (MarketMetric.latest_snapshot_ts.is_not(None))
+                | (MarketMetric.updated_at >= recent_cutoff)
             )
             .order_by(
                 MarketMetric.volume_24h_contracts.desc().nullslast(),
                 MarketMetric.trade_count.desc(),
-                MarketMetric.latest_snapshot_ts.desc().nullslast(),
                 MarketMetric.updated_at.desc(),
             )
             .limit(settings.kalshi_book_market_limit)

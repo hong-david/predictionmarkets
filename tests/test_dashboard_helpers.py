@@ -8,7 +8,6 @@ from app.api.routes.dashboard import (
     _cached_dashboard_payload,
     _clickhouse_table_count,
     _DASHBOARD_CACHE_SCHEMA_VERSION,
-    _history_coverage_windows,
     _merge_series_snapshot_payloads,
     _metric_probability_float,
     _probability_float,
@@ -226,34 +225,6 @@ def test_series_snapshot_merge_prefers_finer_chart_interval() -> None:
     assert len(merged) == 1
     assert merged[0]["interval_sec"] == 300
     assert merged[0]["last_price"] == 0.52
-
-
-def test_history_coverage_windows_merge_mixed_intervals() -> None:
-    rows = [
-        SimpleNamespace(
-            bucket_start=datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
-            interval_sec=3600,
-        ),
-        SimpleNamespace(
-            bucket_start=datetime(2026, 5, 8, 16, 5, tzinfo=timezone.utc),
-            interval_sec=300,
-        ),
-        SimpleNamespace(
-            bucket_start=datetime(2026, 5, 8, 17, 30, tzinfo=timezone.utc),
-            interval_sec=300,
-        ),
-    ]
-
-    assert _history_coverage_windows(rows) == [
-        (
-            datetime(2026, 5, 8, 16, 0, tzinfo=timezone.utc),
-            datetime(2026, 5, 8, 17, 0, tzinfo=timezone.utc),
-        ),
-        (
-            datetime(2026, 5, 8, 17, 30, tzinfo=timezone.utc),
-            datetime(2026, 5, 8, 17, 35, tzinfo=timezone.utc),
-        ),
-    ]
 
 
 def test_clickhouse_table_count_reads_supported_table(monkeypatch) -> None:

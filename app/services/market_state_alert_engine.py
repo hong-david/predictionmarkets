@@ -16,7 +16,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
-from app.db.models import Market, MarketSnapshot
+from app.db.models import Market
 from app.services.book_activity_signals import book_signals_for_scoring
 from app.services.features.liquidity import decimal_volume_delta
 from app.services.features.quotes import (
@@ -37,15 +37,15 @@ def dec_to_float(value: Decimal | None) -> float | None:
     return float(value) if value is not None else None
 
 
-def compute_spread(snapshot: MarketSnapshot) -> Decimal | None:
+def compute_spread(snapshot: Any) -> Decimal | None:
     return decimal_spread(snapshot.yes_bid_dollars, snapshot.yes_ask_dollars)
 
 
-def compute_mid_price(snapshot: MarketSnapshot) -> Decimal | None:
+def compute_mid_price(snapshot: Any) -> Decimal | None:
     return decimal_mid_price(snapshot.yes_bid_dollars, snapshot.yes_ask_dollars)
 
 
-def reference_price(snapshot: MarketSnapshot) -> Decimal | None:
+def reference_price(snapshot: Any) -> Decimal | None:
     return decimal_reference_price(
         last=snapshot.last_price_dollars,
         bid=snapshot.yes_bid_dollars,
@@ -54,14 +54,14 @@ def reference_price(snapshot: MarketSnapshot) -> Decimal | None:
 
 
 def compute_volume_delta(
-    latest: MarketSnapshot,
-    previous: MarketSnapshot,
+    latest: Any,
+    previous: Any,
 ) -> Decimal | None:
     return decimal_volume_delta(latest.volume_fp, previous.volume_fp)
 
 
 
-def _reference_price_mode(snapshot: MarketSnapshot) -> str:
+def _reference_price_mode(snapshot: Any) -> str:
     """Return how reference_price() will be derived for this snapshot."""
     if getattr(snapshot, "last_price_dollars", None) is not None:
         return "last"
@@ -73,12 +73,15 @@ def _reference_price_mode(snapshot: MarketSnapshot) -> str:
     return "none"
 
 
-def _volume_semantics(snapshot: MarketSnapshot) -> str:
+def _volume_semantics(snapshot: Any) -> str:
     """Return a coarse snapshot-volume shape.
 
     Missing optional fields are treated as the partial shape so lightweight
     test doubles that omit DB-only columns still work.
     """
+    if getattr(snapshot, "source", None) == "chart_history":
+        return "bucket"
+
     complete_quote = (
         getattr(snapshot, "last_price_dollars", None) is not None
         and getattr(snapshot, "no_bid_dollars", None) is not None
@@ -89,23 +92,23 @@ def _volume_semantics(snapshot: MarketSnapshot) -> str:
 
 
 def _reference_price_comparable(
-    current: MarketSnapshot,
-    previous: MarketSnapshot,
+    current: Any,
+    previous: Any,
 ) -> bool:
     mode = _reference_price_mode(current)
     return mode != "none" and mode == _reference_price_mode(previous)
 
 
 def _volume_comparable(
-    current: MarketSnapshot,
-    previous: MarketSnapshot,
+    current: Any,
+    previous: Any,
 ) -> bool:
     if current.volume_fp is None or previous.volume_fp is None:
         return False
     return _volume_semantics(current) == _volume_semantics(previous)
 
 
-def _series_spreads(snapshots: list[MarketSnapshot]) -> list[Decimal]:
+def _series_spreads(snapshots: list[Any]) -> list[Decimal]:
     spreads: list[Decimal] = []
     for snapshot in snapshots[: min(30, len(snapshots))]:
         spread = compute_spread(snapshot)
@@ -115,7 +118,7 @@ def _series_spreads(snapshots: list[MarketSnapshot]) -> list[Decimal]:
 
 
 def _price_and_volume_deltas(
-    snapshots: list[MarketSnapshot],
+    snapshots: list[Any],
 ) -> tuple[list[Decimal], list[Decimal]]:
     price_deltas: list[Decimal] = []
     volume_deltas: list[Decimal] = []
@@ -130,15 +133,20 @@ def _price_and_volume_deltas(
         ):
             price_deltas.append(current_ref - previous_ref)
         if _volume_comparable(current, previous):
-            volume_delta = compute_volume_delta(current, previous)
-            if volume_delta is not None:
-                volume_deltas.append(volume_delta)
+            if _volume_semantics(current) == "bucket":
+                volume_value = getattr(current, "volume_fp", None)
+                if volume_value is not None:
+                    volume_deltas.append(volume_value)
+            else:
+                volume_delta = compute_volume_delta(current, previous)
+                if volume_delta is not None:
+                    volume_deltas.append(volume_delta)
     return price_deltas, volume_deltas
 
 
 def analyze_market(
     market: Market,
-    snapshots: list[MarketSnapshot],
+    snapshots: list[Any],
     book_activity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Score market-state alert conditions from newest-first snapshots."""
@@ -148,7 +156,7 @@ def analyze_market(
             "title": market.title,
             "score": 0.0,
             "severity": "none",
-            "reasons": ["no snapshots available"],
+            "reasons": ["no quote history available"],
             "signals": {},
         }
 
@@ -163,8 +171,11 @@ def analyze_market(
     latest_mid = compute_mid_price(latest)
     latest_ref_price = reference_price(latest)
 
-    signals["latest_snapshot_id"] = latest.id
+    signals["latest_snapshot_id"] = getattr(latest, "id", None)
     signals["latest_snapshot_ts"] = latest.ts.isoformat() if latest.ts else None
+    signals["latest_quote_source"] = getattr(latest, "source", "unknown")
+    signals["latest_quote_source_key"] = getattr(latest, "source_key", None)
+    signals["latest_quote_ts"] = latest.ts.isoformat() if latest.ts else None
     signals["latest_spread"] = dec_to_float(latest_spread)
     signals["latest_mid_price"] = dec_to_float(latest_mid)
     signals["latest_reference_price"] = dec_to_float(latest_ref_price)
@@ -285,13 +296,22 @@ def analyze_market(
             signals["abs_price_change"] = None
 
     if previous is not None:
-        signals["previous_snapshot_id"] = previous.id
+        signals["previous_snapshot_id"] = getattr(previous, "id", None)
+        signals["previous_quote_source"] = getattr(previous, "source", "unknown")
+        signals["previous_quote_source_key"] = getattr(previous, "source_key", None)
         signals["previous_reference_price"] = dec_to_float(reference_price(previous))
         signals["previous_reference_price_mode"] = _reference_price_mode(previous)
         signals["previous_volume_semantics"] = _volume_semantics(previous)
         signals["previous_volume_fp"] = dec_to_float(previous.volume_fp)
         signals["volume_delta_comparable"] = _volume_comparable(latest, previous)
-        volume_delta = compute_volume_delta(latest, previous) if signals["volume_delta_comparable"] else None
+        if signals["volume_delta_comparable"] and _volume_semantics(latest) == "bucket":
+            volume_delta = latest.volume_fp
+        else:
+            volume_delta = (
+                compute_volume_delta(latest, previous)
+                if signals["volume_delta_comparable"]
+                else None
+            )
         signals["volume_delta"] = dec_to_float(volume_delta)
         if not volume_rolling_hit and volume_delta is not None:
             if volume_delta >= Decimal("50"):

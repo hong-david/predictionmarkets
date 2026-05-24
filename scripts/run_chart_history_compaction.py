@@ -76,6 +76,7 @@ def _candidate_markets(
     source_interval_sec: int,
     max_markets: int,
     offset: int,
+    closed_only: bool,
 ) -> list[Market]:
     rows = (
         db.query(Market)
@@ -90,7 +91,7 @@ def _candidate_markets(
     )
     out: list[Market] = []
     for market in rows:
-        if _closed_or_resolved_before(market, cutoff):
+        if not closed_only or _closed_or_resolved_before(market, cutoff):
             out.append(market)
             if len(out) >= max(1, max_markets):
                 break
@@ -200,6 +201,7 @@ def compact_chart_history(
     max_source_rows_per_market: int,
     execute: bool,
     replace_source_rows: bool,
+    closed_only: bool = True,
 ) -> dict[str, Any]:
     if execute and not replace_source_rows:
         raise ValueError(
@@ -215,10 +217,12 @@ def compact_chart_history(
         source_interval_sec=source_interval_sec,
         max_markets=max_markets,
         offset=offset,
+        closed_only=closed_only,
     )
     result: dict[str, Any] = {
         "dry_run": not execute,
         "replace_source_rows": bool(replace_source_rows and execute),
+        "market_scope": "closed_or_resolved" if closed_only else "all_old_buckets",
         "grace_days_after_close": grace_days_after_close,
         "source_interval_sec": source_interval_sec,
         "target_interval_sec": target_interval_sec,
@@ -274,14 +278,32 @@ def compact_chart_history(
 
 def _compaction_policies_from_args(args: argparse.Namespace) -> list[dict[str, int]]:
     raw = str(getattr(args, "policies", "") or "").strip()
-    if not raw:
-        return [
+    return _parse_compaction_policies(
+        raw,
+        default=[
             {
                 "source_interval_sec": max(1, args.source_interval_sec),
                 "target_interval_sec": max(1, args.target_interval_sec),
                 "grace_days_after_close": max(0, args.grace_days_after_close),
             }
-        ]
+        ],
+    )
+
+
+def _active_retention_policies_from_args(
+    args: argparse.Namespace,
+) -> list[dict[str, int]]:
+    raw = str(getattr(args, "active_retention_policies", "") or "").strip()
+    return _parse_compaction_policies(raw, default=[])
+
+
+def _parse_compaction_policies(
+    raw: str,
+    *,
+    default: list[dict[str, int]],
+) -> list[dict[str, int]]:
+    if not raw:
+        return list(default)
 
     policies: list[dict[str, int]] = []
     for part in raw.split(","):
@@ -331,6 +353,7 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
 
         logger.info("chart-history compaction lock acquired")
         policies = _compaction_policies_from_args(args)
+        active_policies = _active_retention_policies_from_args(args)
         policy_results = []
         for policy in policies:
             policy_results.append(
@@ -344,8 +367,26 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
                     max_source_rows_per_market=max(0, args.max_source_rows_per_market),
                     execute=bool(args.execute),
                     replace_source_rows=bool(args.replace_source_rows),
+                    closed_only=True,
                 )
             )
+        active_policy_results = []
+        for policy in active_policies:
+            active_policy_results.append(
+                compact_chart_history(
+                    db,
+                    grace_days_after_close=policy["grace_days_after_close"],
+                    source_interval_sec=policy["source_interval_sec"],
+                    target_interval_sec=policy["target_interval_sec"],
+                    max_markets=max(1, args.max_markets),
+                    offset=max(0, args.offset),
+                    max_source_rows_per_market=max(0, args.max_source_rows_per_market),
+                    execute=bool(args.execute),
+                    replace_source_rows=bool(args.replace_source_rows),
+                    closed_only=False,
+                )
+            )
+        all_policy_results = [*policy_results, *active_policy_results]
         first_policy = policies[0]
         result = {
             "dry_run": not args.execute,
@@ -354,18 +395,24 @@ def _run_once(args: argparse.Namespace) -> dict[str, Any]:
             "source_interval_sec": first_policy["source_interval_sec"],
             "target_interval_sec": first_policy["target_interval_sec"],
             "policies": policy_results,
-            "markets": sum(int(item.get("markets") or 0) for item in policy_results),
+            "active_retention_policies": active_policy_results,
+            "markets": sum(int(item.get("markets") or 0) for item in all_policy_results),
             "source_rows": sum(
-                int(item.get("source_rows") or 0) for item in policy_results
+                int(item.get("source_rows") or 0) for item in all_policy_results
             ),
             "target_buckets": sum(
-                int(item.get("target_buckets") or 0) for item in policy_results
+                int(item.get("target_buckets") or 0) for item in all_policy_results
             ),
             "target_rows_upserted": sum(
-                int(item.get("target_rows_upserted") or 0) for item in policy_results
+                int(item.get("target_rows_upserted") or 0)
+                for item in all_policy_results
             ),
             "source_rows_deleted": sum(
-                int(item.get("source_rows_deleted") or 0) for item in policy_results
+                int(item.get("source_rows_deleted") or 0)
+                for item in all_policy_results
+            ),
+            "active_retention_markets": sum(
+                int(item.get("markets") or 0) for item in active_policy_results
             ),
             "lock_acquired": True,
         }
@@ -401,6 +448,15 @@ def main() -> None:
         help=(
             "Optional comma-separated source:target:grace_days policies, e.g. "
             "300:3600:7,3600:86400:180."
+        ),
+    )
+    parser.add_argument(
+        "--active-retention-policies",
+        default="",
+        help=(
+            "Optional comma-separated source:target:age_days policies that apply "
+            "to old buckets for active and closed markets, e.g. "
+            "300:3600:14,3600:86400:180."
         ),
     )
     parser.add_argument("--max-markets", type=int, default=100)

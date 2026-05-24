@@ -14,7 +14,6 @@ from app.db.models import (
     CaseEvidence,
     Market,
     MarketMetric,
-    MarketSnapshot,
     NewsArticle,
     NewsEvent,
     Trade,
@@ -30,6 +29,11 @@ from app.services.surveillance_scores import (
 from app.services.trade_baselines import latest_baseline_for_market
 from app.services.trade_context import MarketContext, explain_trades_with_context
 from app.services.trade_suspicion import explain_trades_against_window
+from app.services.quote_series import (
+    history_points_for_market,
+    quote_payload,
+    sibling_history_payloads,
+)
 
 TRADE_SCORER_VERSION = 4
 TRADE_FLAG_MIN_SCORE = 3.0
@@ -110,28 +114,6 @@ def _trade_payload(trade: Trade) -> dict:
     }
 
 
-def _snapshot_payload(snapshot: MarketSnapshot) -> dict:
-    return {
-        "ts": snapshot.ts.isoformat() if snapshot.ts else None,
-        "market_pk": snapshot.market_pk,
-        "yes_bid": float(snapshot.yes_bid_dollars)
-        if snapshot.yes_bid_dollars is not None
-        else None,
-        "yes_ask": float(snapshot.yes_ask_dollars)
-        if snapshot.yes_ask_dollars is not None
-        else None,
-        "last_price": float(snapshot.last_price_dollars)
-        if snapshot.last_price_dollars is not None
-        else None,
-        "volume_24h": float(snapshot.volume_24h_fp)
-        if snapshot.volume_24h_fp is not None
-        else None,
-        "open_interest": float(snapshot.open_interest_fp)
-        if snapshot.open_interest_fp is not None
-        else None,
-    }
-
-
 def _news_context_for_market(db: Session, market: Market) -> list[dict]:
     rows = (
         db.query(NewsEvent, NewsArticle)
@@ -167,30 +149,14 @@ def _sibling_snapshot_context(
     start: datetime,
     end: datetime,
 ) -> list[dict]:
-    if not market.event_id:
-        return []
-    sibling_pks = [
-        int(pk)
-        for (pk,) in (
-            db.query(Market.id)
-            .filter(Market.event_id == market.event_id)
-            .filter(Market.id != market.id)
-            .limit(25)
-            .all()
-        )
-    ]
-    if not sibling_pks:
-        return []
-    rows = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk.in_(sibling_pks))
-        .filter(MarketSnapshot.ts >= start - timedelta(minutes=15))
-        .filter(MarketSnapshot.ts <= end + timedelta(minutes=45))
-        .order_by(MarketSnapshot.ts.asc(), MarketSnapshot.id.asc())
-        .limit(3000)
-        .all()
+    return sibling_history_payloads(
+        db,
+        market,
+        start=start - timedelta(minutes=15),
+        end=end + timedelta(minutes=45),
+        sibling_limit=25,
+        row_limit=3000,
     )
-    return [_snapshot_payload(row) for row in rows]
 
 
 def _snapshots_for_market(
@@ -200,16 +166,14 @@ def _snapshots_for_market(
     start: datetime,
     end: datetime,
 ) -> list[dict]:
-    rows = (
-        db.query(MarketSnapshot)
-        .filter(MarketSnapshot.market_pk == market_pk)
-        .filter(MarketSnapshot.ts >= start - timedelta(minutes=15))
-        .filter(MarketSnapshot.ts <= end + timedelta(minutes=45))
-        .order_by(MarketSnapshot.ts.asc(), MarketSnapshot.id.asc())
-        .limit(3000)
-        .all()
+    rows = history_points_for_market(
+        db,
+        market_pk,
+        start=start - timedelta(minutes=15),
+        end=end + timedelta(minutes=45),
+        limit=3000,
     )
-    return [_snapshot_payload(row) for row in rows]
+    return [quote_payload(row) for row in rows]
 
 
 def _upsert_flag(

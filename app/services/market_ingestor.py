@@ -249,10 +249,6 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
             else:
                 unchanged_markets += 1
 
-        if not _poller_quote_snapshots_enabled():
-            snapshots_skipped_disabled += 1
-            continue
-
         if _metric_is_fresh(metric_by_market_pk.get(int(market.id)), now):
             snapshots_skipped_fresh_metric += 1
             continue
@@ -272,6 +268,25 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         )
         oi = parse_decimal(first_present(item.get("open_interest_fp"), item.get("open_interest")))
         liq = parse_decimal(first_present(item.get("liquidity_dollars"), item.get("liquidity")))
+
+        if not _poller_quote_snapshots_enabled():
+            snapshots_skipped_disabled += 1
+            metric_updates.append(
+                {
+                    "market": market,
+                    "snapshot": None,
+                    "lp": lp,
+                    "yb": yb,
+                    "ya": ya,
+                    "nb": nb,
+                    "na": na,
+                    "v24": v24,
+                    "oi": oi,
+                    "liq": liq,
+                }
+            )
+            continue
+
         if should_skip_duplicate_snapshot(
             db,
             market.id,
@@ -317,7 +332,8 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
         )
 
     if metric_updates:
-        db.flush()
+        if snapshots_created:
+            db.flush()
         chart_history_rows: list[dict] = []
         for update in metric_updates:
             market = update["market"]
@@ -331,8 +347,8 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
                 db,
                 market_pk=market.id,
                 prior=market.manipulability_prior,
-                latest_snapshot_id=snapshot.id,
-                latest_snapshot_ts=snapshot.ts,
+                latest_snapshot_id=snapshot.id if snapshot is not None else None,
+                latest_snapshot_ts=snapshot.ts if snapshot is not None else None,
                 last_price_dollars=update["lp"],
                 yes_bid_dollars=update["yb"],
                 yes_ask_dollars=update["ya"],
@@ -343,7 +359,7 @@ def ingest_markets_payload(db: Session, payload: dict) -> dict[str, int]:
                 liquidity_dollars=update["liq"],
                 decision=decision,
             )
-            event_ts = snapshot.ts or now
+            event_ts = snapshot.ts if snapshot is not None and snapshot.ts else now
             if should_write_quote_history(int(market.id), event_ts):
                 chart_row = quote_history_row(
                     market_pk=market.id,

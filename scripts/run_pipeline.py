@@ -337,6 +337,13 @@ def build_processes(args: argparse.Namespace) -> list[ManagedProcess]:
                     str(args.chart_history_compaction_policies),
                 ]
             )
+        if getattr(args, "chart_history_active_retention_policies", ""):
+            chart_history_compaction_command.extend(
+                [
+                    "--active-retention-policies",
+                    str(args.chart_history_active_retention_policies),
+                ]
+            )
         if args.chart_history_compaction_execute:
             chart_history_compaction_command.append("--execute")
         if args.chart_history_compaction_replace_source_rows:
@@ -479,6 +486,7 @@ def main() -> None:
         default=0,
     )
     parser.add_argument("--chart-history-compaction-policies", default="")
+    parser.add_argument("--chart-history-active-retention-policies", default="")
     parser.add_argument("--with-dashboard-cache-warmer", action="store_true")
     parser.add_argument("--dashboard-cache-warm-interval-seconds", type=float, default=60.0)
     parser.add_argument("--dashboard-cache-warm-market-scopes", default="active")
