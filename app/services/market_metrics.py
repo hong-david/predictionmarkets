@@ -103,6 +103,7 @@ def bulk_upsert_quote_metrics(
 ) -> None:
     if not rows:
         return
+    rows = sorted(rows, key=lambda row: int(row["market_pk"]))
     stmt = pg_insert(MarketMetric).values(rows)
     excluded = stmt.excluded
     stmt = stmt.on_conflict_do_update(

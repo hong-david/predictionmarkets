@@ -95,12 +95,16 @@ def run_cycle(args: argparse.Namespace) -> dict[str, object]:
                 dry_run=args.dry_run,
             )
             trade_result = out["trade_flags"]
+            trade_deadlocks = int(trade_result.get("deadlocked_markets") or 0)
+            trade_detail = (
+                f"Flagged {trade_result.get('flagged', 0)} trades; "
+                f"promoted {trade_result.get('promoted', 0)}."
+            )
+            if trade_deadlocks:
+                trade_detail += f" Skipped {trade_deadlocks} deadlocked markets."
             mark_pipeline_success(
                 "trade_flags",
-                detail=(
-                    f"Flagged {trade_result.get('flagged', 0)} trades; "
-                    f"promoted {trade_result.get('promoted', 0)}."
-                ),
+                detail=trade_detail,
                 run_id=run_id,
                 count=int(trade_result.get("created_or_updated") or 0),
                 metadata=trade_result,

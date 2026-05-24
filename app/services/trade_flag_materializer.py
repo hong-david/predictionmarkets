@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta
+import logging
 from typing import Iterable
 
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import (
@@ -39,6 +41,14 @@ TRADE_SCORER_VERSION = 4
 TRADE_FLAG_MIN_SCORE = 3.0
 TRADE_FLAG_TRIGGERED_SCORE = 7.0
 TRADE_FLAG_CASE_SCORE = 8.5
+logger = logging.getLogger(__name__)
+
+
+def _is_deadlock_error(exc: OperationalError) -> bool:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    return sqlstate == "40P01" or "deadlock detected" in str(
+        getattr(exc, "orig", exc)
+    ).lower()
 
 
 def severity_for_score(score: float) -> str:
@@ -322,6 +332,95 @@ def _flags_by_reason(rows: Iterable[TradeFlag]) -> dict[str, int]:
     return out
 
 
+def _materialize_market_trade_flags(
+    db: Session,
+    market_rows: list[tuple[Trade, Market]],
+    *,
+    min_score: float,
+    scorer_version: int,
+    dry_run: bool,
+) -> tuple[int, int, list[dict]]:
+    market = market_rows[0][1]
+    trades = [trade for trade, _market in market_rows]
+    payloads = [_trade_payload(trade) for trade in trades]
+    local = explain_trades_against_window(payloads, window=50)
+    start = trades[0].ts
+    end = trades[-1].ts
+    context = explain_trades_with_context(
+        payloads,
+        market=_market_context(market),
+        snapshots=_snapshots_for_market(db, market.id, start=start, end=end),
+        local_explanations=local,
+        peer_baseline=latest_baseline_for_market(
+            db, market, scorer_version=scorer_version
+        ),
+        news_events=_news_context_for_market(db, market),
+        sibling_snapshots=_sibling_snapshot_context(
+            db, market, start=start, end=end
+        ),
+    )
+    created_or_updated = 0
+    promoted = 0
+    top: list[dict] = []
+
+    for trade, local_exp, context_exp in zip(trades, local, context):
+        local_score = float(local_exp["score"]) if local_exp else 0.0
+        context_score = float(context_exp["score"]) if context_exp else 0.0
+        score = final_trade_flag_score(local_score, context_score, context_exp)
+        if score < min_score:
+            continue
+
+        reasons = sorted(
+            set(
+                (local_exp or {}).get("reasons", [])
+                + (context_exp or {}).get("reasons", [])
+            )
+        )
+        components = (context_exp or {}).get("components", {})
+        features = {
+            **((local_exp or {}).get("features", {})),
+            "context": (context_exp or {}).get("features", {}),
+        }
+        top.append(
+            {
+                "trade_id": trade.trade_id,
+                "market_id": market.market_id,
+                "score": score,
+                "reasons": reasons,
+            }
+        )
+        if dry_run:
+            continue
+        flag_id = _upsert_flag(
+            db,
+            trade=trade,
+            market=market,
+            score=score,
+            local_score=local_score,
+            context_score=context_score,
+            reasons=reasons,
+            components=components,
+            features=features,
+            scorer_version=scorer_version,
+        )
+        created_or_updated += 1
+        tier, _case_id = _promote_flag_if_needed(
+            db,
+            flag_id=flag_id,
+            trade=trade,
+            market=market,
+            score=score,
+            reasons=reasons,
+            components=components,
+            features=features,
+            scorer_version=scorer_version,
+        )
+        if tier:
+            promoted += 1
+
+    return created_or_updated, promoted, top
+
+
 def materialize_trade_flags(
     db: Session,
     *,
@@ -343,82 +442,34 @@ def materialize_trade_flags(
 
     created_or_updated = 0
     promoted = 0
+    deadlocked_markets = 0
     top: list[dict] = []
 
     for market_rows in grouped.values():
         market = market_rows[0][1]
-        trades = [trade for trade, _market in market_rows]
-        payloads = [_trade_payload(trade) for trade in trades]
-        local = explain_trades_against_window(payloads, window=50)
-        start = trades[0].ts
-        end = trades[-1].ts
-        context = explain_trades_with_context(
-            payloads,
-            market=_market_context(market),
-            snapshots=_snapshots_for_market(db, market.id, start=start, end=end),
-            local_explanations=local,
-            peer_baseline=latest_baseline_for_market(
-                db, market, scorer_version=scorer_version
-            ),
-            news_events=_news_context_for_market(db, market),
-            sibling_snapshots=_sibling_snapshot_context(
-                db, market, start=start, end=end
-            ),
-        )
-        for trade, local_exp, context_exp in zip(trades, local, context):
-            local_score = float(local_exp["score"]) if local_exp else 0.0
-            context_score = float(context_exp["score"]) if context_exp else 0.0
-            score = final_trade_flag_score(local_score, context_score, context_exp)
-            if score < min_score:
-                continue
-
-            reasons = sorted(
-                set(
-                    (local_exp or {}).get("reasons", [])
-                    + (context_exp or {}).get("reasons", [])
-                )
-            )
-            components = (context_exp or {}).get("components", {})
-            features = {
-                **((local_exp or {}).get("features", {})),
-                "context": (context_exp or {}).get("features", {}),
-            }
-            top.append(
-                {
-                    "trade_id": trade.trade_id,
-                    "market_id": market.market_id,
-                    "score": score,
-                    "reasons": reasons,
-                }
-            )
-            if dry_run:
-                continue
-            flag_id = _upsert_flag(
+        try:
+            market_created, market_promoted, market_top = _materialize_market_trade_flags(
                 db,
-                trade=trade,
-                market=market,
-                score=score,
-                local_score=local_score,
-                context_score=context_score,
-                reasons=reasons,
-                components=components,
-                features=features,
+                market_rows,
+                min_score=min_score,
                 scorer_version=scorer_version,
+                dry_run=dry_run,
             )
-            created_or_updated += 1
-            tier, _case_id = _promote_flag_if_needed(
-                db,
-                flag_id=flag_id,
-                trade=trade,
-                market=market,
-                score=score,
-                reasons=reasons,
-                components=components,
-                features=features,
-                scorer_version=scorer_version,
+            if not dry_run:
+                db.commit()
+        except OperationalError as exc:
+            db.rollback()
+            if not _is_deadlock_error(exc):
+                raise
+            deadlocked_markets += 1
+            logger.warning(
+                "trade flag materialization skipped market_pk=%s after deadlock",
+                market.id,
             )
-            if tier:
-                promoted += 1
+            continue
+        created_or_updated += market_created
+        promoted += market_promoted
+        top.extend(market_top)
 
     top.sort(key=lambda x: x["score"], reverse=True)
     if not dry_run:
@@ -438,6 +489,7 @@ def materialize_trade_flags(
         "flagged": len(top),
         "created_or_updated": created_or_updated,
         "promoted": promoted,
+        "deadlocked_markets": deadlocked_markets,
         "top": top[:100],
         "reason_counts": _flags_by_reason(recent_flags),
     }

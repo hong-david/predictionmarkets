@@ -1,4 +1,7 @@
+from sqlalchemy.exc import OperationalError
+
 from app.services.trade_flag_materializer import (
+    _is_deadlock_error,
     final_trade_flag_score,
     severity_for_score,
 )
@@ -18,3 +21,12 @@ def test_post_news_discount_applies_to_combined_trade_score() -> None:
     }
 
     assert final_trade_flag_score(8.0, 2.0, context) == 5.2
+
+
+def test_deadlock_detection_uses_postgres_sqlstate() -> None:
+    class DeadlockOrig(Exception):
+        sqlstate = "40P01"
+
+    exc = OperationalError("select 1", {}, DeadlockOrig("deadlock detected"))
+
+    assert _is_deadlock_error(exc)

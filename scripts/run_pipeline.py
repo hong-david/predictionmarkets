@@ -502,6 +502,15 @@ def main() -> None:
     processes = build_processes(args)
     if not processes:
         raise SystemExit("No pipeline components selected.")
+    if not args.with_retention_maintenance:
+        record_pipeline_heartbeat(
+            "retention_maintenance",
+            status="paused",
+            detail="Retention maintenance is disabled by supervisor args.",
+            run_id=run_id,
+            count=0,
+            metadata={"enabled": False},
+        )
 
     mark_pipeline_start(
         "pipeline_supervisor",
