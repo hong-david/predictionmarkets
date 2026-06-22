@@ -3909,6 +3909,15 @@ async def get_market_news(
             "stored_event_count": len(stored_articles),
         }
 
+    if settings.archive_mode:
+        return {
+            **payload,
+            "provider": "stored",
+            "articles": [],
+            "stored_event_count": 0,
+            "archive_mode": True,
+        }
+
     params = {
         "query": query,
         "mode": "ArtList",

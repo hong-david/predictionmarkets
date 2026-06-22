@@ -6,6 +6,8 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_host: str = "127.0.0.1"
     app_port: int = 8000
+    archive_mode: bool = False
+    data_cutoff_at: str = ""
 
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = ""

@@ -103,7 +103,7 @@ function StatTile({
   );
 }
 
-export default function OverviewPage() {
+export default function OverviewPage({ archiveMode = false }: { archiveMode?: boolean }) {
   const navigate = useNavigate();
   const [marketScope, setMarketScope] = useState<MarketScope>("active");
   const overview = useQuery({
@@ -114,8 +114,8 @@ export default function OverviewPage() {
         anomalies: OVERVIEW_ANOMALIES,
         market_scope: marketScope,
       }),
-    refetchInterval: 25_000,
-    staleTime: 12_000,
+    refetchInterval: archiveMode ? false : 25_000,
+    staleTime: archiveMode ? 60 * 60_000 : 12_000,
   });
   const st = overview.data?.stats;
   const chartHistoryRows = st?.chart_history_rows ?? 0;
@@ -132,8 +132,8 @@ export default function OverviewPage() {
     queryKey: ["news-diagnostics"],
     queryFn: () => api.newsDiagnostics(),
     enabled: secondaryReady,
-    refetchInterval: 30_000,
-    staleTime: 15_000,
+    refetchInterval: archiveMode ? false : 30_000,
+    staleTime: archiveMode ? 60 * 60_000 : 15_000,
     retry: 1,
   });
 
@@ -160,7 +160,7 @@ export default function OverviewPage() {
         <section className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
           <div className="flex flex-col items-end gap-2">
-            <PipelineHealthWidget />
+            {archiveMode ? <ArchiveModeBadge /> : <PipelineHealthWidget />}
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
               <StatusDot tone="error" />
               <span>Overview API error</span>
@@ -210,7 +210,7 @@ export default function OverviewPage() {
           </p>
         </div>
         <div className="flex flex-col items-start gap-2 sm:items-end">
-          <PipelineHealthWidget />
+          {archiveMode ? <ArchiveModeBadge /> : <PipelineHealthWidget />}
           <ScopeToggle value={marketScope} onChange={setMarketScope} />
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <StatusDot tone={tone} />
@@ -745,6 +745,14 @@ function PipelineHealthWidget() {
           )}
         </div>
       ) : null}
+    </div>
+  );
+}
+
+function ArchiveModeBadge() {
+  return (
+    <div className="inline-flex items-center rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-200">
+      Historical archive
     </div>
   );
 }

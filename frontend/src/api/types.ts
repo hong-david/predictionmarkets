@@ -18,6 +18,11 @@ export type Prior =
 export type Confidence = "high" | "medium" | "low" | "unclassified" | string;
 export type MarketScope = "active" | "historical" | "all";
 
+export interface ArchiveStatus {
+  archive_mode: boolean;
+  data_cutoff_at: string | null;
+}
+
 export interface SystemStats {
   market_scope: MarketScope | string;
   markets: number;

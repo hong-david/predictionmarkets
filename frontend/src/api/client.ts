@@ -1,4 +1,5 @@
 import type {
+  ArchiveStatus,
   Breakdown,
   EventGroup,
   HistoricalSignalQa,
@@ -49,6 +50,7 @@ async function get<T>(
 }
 
 export const api = {
+  archiveStatus: () => get<ArchiveStatus>("/api/archive-status"),
   /** Bundled overview: stats, breakdown, top markets, alerts, trade flags, news signals. */
   overview: (params?: { top?: number; anomalies?: number; market_scope?: MarketScope }) =>
     get<DashboardOverview>("/api/dashboard/overview", {

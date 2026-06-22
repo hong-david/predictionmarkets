@@ -378,6 +378,15 @@ from a live bucket, compacted bucket, or raw fallback snapshot.
 
 ## Changelog
 
+### 2026-06-22
+
+- Added runtime archive mode (`ARCHIVE_MODE`, `DATA_CUTOFF_AT`) for serving
+  frozen historical charts, trades, stored news, and findings while ingestion
+  is paused. The UI shows a persistent cutoff banner, suppresses live pipeline
+  status, and avoids live GDELT fallback requests.
+- Changed the budget Redis eviction policy to `allkeys-lfu` so frequently used
+  dashboard payloads are favored during long-lived archive operation.
+
 ### 2026-05-11
 
 - Raw retention batching (`scripts/run_retention_maintenance.py`, `scripts/run_pipeline.py`, `app/core/config.py`, `docker-compose.budget.yml`): removed the fixed sleep between delete batches (`sleep_seconds` default `0`); default **`retention_batch_size` is 2500** and **`max_batches` is 60** (same cap per sweep as before: 60×2500 = 20×5000 rows per tier when batches are full). Env override remains `KALSHI_RETENTION_MAX_BATCHES`. Snapshot sweeps still use `stop_on_partial_batch=False` so a short batch does **not** end the tier early (partial batches are normal given the per-market lateral cap).
@@ -397,6 +406,7 @@ Most configuration comes from `.env` through `app/core/config.py`.
 | --- | --- |
 | `POSTGRES_*` | Main Postgres connection. |
 | `REDIS_HOST`, `REDIS_PORT` | Dashboard cache and API rate limiter. |
+| `ARCHIVE_MODE`, `DATA_CUTOFF_AT` | Serve the site as a frozen historical archive and disclose the UTC ingestion cutoff. |
 | `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PEM`, `KALSHI_PRIVATE_KEY_PATH` | Kalshi API authentication. |
 | `KALSHI_RAW_BACKEND` | Raw event target: `postgres`, `clickhouse`, or `dual`. |
 | `KALSHI_BOOK_MARKET_LIMIT` | How many markets receive order-book subscriptions. |
